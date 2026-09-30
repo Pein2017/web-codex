@@ -18,8 +18,8 @@
 
 ## 4. Complete the explicitly authorized delivery
 
-- [ ] 4.1 Preserve the original dirty guidance patch, fast-forward the canonical source checkout, push the accepted source to the existing GitHub fork without force and retire only the absorbed clean integration worktree; verify one remaining source checkout and exact remote SHA.
-- [ ] 4.2 Build matching clean Server/Runner/CLI, verify all existing Session rows in disposable state, reconcile live work, preserve a stopped-state backup and retained rollback release, then switch the complete bundle and restart only the dedicated local service.
-- [ ] 4.3 Verify deployed identity, Session count/preservation, all canonical Projects, shared Skills/plugin context, Runner Python and Tunnel readiness; provide the exact version-check prompt and distinguish ChatGPT-side metadata refresh/actual call from host evidence.
+- [x] 4.1 Preserve the original dirty guidance patch, fast-forward the canonical source checkout, push the accepted source to the existing GitHub fork without force and retire only the absorbed clean integration worktree; verify one remaining source checkout and exact remote SHA.
+- [x] 4.2 Build matching clean Server/Runner/CLI, verify all existing Session rows in disposable state, reconcile live work, preserve a stopped-state backup and retained rollback release, then switch the complete bundle and restart only the dedicated local service.
+- [x] 4.3 Verify deployed identity, Session count/preservation, all canonical Projects, shared Skills/plugin context, Runner Python and Tunnel readiness; provide the exact version-check prompt and distinguish ChatGPT-side metadata refresh/actual call from host evidence.
 
 The initial user instruction authorized local pull, merge and compatibility implementation. Subsequent explicit instructions authorize one canonical source checkout, push to the existing fork and local service restart. The lead owns acceptance and delivery; execution workers own only declared disjoint packages. No public Release/tag, force push, post-v0.4.3 feature rollout, research launch or credential change is included.

@@ -74,3 +74,68 @@ are subsequent authorized delivery tasks; no public Release/tag is authorized.
 Operational evidence belongs at the existing deployment root's `verification/`
 and `rollback/`, not in public source assets. No manual ChatGPT browser result is
 inferred from a host smoke.
+
+## Delivered local runtime
+
+The accepted implementation is merge commit
+`004e108a7e5e9bd72e023b13939f763383cb6ad6`. Both fork branches `main` and
+`coordexp/web-workflow` were updated atomically without force. The canonical
+checkout is `/data/CoordExp/.local/src/webcodex-mcp-instructions`; the clean,
+absorbed integration worktree was removed. The original dirty guidance remains
+recoverable in scoped stash `162188d610af33547077c4bd41c97764103d4f8e`
+and the private task patch. This delivery-record follow-up changes only these
+OpenSpec records; it does not change the deployed implementation or require
+rebuilding the immutable bundle.
+
+Clean matching Server, Runner and CLI binaries are deployed as private local
+bundle `coordexp-2026.09.30.1`, built from the implementation commit above.
+The final clean-binary real-entry smoke passed all 31 checks. The actual private
+ledger shadow check restored all 62 old Sessions and found zero divergence
+beyond the explicitly documented existing-native normalization. Live Runtime
+status reports 62 restored Sessions with no persistence error. All five original
+canonical Project id/path pairs are unchanged. Configured shared Skill discovery
+and a revision-guarded read match the shared file; existing project-source and
+missing-definition diagnostics are retained rather than concealed. Native
+CodeGraph and all three Web workflow providers report ready. Runner `python3`
+still resolves to the `ms` environment; initialize/discover guidance matches the
+bundle's 10,992-byte file exactly. All eight bundle checksums pass.
+
+Only the dedicated local tmux service was stopped/restarted, after zero live Jobs
+and pending requests were verified. A consistent stopped-state state/config
+backup is retained under
+`/data/CoordExp/.local/webcodex-custom/rollback/pre-v043-2026.09.30.1/`;
+archive SHA-256 is
+`c0c2d1f1001434d11b62c802d2ea69db6be1fd70cd5382f2388eb2c8c99a8452`.
+The old release remains intact. Server, Runner and Tunnel configuration files
+are byte-identical to the backup. No public Release/tag, package publication,
+credential change or research launch occurred.
+
+The existing connected ChatGPT tool actually returned Server/Runner version
+`0.4.3`, clean build `004e108a7e5e`, exact build alignment and online Runner
+`coordexp-web-runner`. This is remote connected-client evidence, not merely a
+localhost smoke. The current conversation still caches old direct tools:
+native discovery correctly routes `list_projects` through `call_runtime_tool`,
+which is absent from that cached catalog. Refresh the existing connection at
+ChatGPT Plugins and start a new conversation; reinstalling is unnecessary.
+Manual browser Refresh/new-conversation verification remains a user-side step,
+not a claimed completed check. See the
+[official refresh flow](https://developers.openai.com/plugins/deploy/connect-chatgpt#refresh-metadata).
+
+The private operational receipt is
+`/data/CoordExp/.local/webcodex-custom/verification/coordexp-2026.09.30.1/live-receipt.json`;
+matching-binary smoke and state-shadow receipts are beside it. The read-only
+`verify_live.py` reproduces the live host checks without exposing credentials.
+
+Use this read-only prompt after Refresh in a new ChatGPT conversation:
+
+```text
+Verify the existing WebCodex connection with actual tool calls only. Call
+runtime_status with client_id=coordexp-web-runner and compact=true. Require
+Server and Runner 0.4.3, git_commit=004e108a7e5e, git_dirty=false, online Runner
+and aligned sources. Follow tool_manifest's advertised route for list_projects
+and confirm five Projects; list the Runner's plugins and report ready/error.
+Do not guess a direct route or reuse retired tools. If call_runtime_tool is
+absent, report stale connection metadata and request Refresh/new conversation.
+Report each actual result as PASS/FAIL. Do not create Sessions, launch Jobs,
+edit files, train, index, reinstall, or change credentials.
+```
