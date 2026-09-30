@@ -43,7 +43,11 @@ fn validate_coding_agent_registration(
     inventory: Option<&CodingAgentRunInventory>,
 ) -> Result<(), String> {
     match (capability, providers, inventory) {
-        (false, None, None) => return Ok(()),
+        // Older/no-ACP Runners may serialize the optional provider list as []
+        // instead of null/absent. Empty discovery grants no execution capability.
+        (false, providers, None) if providers.is_none_or(|providers| providers.is_empty()) => {
+            return Ok(())
+        }
         (false, _, _) => {
             return Err(
                 "coding-agent provider/inventory metadata requires coding_agent_runs capability"
@@ -252,14 +256,6 @@ impl RunnerRegistry {
         {
             return Err(
                 "apply_patch_match_metadata capability requires apply_patch capability".to_string(),
-            );
-        }
-        if runner_features.supports(RunnerFeature::ApplyPatchStrictMatching)
-            && !runner_features.supports(RunnerFeature::ApplyPatchMatchMetadata)
-        {
-            return Err(
-                "apply_patch_strict_matching capability requires apply_patch_match_metadata capability"
-                    .to_string(),
             );
         }
         if runner_features.supports(RunnerFeature::ApplyPatchMatchingMode)
@@ -581,6 +577,8 @@ impl RunnerRegistry {
                 &runner_instance_id,
                 auth_group,
                 self.observation_epoch.clone(),
+                self.inner.capture_candidates(),
+                self.inner.capture_terminal_event_candidates(),
                 inventory,
                 now,
             );
@@ -1247,6 +1245,39 @@ impl RunnerRegistry {
             .collect()
     }
 
+    /// Exact Project visibility from the registered Runner snapshot. This is
+    /// deliberately read-only: diagnostic observations must not reconcile Jobs
+    /// or prune Runner records as a side effect of checking visibility.
+    pub async fn exact_project_visible_for_auth_snapshot(
+        &self,
+        auth: Option<&crate::RunnerAccess>,
+        project: &str,
+    ) -> bool {
+        let now = now_ts();
+        let inner = self.inner.lock().await;
+        inner.runners.values().any(|runner| {
+            if !runner_visible_to_access(auth, runner) {
+                return false;
+            }
+            if matches!(runner.auth_group, Some(RunnerAccessGroup::SharedKey(_))) {
+                let connected = inner.notifiers.contains_key(&runner.client_id);
+                let recently_seen =
+                    now.saturating_sub(runner.last_seen) <= RUNNER_ONLINE_WINDOW_SECS;
+                let offline_since = runner.disconnected_at.unwrap_or(runner.last_seen);
+                if !connected
+                    && !recently_seen
+                    && now.saturating_sub(offline_since) > self.shared_key_limits.offline_ttl_secs
+                {
+                    return false;
+                }
+            }
+            runner
+                .projects
+                .iter()
+                .any(|entry| project == format!("agent:{}:{}", runner.client_id, entry.id))
+        })
+    }
+
     /// Return a complete canonical Runner/Project observation only when both
     /// caller-supplied cardinality bounds hold. `None` means the observation is
     /// incomplete and must never support a negative authority conclusion.
@@ -1488,6 +1519,7 @@ impl RunnerRegistry {
         let view = Self::runner_view_locked(inner, client_id)?;
         Some(RunnerSemanticView {
             view,
+            observed_at: std::time::Instant::now(),
             runner_features,
         })
     }

@@ -1,5 +1,26 @@
 use super::*;
 
+/// Dropping the last singleflight waiter must also remove its queued request.
+/// Other waiters retain the shared future, so one caller timing out cannot
+/// cancel their physical read. This guard also covers ordinary read cancellation.
+struct PendingReadGuard {
+    registry: std::sync::Arc<crate::runner_http::RunnerRegistry>,
+    request_id: Option<String>,
+}
+
+impl Drop for PendingReadGuard {
+    fn drop(&mut self) {
+        if let Some(request_id) = self.request_id.take() {
+            let registry = self.registry.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    registry.cancel_request(&request_id).await;
+                });
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn read_file_content_result(
     content: String,
@@ -58,6 +79,120 @@ pub(crate) fn effective_read_file_range(
 ) -> (usize, usize, usize) {
     let range = EffectiveRange::new(start_line, limit);
     (range.start_line, range.limit, range.end_line())
+}
+
+/// Re-project one caller-requested sub-range from a larger canonical plain-text
+/// read. `read_files` uses this after coalescing overlapping/nearby requests so
+/// the Runner performs fewer reads while the public result still preserves the
+/// original item order, range metadata, SHA, and optional line numbering.
+pub(crate) fn slice_read_file_success_output(
+    parent: &Value,
+    start_line: Option<usize>,
+    limit: Option<usize>,
+    with_line_numbers: bool,
+    path: &str,
+) -> Option<Value> {
+    let result = slice_read_file_result(parent, start_line, limit, with_line_numbers, path);
+    result.success.then_some(result.output)
+}
+
+pub(crate) fn slice_read_file_result(
+    parent: &Value,
+    start_line: Option<usize>,
+    limit: Option<usize>,
+    with_line_numbers: bool,
+    path: &str,
+) -> ToolResult {
+    match slice_read_file_range(parent, start_line, limit) {
+        Some(range) => build_read_file_success(&range, with_line_numbers, Some(path)),
+        None => read_file_failure(ReadFileReason::MalformedRunnerResponse, Some(path)),
+    }
+}
+
+fn slice_read_file_range(
+    parent: &Value,
+    start_line: Option<usize>,
+    limit: Option<usize>,
+) -> Option<FileReadRange> {
+    if parent.get("format").and_then(Value::as_str) != Some("plain") {
+        return None;
+    }
+    let parent_text = parent.get("text")?.as_str()?;
+    let parent_sha256 = parent.get("sha256")?.as_str()?.to_string();
+    let total_lines = usize::try_from(parent.get("total_lines")?.as_u64()?).ok()?;
+    let parent_start = usize::try_from(parent.get("start_line")?.as_u64()?).ok()?;
+    let parent_returned = usize::try_from(parent.get("returned_lines")?.as_u64()?).ok()?;
+    let parent_end = if parent_returned == 0 {
+        None
+    } else {
+        Some(
+            parent_start
+                .saturating_add(parent_returned)
+                .saturating_sub(1),
+        )
+    };
+
+    let range = EffectiveRange::new(start_line, limit);
+    let returned_lines = if range.start_line > total_lines || total_lines == 0 {
+        0
+    } else {
+        range.limit.min(
+            total_lines
+                .saturating_sub(range.start_line)
+                .saturating_add(1),
+        )
+    };
+    let end_line = if returned_lines == 0 {
+        None
+    } else {
+        Some(
+            range
+                .start_line
+                .saturating_add(returned_lines)
+                .saturating_sub(1),
+        )
+    };
+
+    if returned_lines > 0 {
+        if range.start_line < parent_start || end_line > parent_end {
+            return None;
+        }
+    } else if range.start_line < parent_start && total_lines >= range.start_line {
+        return None;
+    }
+
+    let content = if returned_lines == 0 {
+        String::new()
+    } else {
+        let offset = range.start_line.saturating_sub(parent_start);
+        let segments = parent_text
+            .split('\n')
+            .take(parent_returned)
+            .skip(offset)
+            .take(returned_lines)
+            .collect::<Vec<_>>();
+        if segments.len() != returned_lines {
+            return None;
+        }
+        segments.join("\n")
+    };
+    let has_more = end_line.is_some_and(|end| end < total_lines);
+    let next_start_line = if has_more {
+        end_line.map(|end| end + 1)
+    } else {
+        None
+    };
+    Some(FileReadRange {
+        content,
+        sha256: parent_sha256,
+        total_lines,
+        start_line: range.start_line,
+        limit: range.limit,
+        returned_lines,
+        end_line,
+        has_more,
+        next_start_line,
+    })
 }
 
 /// Build the unified `read_file` success [`ToolResult`] from a shared range
@@ -335,6 +470,17 @@ fn instruction_agents_alias_resolution(root_listing: &str) -> InstructionAgentsA
         _ => InstructionAgentsAliasResolution::KeepBoth,
     }
 }
+
+const PROJECT_INSTRUCTION_RUNNER_WAIT_TIMEOUT_SECS: u64 = 6;
+
+#[cfg(not(test))]
+const PROJECT_INSTRUCTION_RESPONSE_DEADLINE: Duration =
+    Duration::from_secs(PROJECT_INSTRUCTION_RUNNER_WAIT_TIMEOUT_SECS + 2);
+// Unit-test Runners are in-process fakes. Tests that exercise instruction loading
+// actively complete these requests, while unrelated Session tests must not spend
+// five production-sized best-effort deadlines waiting on an intentionally idle fake.
+#[cfg(test)]
+const PROJECT_INSTRUCTION_RESPONSE_DEADLINE: Duration = Duration::from_millis(250);
 
 enum InstructionCandidateRead {
     Found(super::project_instructions::LoadedInstructionCandidate),
@@ -631,10 +777,15 @@ impl ToolRuntime {
             Ok(r) => r,
             Err(_) => return read_file_failure(ReadFileReason::RunnerUnavailable, Some(&path)),
         };
+        let mut pending = PendingReadGuard {
+            registry: self.runner_registry.clone(),
+            request_id: Some(request_id.clone()),
+        };
         let response = match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline, rx).await,
             None => tokio::time::timeout(Duration::from_secs(wait_timeout + 2), rx).await,
         };
+        pending.request_id = None;
         match response {
             Ok(Ok(resp)) if resp.exit_code == Some(0) && resp.error.is_none() => {
                 let mut result = read_file_runner_stdout_result_with_options(
@@ -676,7 +827,7 @@ impl ToolRuntime {
     // -------------------------------------------------------------------------
 
     /// Best-effort load of project-local instruction files
-    /// (the effective fixed project-instruction candidate list) for a resolved
+    /// (`project_instructions::INSTRUCTION_CANDIDATE_PATHS`) for a resolved
     /// project. Candidates are tried in fixed order; the first candidate that
     /// reads successfully wins, bounding Runner round-trips. Any read failure
     /// (Runner not connected, file missing, timeout, decode error) is swallowed
@@ -689,10 +840,12 @@ impl ToolRuntime {
         &self,
         config: &ProjectConfig,
     ) -> super::project_instructions::ProjectInstructionsSnapshot {
-        use super::project_instructions::ProjectInstructionsSnapshot;
+        use super::project_instructions::{
+            ProjectInstructionsSnapshot, INSTRUCTION_CANDIDATE_PATHS,
+        };
         let mut scan_complete = true;
-        for candidate in super::project_instructions::effective_instruction_candidate_paths() {
-            match self.read_instruction_candidate(config, &candidate).await {
+        for candidate in INSTRUCTION_CANDIDATE_PATHS {
+            match self.read_instruction_candidate(config, candidate).await {
                 InstructionCandidateRead::Found(candidate) => {
                     return ProjectInstructionsSnapshot::from_candidates(
                         vec![candidate],
@@ -719,9 +872,10 @@ impl ToolRuntime {
         &self,
         config: &ProjectConfig,
     ) -> super::project_instructions::ProjectInstructionsSnapshot {
-        use super::project_instructions::ProjectInstructionsSnapshot;
-        let candidates = super::project_instructions::effective_instruction_candidate_paths();
-        let reads = candidates
+        use super::project_instructions::{
+            ProjectInstructionsSnapshot, INSTRUCTION_CANDIDATE_PATHS,
+        };
+        let reads = INSTRUCTION_CANDIDATE_PATHS
             .iter()
             .map(|candidate| self.read_instruction_candidate(config, candidate));
         let results = futures_util::future::join_all(reads).await;
@@ -744,7 +898,7 @@ impl ToolRuntime {
         let mut found = Vec::new();
         let mut scan_complete = true;
         for (index, result) in results.into_iter().enumerate() {
-            let path = candidates[index].as_str();
+            let path = INSTRUCTION_CANDIDATE_PATHS[index];
             let skip_alias = matches!(
                 (path, agents_alias),
                 (
@@ -777,7 +931,6 @@ impl ToolRuntime {
         &self,
         config: &ProjectConfig,
     ) -> Option<InstructionAgentsAliasResolution> {
-        const WAIT_TIMEOUT: u64 = 6;
         let client_id = config.client_id.as_str();
         let (request_id, rx) = self
             .runner_registry
@@ -797,13 +950,13 @@ impl ToolRuntime {
                     end_line: None,
                     line: None,
                     create_dirs: false,
-                    wait_timeout_secs: WAIT_TIMEOUT,
+                    wait_timeout_secs: PROJECT_INSTRUCTION_RUNNER_WAIT_TIMEOUT_SECS,
                 },
                 "project_instructions".to_string(),
             )
             .await
             .ok()?;
-        match tokio::time::timeout(Duration::from_secs(WAIT_TIMEOUT + 2), rx).await {
+        match tokio::time::timeout(PROJECT_INSTRUCTION_RESPONSE_DEADLINE, rx).await {
             Ok(Ok(resp)) if resp.exit_code == Some(0) && resp.error.is_none() => Some(
                 instruction_agents_alias_resolution(resp.stdout.as_deref().unwrap_or_default()),
             ),
@@ -828,8 +981,6 @@ impl ToolRuntime {
         // Request one extra line so canonical envelope total/selection metadata
         // reliably signals truncation beyond the per-file cap.
         let read_limit = MAX_LINES_PER_FILE + 1;
-        const WAIT_TIMEOUT: u64 = 6;
-
         let client_id = config.client_id.as_str();
         let (request_id, rx) = match self
             .runner_registry
@@ -849,7 +1000,7 @@ impl ToolRuntime {
                     end_line: Some(read_limit),
                     line: None,
                     create_dirs: false,
-                    wait_timeout_secs: WAIT_TIMEOUT,
+                    wait_timeout_secs: PROJECT_INSTRUCTION_RUNNER_WAIT_TIMEOUT_SECS,
                 },
                 "project_instructions".to_string(),
             )
@@ -858,11 +1009,13 @@ impl ToolRuntime {
             Ok(enqueued) => enqueued,
             Err(_) => return InstructionCandidateRead::Unavailable,
         };
-        match tokio::time::timeout(Duration::from_secs(WAIT_TIMEOUT + 2), rx).await {
+        match tokio::time::timeout(PROJECT_INSTRUCTION_RESPONSE_DEADLINE, rx).await {
             Ok(Ok(resp)) if resp.exit_code == Some(0) && resp.error.is_none() => {
                 match parse_instruction_runner_stdout(resp.stdout.unwrap_or_default()) {
                     Ok(Some((content, total_lines, full_sha256))) => {
                         InstructionCandidateRead::Found(LoadedInstructionCandidate {
+                            source_scope:
+                                super::project_instructions::InstructionSourceScope::Project,
                             path: path.to_string(),
                             content,
                             total_lines,
@@ -1371,6 +1524,27 @@ mod tests {
         assert_eq!(result.output["start_line"], 2);
         assert_eq!(result.output["limit"], 2);
         assert_eq!(result.output["format"], "numbered");
+    }
+
+    #[test]
+    fn coalesced_read_slice_restores_original_range_and_numbering() {
+        let parent =
+            read_file_content_result("one\ntwo\nthree\nfour\nfive".to_string(), Some(1), Some(5));
+        assert!(parent.success);
+
+        let sliced =
+            slice_read_file_success_output(&parent.output, Some(2), Some(2), true, "src/lib.rs")
+                .expect("contained range should be sliceable");
+
+        assert_eq!(sliced["path"], "src/lib.rs");
+        assert_eq!(sliced["text"], "2 | two\n3 | three");
+        assert_eq!(sliced["format"], "numbered");
+        assert_eq!(sliced["start_line"], 2);
+        assert_eq!(sliced["limit"], 2);
+        assert_eq!(sliced["returned_lines"], 2);
+        assert_eq!(sliced["end_line"], 3);
+        assert_eq!(sliced["next_start_line"], 4);
+        assert_eq!(sliced["sha256"], parent.output["sha256"]);
     }
 
     #[test]

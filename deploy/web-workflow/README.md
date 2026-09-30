@@ -15,14 +15,6 @@ roots = ["/absolute/shared/skills"]
 
 Use `skill_list` and `skill_read_file` or `context_request=["skills.catalog"]`; not every Codex skill is executable in this host. Memory reads, Python/CodeGraph helpers, and optional public history reads are provided by the optional [web-workflow plugin](../../plugins/web-workflow/README.md). Keep private roots and credentials outside this repository.
 
-The Server's automatic repository guidance keeps the fixed candidate list by
-default. An operator who needs to omit `CLAUDE.md` from startup, coding
-startup, and `project.instructions` sidecars may set
-`WEBCODEX_EXCLUDE_CLAUDE_INSTRUCTIONS=1` in the Server environment. This only
-changes automatic instruction selection; it does not delete the file or block
-an explicit authorized `read_files`/`read_file` call. Unset (or an unrecognized
-value) preserves the existing default and still keeps `AGENTS.md` eligible.
-
 If public Codex history is needed, configure the plugin's separate
 `WEBCODEX_WEB_WORKFLOW_HISTORY_ROOT`. Use `public_history_read` with an
 explicit thread id and its returned cursor. The reader is read-only, bounded,
@@ -59,7 +51,7 @@ non-public, oversized, or otherwise ineligible records; continue with the
 returned cursor when progress is reported. No automatic retry or polling is
 implied.
 
-For normal work, select the exact registered Project in `work_on_project`, leave repository instruction injection disabled, then use current search/read/edit/validation tools. Retain the Session identifier for multi-step work. Jobs or tmux work are retrieved manually; no ChatGPT auto-wake integration is provided.
+For normal work, select the exact registered Project in `work_on_project`, use upstream's bounded startup projection and request additional context when needed, then use current search/read/edit/validation tools. Retain the Session identifier for multi-step work. Jobs or tmux work are retrieved manually; no ChatGPT auto-wake integration is provided.
 
 Use `recording_session_id` explicitly for recorded calls. `read_files` returns a
 `read_revision` that can be copied directly to `apply_text_edits` as
@@ -106,10 +98,10 @@ The merged upstream Git review path requires Git with `check-attr --source` supp
 ## Fork maintenance and delivery
 
 - `upstream` is the original WebCodex repository; `origin` is the operator's fork.
-- Use scoped development branches and commits with repository-local OpenSpec changes. This fork uses `coordexp/*` because its inherited `codex` branch prevents a `codex/*` ref namespace. Merge upstream before accepting an update, preserving the original history and local patches.
+- Use scoped `codex/*` development branches and repository-local OpenSpec changes. Merge upstream before accepting an update, preserving original history and only demonstrated local requirement gaps.
 - Fork deployment tags use `coordexp-YYYY.MM.DD.N`. These are self-hosted Linux prereleases, not upstream npm/desktop/container releases. The upstream package version remains visible alongside the exact Git commit and dirty flag.
 - The inherited container-release workflow skips `coordexp-*` tags; creating a fork prerelease does not authorize container or npm publication.
-- Before deployment: focused changed-contract tests, optional-plugin tests, strict OpenSpec validation, and a disposable real Server/Runner smoke. Build both binaries from the same clean commit using `dogfood` for local deployments (`release` for formal published artifacts); record checksums and actual build identities. Local deployment alone does not create a tag or GitHub Release.
+- Before deployment: focused changed-contract tests, optional-plugin tests, strict OpenSpec validation, and a disposable real Server/Runner smoke. Build matching Server/Runner/CLI binaries from the same clean commit using `dogfood` for local deployments (`release` for formal published artifacts); record checksums and actual build identities. Local deployment alone does not create a tag or GitHub Release.
 - Retain old binaries, operator config and a consistent Server-state backup. Check active jobs before restarting the existing Server/Runner. A schema migration may require restoring the matching backup when rolling back.
 - Publish only reviewed source and Linux artifacts with scope/validation notes to the fork. Do not invoke upstream package publication workflows. Never publish private configuration, memory content or operational credentials.
 - After deployment, verify MCP initialization, effective guidance identity, all registered projects, shared context, and the edit/test path on a disposable project. Refresh the ChatGPT connection when tool metadata changes, then start a new conversation if it retained old schemas.
@@ -124,4 +116,4 @@ python3 scripts/e2e_web_workflow.py \
   --timeout-secs 300
 ```
 
-It checks current full-operator MCP contracts, guarded edits, actual command validation, and asynchronous Job terminal/log observation. Preserve its receipt and logs outside the public release assets. It does not claim to test ChatGPT's browser UI or the separate Actions surface.
+It checks current native adaptive MCP contracts, guarded edits, actual command validation, and asynchronous Job terminal/log observation. Preserve its receipt and logs outside the public release assets. It does not claim to test ChatGPT's browser UI or the separate Actions surface.

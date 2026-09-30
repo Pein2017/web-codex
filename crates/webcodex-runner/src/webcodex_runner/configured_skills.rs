@@ -6,7 +6,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use webcodex_core::runner_skill::{
-    normalize_runner_skill_resource_path, RunnerSkillDescriptor, RunnerSkillDiagnostic,
+    normalize_runner_skill_resource_path, RunnerSkillDescriptor, RunnerSkillExecutionRequest,
     RunnerSkillReadResponse, RunnerSkillSource, MAX_RUNNER_SKILL_READ_TEXT_BYTES,
     RUNNER_SKILL_RESPONSE_FORMAT,
 };
@@ -26,11 +26,17 @@ pub(super) struct LiveSkill {
     package_root: PathBuf,
 }
 
+#[derive(Debug)]
+pub(super) struct PreparedConfiguredSkillExecution {
+    pub(super) target_path: PathBuf,
+    pub(super) script: String,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct LiveDiscovery {
     pub(super) skills: Vec<LiveSkill>,
     pub(super) invalid_count: usize,
-    pub(super) diagnostics: Vec<RunnerSkillDiagnostic>,
+    pub(super) diagnostics: Vec<String>,
     pub(super) discovery_truncated: bool,
 }
 
@@ -108,7 +114,6 @@ fn discover_with_trigger(
                 push_diagnostic(
                     &mut discovery.diagnostics,
                     "configured_skill_root_not_found",
-                    None,
                 );
                 continue;
             }
@@ -116,7 +121,6 @@ fn discover_with_trigger(
                 push_diagnostic(
                     &mut discovery.diagnostics,
                     "configured_skill_root_unavailable",
-                    None,
                 );
                 continue;
             }
@@ -125,7 +129,6 @@ fn discover_with_trigger(
             push_diagnostic(
                 &mut discovery.diagnostics,
                 "configured_skill_root_link_not_allowed",
-                None,
             );
             continue;
         }
@@ -133,7 +136,6 @@ fn discover_with_trigger(
             push_diagnostic(
                 &mut discovery.diagnostics,
                 "configured_skill_root_not_directory",
-                None,
             );
             continue;
         }
@@ -143,7 +145,6 @@ fn discover_with_trigger(
                 push_diagnostic(
                     &mut discovery.diagnostics,
                     "configured_skill_root_unavailable",
-                    None,
                 );
                 continue;
             }
@@ -154,7 +155,7 @@ fn discover_with_trigger(
                 if code == "configured_skill_root_scan_limit_exceeded" {
                     discovery.discovery_truncated = true;
                 }
-                push_diagnostic(&mut discovery.diagnostics, code, None);
+                push_diagnostic(&mut discovery.diagnostics, code);
                 continue;
             }
         };
@@ -175,7 +176,7 @@ fn discover_with_trigger(
                 }
                 Err(code) => {
                     discovery.invalid_count = discovery.invalid_count.saturating_add(1);
-                    push_diagnostic(&mut discovery.diagnostics, code, Some(&package_name));
+                    push_diagnostic(&mut discovery.diagnostics, code);
                 }
             }
         }
@@ -202,7 +203,6 @@ fn resolve_live_skill_by_id(
                 push_diagnostic(
                     &mut discovery.diagnostics,
                     "configured_skill_root_not_found",
-                    None,
                 );
                 continue;
             }
@@ -210,7 +210,6 @@ fn resolve_live_skill_by_id(
                 push_diagnostic(
                     &mut discovery.diagnostics,
                     "configured_skill_root_unavailable",
-                    None,
                 );
                 continue;
             }
@@ -219,7 +218,6 @@ fn resolve_live_skill_by_id(
             push_diagnostic(
                 &mut discovery.diagnostics,
                 "configured_skill_root_link_not_allowed",
-                None,
             );
             continue;
         }
@@ -227,7 +225,6 @@ fn resolve_live_skill_by_id(
             push_diagnostic(
                 &mut discovery.diagnostics,
                 "configured_skill_root_not_directory",
-                None,
             );
             continue;
         }
@@ -237,7 +234,6 @@ fn resolve_live_skill_by_id(
                 push_diagnostic(
                     &mut discovery.diagnostics,
                     "configured_skill_root_unavailable",
-                    None,
                 );
                 continue;
             }
@@ -248,7 +244,7 @@ fn resolve_live_skill_by_id(
                 if code == "configured_skill_root_scan_limit_exceeded" {
                     discovery.discovery_truncated = true;
                 }
-                push_diagnostic(&mut discovery.diagnostics, code, None);
+                push_diagnostic(&mut discovery.diagnostics, code);
                 continue;
             }
         };
@@ -280,7 +276,7 @@ fn resolve_live_skill_by_id(
                 }
                 Err(code) => {
                     discovery.invalid_count = discovery.invalid_count.saturating_add(1);
-                    push_diagnostic(&mut discovery.diagnostics, code, Some(&package_name));
+                    push_diagnostic(&mut discovery.diagnostics, code);
                 }
             }
         }
@@ -383,6 +379,71 @@ fn load_live_skill(
             definition_revision,
         },
         package_root,
+    })
+}
+
+pub(super) fn prepare_execution_target(
+    config: &SkillsConfig,
+    request: &RunnerSkillExecutionRequest,
+) -> Result<PreparedConfiguredSkillExecution, String> {
+    request
+        .validate()
+        .map_err(|_| "skill_invalid_execution_request".to_string())?;
+    if request.expected_source != RunnerSkillSource::Configured {
+        return Err("skill_source_changed".to_string());
+    }
+    let path = normalize_runner_skill_resource_path(&request.path)
+        .map_err(|_| "skill_resource_path_invalid".to_string())?;
+    if webcodex_core::sensitive_paths::is_secret_path(&path) {
+        return Err("skill_sensitive_path".to_string());
+    }
+    let (skill, _scan_stats) = resolve_live_skill_by_id(config, &request.skill_id)?;
+    let skill = skill.ok_or_else(|| "skill_not_found".to_string())?;
+    if skill.descriptor.definition_revision() != request.expected_definition_revision {
+        return Err("skill_definition_changed".to_string());
+    }
+    let canonical_root = skill
+        .package_root
+        .parent()
+        .ok_or_else(|| "skill_resource_path_invalid".to_string())?;
+    let target = resolve_regular_package_file(
+        &skill.package_root,
+        canonical_root,
+        &path,
+        "skill_resource_not_found",
+        "skill_resource_path_invalid",
+    )
+    .map_err(str::to_string)?;
+    let bytes =
+        read_bounded(&target, MAX_RUNNER_SKILL_READ_TEXT_BYTES).map_err(|code| match code {
+            "too_large" => "skill_resource_too_large".to_string(),
+            "invalid_utf8" => "skill_resource_unsupported_encoding".to_string(),
+            _ => "skill_resource_unavailable".to_string(),
+        })?;
+    if sha256_hex(&bytes) != request.expected_resource_sha256 {
+        return Err("skill_resource_changed".to_string());
+    }
+    let script =
+        String::from_utf8(bytes).map_err(|_| "skill_resource_unsupported_encoding".to_string())?;
+    if script.contains('\0') {
+        return Err("skill_resource_unsupported_encoding".to_string());
+    }
+    let definition_after = resolve_regular_package_file(
+        &skill.package_root,
+        canonical_root,
+        SKILL_DEFINITION_FILE,
+        "skill_definition_changed",
+        "skill_definition_changed",
+    )
+    .map_err(str::to_string)?;
+    let definition_after = read_bounded(&definition_after, MAX_SKILL_DEFINITION_BYTES)
+        .map_err(|_| "skill_definition_changed".to_string())?;
+    if sha256_hex(&definition_after) != request.expected_definition_revision {
+        return Err("skill_definition_changed".to_string());
+    }
+    Ok(PreparedConfiguredSkillExecution {
+        target_path: target,
+        script,
     })
 }
 
@@ -525,7 +586,7 @@ fn resolve_regular_package_file(
     Ok(target)
 }
 
-fn metadata_is_link_like(metadata: &fs::Metadata) -> bool {
+pub(super) fn metadata_is_link_like(metadata: &fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
         return true;
     }
@@ -582,17 +643,9 @@ fn valid_package_name(name: &str) -> bool {
         && !name.chars().any(char::is_control)
 }
 
-fn push_diagnostic(
-    diagnostics: &mut Vec<RunnerSkillDiagnostic>,
-    code: &str,
-    candidate_name: Option<&str>,
-) {
+fn push_diagnostic(diagnostics: &mut Vec<String>, code: &str) {
     if diagnostics.len() < MAX_CONFIGURED_SKILL_DIAGNOSTICS {
-        diagnostics.push(RunnerSkillDiagnostic {
-            reason_code: code.to_string(),
-            candidate_name: candidate_name.map(str::to_string),
-            source_scope: Some("runner".to_string()),
-        });
+        diagnostics.push(code.to_string());
     }
 }
 

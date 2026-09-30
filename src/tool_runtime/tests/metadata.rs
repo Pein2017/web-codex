@@ -14,6 +14,7 @@ use crate::tool_runtime::kernel::{
 use crate::tool_runtime::project_resolution::{
     ProjectKnowledgeSourceResolution, ProjectKnowledgeUnavailableReason,
 };
+use crate::tool_runtime::tool_call::ComputerObserveToolCall;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -281,6 +282,32 @@ async fn register_pointer_target_for_auth(
         .await
         .unwrap();
 }
+#[tokio::test]
+async fn computer_gateway_rejects_missing_exact_action_capability_before_dispatch() {
+    let runtime = test_runtime();
+    let auth = crate::auth::shared_key_context("computer-capability-fence");
+    register_pointer_target_for_auth(&runtime, "pointer-only", "Pointer Only", &auth).await;
+
+    let result = runtime
+        .dispatch_computer_tool(
+            ToolCall::ComputerObserve(ComputerObserveToolCall::SnapshotDisplay {
+                client_id: "pointer-only".to_string(),
+                display_id: "display_iavN7wEjRWeJq83v".to_string(),
+                max_width: None,
+                max_height: None,
+            }),
+            Some(&auth),
+        )
+        .await;
+    assert!(!result.success);
+    assert_eq!(result.output["error_kind"], "capability_unavailable");
+    assert!(result
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("computer_display_observe"));
+}
+
 async fn register_clipboard_target_for_auth(
     runtime: &ToolRuntime,
     client_id: &str,
@@ -347,6 +374,8 @@ async fn register_agent_projects_for_auth(
                 capabilities: crate::test_support::current_runner_capabilities(
                     RunnerCapabilities {
                         shell: true,
+                        explicit_shell_selection: false,
+                        bash_login_shell: false,
                         file_read: true,
                         file_write: true,
                         artifact_export_chunk_read: false,
@@ -354,11 +383,11 @@ async fn register_agent_projects_for_auth(
                         structured_file_delete: false,
                         apply_text_edit_occurrence: false,
                         apply_text_edit_line_scope: false,
+                        apply_text_edit_expected_match_count: false,
                         apply_text_edit_local_guard_without_sha: false,
                         apply_patch: false,
                         apply_patch_match_metadata: false,
                         apply_patch_matching_mode: false,
-                        apply_patch_strict_matching: false,
                         git: true,
                         jobs: true,
                         async_jobs: true,
@@ -370,6 +399,7 @@ async fn register_agent_projects_for_auth(
                         structured_cargo_test_count_assertion: true,
                         structured_cargo_test_execution_policy: true,
                         structured_cargo_test_lib: true,
+                        structured_cargo_check_packages: true,
                         structured_go_test_json: true,
                         structured_go_test_tool: true,
                         structured_go_test_packages: true,
@@ -377,6 +407,7 @@ async fn register_agent_projects_for_auth(
                         structured_script_payload: false,
                         structured_script_javascript: false,
                         structured_script_typescript: false,
+                        structured_script_python: false,
                         internal_posix_script: false,
                         structured_execution_jobs: false,
                         detached_process_jobs: false,
@@ -386,7 +417,11 @@ async fn register_agent_projects_for_auth(
                         project_path_registration: false,
                         managed_worktree: false,
                         skill_runtime: false,
+                        skill_resource_execution: false,
                         skill_management: false,
+                        browser_observe: false,
+                        browser_control: false,
+                        browser_launch: false,
                         computer_observe: false,
                         computer_application_discovery: false,
                         computer_application_launch: false,
@@ -407,6 +442,7 @@ async fn register_agent_projects_for_auth(
                         native_tool_plugins: false,
                         managed_ssh_resources: false,
                         runner_config_control: false,
+                        instruction_runtime: false,
                     },
                 ),
                 policy: None,
@@ -1075,10 +1111,12 @@ async fn repository_knowledge_association_revalidates_identity_availability_and_
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project: target_id,
                         command: "pwd".to_string(),
                         session_id: None,
                         timeout_secs: Some(30),
+                        sync_wait_secs: Some(30),
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -1272,10 +1310,12 @@ async fn replacement_runner_pending_inventory_has_zero_project_routing_authority
 
     let pending_calls = vec![
         ToolCall::RunShell {
+            login: false,
             project: project_id.clone(),
             command: "pwd".to_string(),
             session_id: None,
             timeout_secs: Some(30),
+            sync_wait_secs: None,
             cwd: None,
             purpose: None,
             shell: None,
@@ -1356,10 +1396,12 @@ async fn replacement_runner_pending_inventory_has_zero_project_routing_authority
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project: project_id,
                         command: "pwd".to_string(),
                         session_id: None,
                         timeout_secs: Some(30),
+                        sync_wait_secs: Some(30),
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -1439,10 +1481,12 @@ async fn replacement_runner_removed_project_never_inherits_old_authority() {
         let result = runtime
             .dispatch_with_auth(
                 ToolCall::RunShell {
+                    login: false,
                     project: project_id.clone(),
                     command: "pwd".to_string(),
                     session_id: None,
                     timeout_secs: Some(30),
+                    sync_wait_secs: None,
                     cwd: None,
                     purpose: None,
                     shell: None,
@@ -1697,10 +1741,12 @@ async fn unique_short_agent_project_id_is_resolved_by_runtime_surface() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project: "agent-proj".to_string(),
                         command: "echo hi".to_string(),
                         session_id: None,
                         timeout_secs: Some(1),
+                        sync_wait_secs: None,
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -1767,10 +1813,12 @@ async fn runner_capability_rejection_matrix_names_required_capability() {
         let project = agent_test_project_id(client_id);
         let call = match case {
             CapabilityCase::RunShell => ToolCall::RunShell {
+                login: false,
                 project,
                 command: "echo hi".to_string(),
                 session_id: None,
                 timeout_secs: None,
+                sync_wait_secs: None,
                 cwd: None,
                 purpose: None,
                 shell: None,
@@ -1803,10 +1851,12 @@ async fn runner_tool_unknown_client_returns_unknown_project_error() {
     let result = runtime
         .dispatch_with_auth(
             ToolCall::RunShell {
+                login: false,
                 project: agent_test_project_id("ghost"),
                 command: "echo hi".to_string(),
                 session_id: None,
                 timeout_secs: None,
+                sync_wait_secs: None,
                 cwd: None,
                 purpose: None,
                 shell: None,
@@ -1924,22 +1974,9 @@ fn runtime_status_input_schema_exposes_compact_flags() {
         .expect("runtime_status agents output description");
     assert!(agents_description.contains("stale_count"));
     assert!(!agents_description.contains("offline_count"));
-    let runtime_exposure_description = output_schema["properties"]["output"]["properties"]
-        ["runtime_exposure"]["description"]
-        .as_str()
-        .expect("runtime_status runtime_exposure output description");
-    for exposure in [
-        crate::model_surface::MODEL_SURFACE_LOCAL_CODING,
-        crate::model_surface::MODEL_SURFACE_ADAPTIVE_RUNTIME,
-        crate::model_surface::MODEL_SURFACE_FULL_OPERATOR_RUNTIME,
-        crate::model_surface::RUNTIME_EXPOSURE_PROJECT_CONNECTOR,
-    ] {
-        assert!(
-            runtime_exposure_description.contains(exposure),
-            "runtime_status runtime_exposure output description missing {exposure}"
-        );
-    }
-    assert!(!runtime_exposure_description.contains("canonical_connector"));
+    assert!(output_schema["properties"]["output"]["properties"]
+        .get("runtime_exposure")
+        .is_none());
     let compact_schemas =
         &output_schema["properties"]["output"]["properties"]["mcp_compact_schemas"];
     assert_eq!(compact_schemas["type"], "boolean");
@@ -2071,6 +2108,61 @@ async fn tool_manifest_keeps_list_compact_and_exact_contract_bounded() {
 }
 
 #[tokio::test]
+async fn tool_manifest_exact_route_is_parser_ready_for_direct_and_gateway_tools() {
+    let runtime = test_runtime();
+
+    let direct = runtime
+        .dispatch(ToolCall::ToolManifest {
+            tool_name: Some("run_shell".to_string()),
+            category: None,
+            intent: None,
+            include_recommended_flows: false,
+            include_risk_summary: false,
+        })
+        .await;
+    assert!(direct.success, "{:?}", direct.error);
+    assert_eq!(direct.output["route"]["primary"]["mode"], "direct");
+    assert_eq!(direct.output["route"]["primary"]["tool"], "run_shell");
+    assert_eq!(direct.output["route"]["fallback"]["mode"], "gateway");
+    assert_eq!(
+        direct.output["route"]["fallback"]["tool"],
+        crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+    );
+    assert_eq!(direct.output["route"]["fallback"]["target"], "run_shell");
+    assert_eq!(
+        direct.output["route"]["fallback"]["when"],
+        "direct_callable_unavailable"
+    );
+    assert_eq!(
+        direct.output["route"]["fallback"]["blocked_when_mcp_apps_enabled"],
+        false
+    );
+    assert_eq!(
+        direct.output["route"]["tool_manifest_registers_host_tool"],
+        false
+    );
+    assert_eq!(direct.output["route"]["discovery_effect"], "none");
+
+    let gateway = runtime
+        .dispatch(ToolCall::ToolManifest {
+            tool_name: Some("apply_patch".to_string()),
+            category: None,
+            intent: None,
+            include_recommended_flows: false,
+            include_risk_summary: false,
+        })
+        .await;
+    assert!(gateway.success, "{:?}", gateway.error);
+    assert_eq!(gateway.output["route"]["primary"]["mode"], "gateway");
+    assert_eq!(
+        gateway.output["route"]["primary"]["tool"],
+        crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+    );
+    assert_eq!(gateway.output["route"]["primary"]["target"], "apply_patch");
+    assert!(gateway.output["route"]["fallback"].is_null());
+}
+
+#[tokio::test]
 async fn bounded_list_tools_hides_schemas_and_finds_artifact_upload_tools() {
     let runtime = test_runtime();
     let full = runtime
@@ -2183,7 +2275,7 @@ async fn tool_manifest_recommends_default_remote_coding_loop() {
         "search_project_texts",
         "read_files",
         "import_conversation_files_to_project",
-        "export_project_artifact",
+        "project_artifact",
         "show_changes",
         "apply_text_edits",
         "apply_unified_diff",
@@ -2295,18 +2387,13 @@ async fn runtime_status_uses_agent_projects_as_effective() {
 
 #[tokio::test]
 async fn runtime_status_includes_build_metadata() {
-    let runtime =
-        test_runtime().with_model_surface(crate::model_surface::ModelSurface::FullOperatorRuntime);
+    let runtime = test_runtime();
     let result = runtime.dispatch(runtime_status_call()).await;
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(
-        result.output["runtime_exposure"],
-        crate::model_surface::MODEL_SURFACE_FULL_OPERATOR_RUNTIME
-    );
+    assert!(result.output.get("runtime_exposure").is_none());
     assert_eq!(
         result.output["mcp_compact_schemas"],
         crate::model_surface::effective_mcp_compact_schemas(
-            runtime.runtime_exposure(),
             crate::config::mcp_compact_schemas_override(),
         )
     );
@@ -2396,104 +2483,22 @@ async fn runtime_status_preserves_allowlisted_effective_config_across_projection
 async fn runtime_status_reports_effective_mcp_compact_schema_policy() {
     let mut env = crate::test_support::TestEnvGuard::new();
     env.remove("WEBCODEX_MCP_COMPACT_SCHEMAS");
+    let runtime = test_runtime();
 
-    for (surface, expected) in [
-        (crate::model_surface::ModelSurface::LocalCoding, false),
-        (crate::model_surface::ModelSurface::AdaptiveRuntime, true),
-        (
-            crate::model_surface::ModelSurface::FullOperatorRuntime,
-            false,
-        ),
-    ] {
-        let runtime = test_runtime().with_model_surface(surface);
-        let result = runtime.dispatch(runtime_status_call()).await;
-        assert!(result.success, "{surface:?}: {:?}", result.error);
-        assert_eq!(
-            result.output["mcp_compact_schemas"], expected,
-            "{surface:?}"
-        );
-    }
+    let default = runtime.dispatch(runtime_status_call()).await;
+    assert!(default.success, "{:?}", default.error);
+    assert_eq!(default.output["mcp_compact_schemas"], true);
+    assert!(default.output.get("runtime_exposure").is_none());
 
-    let adaptive =
-        test_runtime().with_model_surface(crate::model_surface::ModelSurface::AdaptiveRuntime);
     env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "false");
-    let full = adaptive.dispatch(runtime_status_call()).await;
+    let full = runtime.dispatch(runtime_status_call()).await;
     assert_eq!(full.output["mcp_compact_schemas"], false);
+
     env.set("WEBCODEX_MCP_COMPACT_SCHEMAS", "true");
-    let compact = adaptive.dispatch(runtime_status_call()).await;
+    let compact = runtime.dispatch(runtime_status_call()).await;
     assert_eq!(compact.output["mcp_compact_schemas"], true);
 }
 
-#[tokio::test]
-async fn runtime_status_defaults_to_local_coding_surface() {
-    // ToolRuntime::new_for_tests defaults to local_coding; keep this as a real
-    // default-constructor check rather than overriding the value under test.
-    let runtime = test_runtime();
-    let result = runtime.dispatch(runtime_status_call()).await;
-    assert!(result.success, "{:?}", result.error);
-    assert_eq!(
-        result.output["runtime_exposure"],
-        crate::model_surface::MODEL_SURFACE_LOCAL_CODING
-    );
-}
-
-#[tokio::test]
-async fn runtime_status_reports_project_connector_exposure_when_configured() {
-    let mut env = crate::test_support::TestEnvGuard::new();
-    env.set("WEBCODEX_SHARED_KEY_ENABLED", "true");
-    env.set("WEBCODEX_ALLOW_ANONYMOUS", "true");
-    let runtime = runtime_with_info(RuntimeInfo {
-        auth_enabled: true,
-        oauth2_enabled: true,
-        oauth2_shared_key_bridge_enabled: true,
-        ..RuntimeInfo::default()
-    })
-    .with_runtime_exposure(crate::model_surface::RuntimeExposure::ProjectConnector);
-    let full = runtime.dispatch(runtime_status_call()).await;
-    assert_eq!(
-        full.output["runtime_exposure"],
-        crate::model_surface::RUNTIME_EXPOSURE_PROJECT_CONNECTOR
-    );
-    assert_eq!(
-        full.output["effective_config"]["auth"]["shared_key_enabled"],
-        false
-    );
-    assert_eq!(
-        full.output["effective_config"]["auth"]["anonymous_enabled"],
-        false
-    );
-    assert_eq!(
-        full.output["effective_config"]["auth"]["oauth2_enabled"],
-        true
-    );
-    assert_eq!(
-        full.output["effective_config"]["auth"]["oauth2_shared_key_bridge_enabled"],
-        true
-    );
-    let compact = runtime
-        .dispatch(ToolCall::from_tool_name("runtime_status", json!({"compact": true})).unwrap())
-        .await;
-    assert_eq!(
-        compact.output["runtime_exposure"],
-        crate::model_surface::RUNTIME_EXPOSURE_PROJECT_CONNECTOR
-    );
-    assert_eq!(
-        compact.output["mcp_compact_schemas"],
-        crate::model_surface::effective_mcp_compact_schemas(
-            runtime.runtime_exposure(),
-            crate::config::mcp_compact_schemas_override(),
-        )
-    );
-    assert_eq!(
-        compact.output["effective_config"]["auth"]["oauth2_shared_key_bridge_enabled"],
-        true
-    );
-}
-
-// runtime_status resolves the effective exposure-aware compact-schema policy on
-// each call. Serialize this async assertion with tests that mutate the override
-// so the value cannot change between dispatch and the matching expectation.
-#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn runtime_status_compact_and_summary_only_return_sanitized_summary() {
     use crate::runner_protocol::{RunnerPolicySummary, ShellProfilesSummary};
@@ -2532,7 +2537,6 @@ async fn runtime_status_compact_and_summary_only_return_sanitized_summary() {
         assert_eq!(
             summary["mcp_compact_schemas"],
             crate::model_surface::effective_mcp_compact_schemas(
-                runtime.runtime_exposure(),
                 crate::config::mcp_compact_schemas_override(),
             ),
             "arguments: {arguments}"
@@ -2559,7 +2563,6 @@ async fn runtime_status_compact_and_summary_only_return_sanitized_summary() {
             "/connection_layers/server_transport/status",
             "/connection_layers/server_registration/status",
             "/connection_layers/project_registry/status",
-            "/connection_layers/connector_endpoint/status",
             "/connection_layers/last_successful_tool_call/status",
         ] {
             assert!(
@@ -2689,9 +2692,9 @@ async fn runtime_status_quic_enabled_error_is_sanitized() {
         auth_enabled: false,
         configured_public_url: None,
         quic: Some(status),
+        mcp_instructions: None,
         oauth2_enabled: false,
         oauth2_shared_key_bridge_enabled: false,
-        mcp_instructions: None,
     });
     let result = runtime.dispatch(runtime_status_call()).await;
     assert!(result.success);
@@ -2721,9 +2724,9 @@ async fn runtime_status_quic_started_reports_listen_and_alpn() {
         auth_enabled: false,
         configured_public_url: None,
         quic: Some(status),
+        mcp_instructions: None,
         oauth2_enabled: false,
         oauth2_shared_key_bridge_enabled: false,
-        mcp_instructions: None,
     });
     let result = runtime.dispatch(runtime_status_call()).await;
     assert!(result.success);
@@ -2741,9 +2744,9 @@ async fn runtime_status_auth_enabled_reflects_runtime_info() {
     let runtime = runtime_with_info(RuntimeInfo {
         auth_enabled: false,
         configured_public_url: None,
+        mcp_instructions: None,
         oauth2_enabled: false,
         oauth2_shared_key_bridge_enabled: false,
-        mcp_instructions: None,
         quic: Some(Arc::new(std::sync::Mutex::new(
             crate::config::QuicServerConfig::default().runtime_status(),
         ))),
@@ -2756,9 +2759,9 @@ async fn runtime_status_auth_enabled_reflects_runtime_info() {
     let runtime = runtime_with_info(RuntimeInfo {
         auth_enabled: true,
         configured_public_url: Some("https://webcodex.example.com".to_string()),
+        mcp_instructions: None,
         oauth2_enabled: true,
         oauth2_shared_key_bridge_enabled: true,
-        mcp_instructions: None,
         quic: Some(Arc::new(std::sync::Mutex::new(
             crate::config::QuicServerConfig::default().runtime_status(),
         ))),
@@ -3174,7 +3177,10 @@ async fn computer_list_targets_is_minimal_capability_filtered_and_auth_scoped() 
     .await;
 
     let result = runtime
-        .dispatch_with_auth(ToolCall::ComputerListTargets, Some(&shared_a))
+        .dispatch_computer_tool(
+            ToolCall::ComputerObserve(ComputerObserveToolCall::Targets),
+            Some(&shared_a),
+        )
         .await;
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["count"], 8);
@@ -3412,11 +3418,6 @@ async fn runtime_status_distinguishes_stale_registration_from_transport_connecti
         "registration_instance_disconnected"
     );
     assert_eq!(layers["project_registry"]["status"], "not_configured");
-    assert_eq!(layers["connector_endpoint"]["status"], "not_configured");
-    assert_eq!(
-        layers["connector_endpoint"]["reason_code"],
-        "connector_runtime_disabled"
-    );
     assert!(layers.get("session_binding").is_none());
 }
 
@@ -3458,6 +3459,11 @@ async fn runtime_status_tools_summary_lists_names() {
     assert!(result.success);
     let tools = &result.output["tools"];
     let names = tools["names"].as_array().unwrap();
+    let expected_names = registered_tool_specs()
+        .into_iter()
+        .map(|spec| Value::String(spec.name))
+        .collect::<Vec<_>>();
+    assert_eq!(names, expected_names.as_slice());
     assert!(!names.is_empty());
     assert!(
         names.iter().any(|n| n == "runtime_status"),

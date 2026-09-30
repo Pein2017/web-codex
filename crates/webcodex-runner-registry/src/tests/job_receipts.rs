@@ -1,14 +1,16 @@
 use super::*;
 use crate::{
-    JobReceiptStore, NoopRunnerRegistryTelemetry, RetainedJobReceipt, RunnerAccess,
-    RunnerAccessGroup,
+    JobReceiptStore, JobTerminalEvent, JobTerminalEventSink, NoopRunnerRegistryTelemetry,
+    RetainedJobReceipt, RunnerAccess, RunnerAccessGroup,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 #[derive(Debug, Default)]
 struct MemoryReceipts {
     rows: Mutex<Vec<RetainedJobReceipt>>,
     fail: bool,
+    failures_remaining: std::sync::atomic::AtomicUsize,
     registry: Mutex<Option<Weak<crate::receipts::ReceiptRegistryState>>>,
 }
 impl JobReceiptStore for MemoryReceipts {
@@ -25,7 +27,16 @@ impl JobReceiptStore for MemoryReceipts {
                 "storage must run after registry unlock"
             );
         }
-        if self.fail {
+        if self.fail
+            || self
+                .failures_remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok()
+        {
             return Err("injected failure".into());
         }
         let mut rows = self.rows.lock().unwrap();
@@ -61,6 +72,57 @@ async fn durable(store: &Arc<MemoryReceipts>) -> RunnerRegistry {
     *store.registry.lock().unwrap() = Some(Arc::downgrade(&registry.inner));
     registry
 }
+
+#[derive(Debug, Default)]
+struct MemoryTerminalEvents {
+    rows: Mutex<Vec<JobTerminalEvent>>,
+    fail_next: AtomicBool,
+    registry: Mutex<Option<Weak<crate::receipts::ReceiptRegistryState>>>,
+}
+
+impl MemoryTerminalEvents {
+    fn fail_once(&self) {
+        self.fail_next.store(true, Ordering::SeqCst);
+    }
+}
+
+impl JobTerminalEventSink for MemoryTerminalEvents {
+    fn record_terminal_event(&self, event: &JobTerminalEvent) -> Result<(), String> {
+        if let Some(registry) = self
+            .registry
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(Weak::upgrade)
+        {
+            assert!(
+                registry.is_unlocked_for_test(),
+                "terminal-event sink must run after registry unlock"
+            );
+        }
+        if self.fail_next.swap(false, Ordering::SeqCst) {
+            return Err("injected terminal-event failure".into());
+        }
+        self.rows.lock().unwrap().push(event.clone());
+        Ok(())
+    }
+}
+
+async fn durable_with_events(
+    store: &Arc<MemoryReceipts>,
+    events: &Arc<MemoryTerminalEvents>,
+) -> RunnerRegistry {
+    let registry = RunnerRegistry::with_job_receipt_and_terminal_event_sink(
+        Arc::new(NoopRunnerRegistryTelemetry),
+        store.clone(),
+        events.clone(),
+    )
+    .await;
+    let weak = Arc::downgrade(&registry.inner);
+    *store.registry.lock().unwrap() = Some(weak.clone());
+    *events.registry.lock().unwrap() = Some(weak);
+    registry
+}
 fn access(owner: Option<&str>, group: Option<RunnerAccessGroup>) -> RunnerAccess {
     RunnerAccess {
         username: owner.map(str::to_string),
@@ -68,6 +130,206 @@ fn access(owner: Option<&str>, group: Option<RunnerAccessGroup>) -> RunnerAccess
         global_visibility: false,
         owner_bypass: false,
     }
+}
+
+#[tokio::test]
+async fn terminal_events_emit_once_only_after_accepted_sequenced_terminal_truth() {
+    let store = Arc::new(MemoryReceipts::default());
+    let events = Arc::new(MemoryTerminalEvents::default());
+    let registry = durable_with_events(&store, &events).await;
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
+
+    registry
+        .update_job(update(INSTANCE_A, &job.job_id, 2, "running", None, false))
+        .await
+        .unwrap();
+    assert!(events.rows.lock().unwrap().is_empty());
+
+    let out_of_order = registry
+        .update_job(update(INSTANCE_A, &job.job_id, 1, "completed", None, true))
+        .await
+        .unwrap();
+    assert_eq!(
+        out_of_order.status, "running",
+        "out-of-order sequence must not terminalize"
+    );
+    assert!(events.rows.lock().unwrap().is_empty());
+
+    let duplicate_sequence = registry
+        .update_job(update(INSTANCE_A, &job.job_id, 2, "completed", None, true))
+        .await
+        .unwrap();
+    assert_eq!(
+        duplicate_sequence.status, "running",
+        "duplicate sequence must not terminalize"
+    );
+    assert!(events.rows.lock().unwrap().is_empty());
+
+    registry
+        .update_job(update(INSTANCE_A, &job.job_id, 3, "completed", None, true))
+        .await
+        .unwrap();
+    {
+        let rows = events.rows.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].job_id, job.job_id);
+        assert_eq!(rows[0].status, "completed");
+        assert_eq!(rows[0].outcome, "succeeded");
+    }
+
+    let replay = registry
+        .update_job(update(INSTANCE_A, &job.job_id, 3, "completed", None, true))
+        .await
+        .unwrap();
+    assert_eq!(replay.status, "completed");
+    assert_eq!(events.rows.lock().unwrap().len(), 1);
+}
+
+
+#[tokio::test]
+async fn terminal_event_sink_failure_requeues_candidate_until_a_later_registry_unlock() {
+    let store = Arc::new(MemoryReceipts::default());
+    let events = Arc::new(MemoryTerminalEvents::default());
+    let registry = durable_with_events(&store, &events).await;
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
+
+    events.fail_once();
+    registry
+        .update_job(update(INSTANCE_A, &job.job_id, 1, "completed", None, true))
+        .await
+        .unwrap();
+    assert!(events.rows.lock().unwrap().is_empty());
+
+    // Any later registry guard release retries the exact bounded candidate.
+    assert_eq!(registry.get_job(&job.job_id).await.unwrap().status, "completed");
+    {
+        let rows = events.rows.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].job_id, job.job_id);
+    }
+    let _ = registry.get_job(&job.job_id).await.unwrap();
+    assert_eq!(events.rows.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn same_instance_reconciliation_preserves_exact_job_identity_for_terminal_event() {
+    let store = Arc::new(MemoryReceipts::default());
+    let events = Arc::new(MemoryTerminalEvents::default());
+    let registry = durable_with_events(&store, &events).await;
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let (job, request) = start_and_take_over(&registry, INSTANCE_A).await;
+    registry
+        .update_job(update(INSTANCE_A, &job.job_id, 1, "running", None, false))
+        .await
+        .unwrap();
+
+    let snapshot = snapshot_from_request(
+        &job,
+        &request,
+        "running",
+        1,
+        ShellJobStreamSnapshot::default(),
+    );
+    register(
+        &registry,
+        INSTANCE_A,
+        ShellJobInventory {
+            active_complete: true,
+            jobs: vec![snapshot],
+        },
+    )
+    .await;
+    assert_eq!(registry.get_job(&job.job_id).await.unwrap().job_id, job.job_id);
+    assert!(events.rows.lock().unwrap().is_empty());
+
+    registry
+        .update_job(update(INSTANCE_A, &job.job_id, 2, "completed", None, true))
+        .await
+        .unwrap();
+    let rows = events.rows.lock().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].job_id, job.job_id);
+    assert_eq!(rows[0].status, "completed");
+}
+#[tokio::test]
+async fn terminal_events_share_protocol_violation_lost_and_stopped_classification() {
+    let store = Arc::new(MemoryReceipts::default());
+    let events = Arc::new(MemoryTerminalEvents::default());
+    let registry = durable_with_events(&store, &events).await;
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+
+    let (protocol, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    let mut invalid = update(INSTANCE_A, &protocol.job_id, 1, "running", None, false);
+    invalid.validation_progress = Some(ShellJobValidationProgress {
+        completed: 0,
+        current_step: None,
+        failed_step: None,
+    });
+    let failed = registry.update_job(invalid).await.unwrap();
+    assert_eq!(failed.status, "failed");
+
+    let (lost, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    registry
+        .update_job(update(INSTANCE_A, &lost.job_id, 1, "running", None, false))
+        .await
+        .unwrap();
+    drive_into_recovering(&registry, &lost.job_id, INSTANCE_A).await;
+    age_recovering_since(&registry, &lost.job_id, job_recovery_grace_secs() + 1).await;
+    recovery_timeout_sweep(&registry).await;
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+
+    let (stopped, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    registry
+        .update_job(update(INSTANCE_A, &stopped.job_id, 1, "running", None, false))
+        .await
+        .unwrap();
+    registry
+        .stop_job(&stopped.job_id, "tester".to_string())
+        .await
+        .unwrap();
+    registry
+        .update_job(update(INSTANCE_A, &stopped.job_id, 2, "stopped", None, true))
+        .await
+        .unwrap();
+
+    let rows = events.rows.lock().unwrap();
+    let event = |job_id: &str| rows.iter().find(|event| event.job_id == job_id).unwrap();
+    assert_eq!((event(&protocol.job_id).status.as_str(), event(&protocol.job_id).outcome.as_str()), ("failed", "failed"));
+    assert_eq!((event(&lost.job_id).status.as_str(), event(&lost.job_id).outcome.as_str()), ("lost", "failed"));
+    assert_eq!((event(&stopped.job_id).status.as_str(), event(&stopped.job_id).outcome.as_str()), ("stopped", "cancelled"));
+}
+
+#[tokio::test]
+async fn replaced_runner_terminal_update_is_fenced_and_cannot_duplicate_lost_event() {
+    let store = Arc::new(MemoryReceipts::default());
+    let events = Arc::new(MemoryTerminalEvents::default());
+    let registry = durable_with_events(&store, &events).await;
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    registry
+        .update_job(update(INSTANCE_A, &job.job_id, 1, "running", None, false))
+        .await
+        .unwrap();
+
+    register(&registry, INSTANCE_B, empty_inventory()).await;
+    assert_eq!(registry.get_job(&job.job_id).await.unwrap().status, "lost");
+    assert_eq!(events.rows.lock().unwrap().len(), 1);
+
+    let stale = registry
+        .update_job(update(INSTANCE_A, &job.job_id, 2, "completed", None, true))
+        .await
+        .unwrap_err();
+    assert!(
+        stale.contains("no longer the active instance")
+            || stale.contains("replaced runner instance"),
+        "unexpected stale-instance error: {stale}"
+    );
+    let rows = events.rows.lock().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].job_id, job.job_id);
+    assert_eq!(rows[0].status, "lost");
 }
 
 #[tokio::test]
@@ -555,4 +817,31 @@ async fn receipts_unowned_admission_preserves_only_existing_global_visibility() 
         .get_job_for_auth(Some(&access(Some("tester"), None)), &job.job_id)
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn receipts_transient_storage_failure_retries_without_job_reexecution() {
+    let store = Arc::new(MemoryReceipts {
+        failures_remaining: std::sync::atomic::AtomicUsize::new(1),
+        ..Default::default()
+    });
+    let registry = durable(&store).await;
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let (job, _) = start_and_take_over(&registry, INSTANCE_A).await;
+    registry
+        .update_job(update(
+            INSTANCE_A,
+            &job.job_id,
+            2,
+            "completed",
+            Some("done\n"),
+            true,
+        ))
+        .await
+        .unwrap();
+    let observed = registry.get_job(&job.job_id).await.unwrap();
+    assert_eq!(observed.exit_code, Some(0));
+    let rows = store.rows.lock().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].snapshot.job_id, job.job_id);
 }

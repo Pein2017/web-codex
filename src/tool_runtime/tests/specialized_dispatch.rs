@@ -22,10 +22,6 @@ fn context() -> ToolCallContext<'static> {
     }
 }
 
-fn invocation_metadata() -> Vec<String> {
-    Vec::new()
-}
-
 #[tokio::test]
 async fn specialized_dispatch_leaves_ordinary_and_unknown_requests_untouched() {
     let runtime = ToolRuntime::new_for_tests();
@@ -35,14 +31,11 @@ async fn specialized_dispatch_leaves_ordinary_and_unknown_requests_untouched() {
             tool_name: tool_name.to_string(),
             arguments: json!(null),
         };
-        assert!(try_dispatch_specialized_gateway(
-            &runtime,
-            &request,
-            context(),
-            &invocation_metadata()
-        )
-        .await
-        .is_none());
+        assert!(
+            try_dispatch_specialized_gateway(&runtime, &request, context())
+                .await
+                .is_none()
+        );
         assert_eq!(request.arguments, json!(null));
     }
 }
@@ -88,10 +81,9 @@ async fn specialized_dispatch_maps_each_gateway_action_scope_without_static_poli
             tool_name: tool_name.to_string(),
             arguments,
         };
-        let outcome =
-            try_dispatch_specialized_gateway(&runtime, &request, context(), &invocation_metadata())
-                .await
-                .unwrap();
+        let outcome = try_dispatch_specialized_gateway(&runtime, &request, context())
+            .await
+            .unwrap();
         assert!(!outcome.success);
         assert!(outcome.result.is_none());
         assert!(
@@ -117,14 +109,9 @@ async fn specialized_dispatch_parse_failures_never_fall_through() {
                 tool_name: tool_name.to_string(),
                 arguments,
             };
-            let outcome = try_dispatch_specialized_gateway(
-                &runtime,
-                &request,
-                context(),
-                &invocation_metadata(),
-            )
-            .await
-            .unwrap();
+            let outcome = try_dispatch_specialized_gateway(&runtime, &request, context())
+                .await
+                .unwrap();
             assert!(!outcome.success);
             assert!(outcome.result.is_none());
             assert!(
@@ -181,7 +168,6 @@ async fn specialized_dispatch_preserves_recording_authority_denial_as_tool_resul
                     session_id: Some(session_id),
                     ..context()
                 },
-                &invocation_metadata(),
             )
             .await
             .unwrap();

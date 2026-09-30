@@ -94,7 +94,7 @@ Memory provider    Skill providers    Plugin provider
 
 最初探索时，Skill/Memory 的 runtime/management 分类分别由实现模块中的 `is_*_tool_name` helpers 持有，Kernel、发现 surface、MCP adapter 与 registry 又各自消费或重复维护这些名字集合。这不是已证明的权限漏洞，而是“新增工具时容易改漏一处”的结构风险。
 
-后续 consolidation 已将这一个静态事实收敛到 canonical `ToolDefinition`：`ToolOperatorExtensionFamily` 只描述 `SkillRuntime / SkillManagement / MemoryRuntime / MemoryManagement / TraceDiagnostics` 的 Stateless Operator protocol admission family，各定义在 Skill、Memory、diagnostic 的 ToolDefinition 旁显式声明。Registry、Kernel capability gate、tool manifest surface 和 MCP Full Operator projection 统一通过 `runtime_tool_operator_extension_family` 消费；旧 Skill/Memory classifier 和 registry 中对应的硬编码 family name sets 已从 live code 删除。
+后续 consolidation 已将这一个静态事实收敛到 canonical `ToolDefinition`：`ToolOperatorExtensionFamily` 只描述 `SkillRuntime / SkillManagement / MemoryRuntime / MemoryManagement / TraceDiagnostics` 的 Stateless Operator protocol admission family，各定义在 Skill、Memory、diagnostic 的 ToolDefinition 旁显式声明。Registry、Kernel capability gate、tool manifest 与 MCP Stateless protocol-extension projection 统一通过 `runtime_tool_operator_extension_family` 消费；旧 Skill/Memory classifier 和 registry 中对应的硬编码 family name sets 已从 live code 删除。
 
 证据：[tool_definition.rs](../../crates/webcodex-tool-contracts/src/tool_definition.rs)、[tool_policy.rs](../../crates/webcodex-tool-contracts/src/tool_policy.rs)、[tool_specs.rs](../../crates/webcodex-tool-contracts/src/registry/tool_specs.rs)、[kernel.rs](../../src/tool_runtime/kernel.rs)、[surface.rs](../../src/tool_runtime/surface.rs)、[mcp/tools.rs](../../src/mcp/tools.rs)。
 
@@ -193,7 +193,7 @@ Stage 4A1 因此保留为 **managed-worktree source lineage foundation**：它�
 
 旧 configured/managed enqueue wrapper和compatibility alias没有保留。这个收敛只改变内部protocol/admission shape：authorization、Project authority、Runner instance fencing、management outcome-unknown、ToolResult schema与模型可见Skill工具名称/参数仍由原边界保持。
 
-同理，内容 revision、catalog revision、状态 CAS、Job observation token、Session context ACK 虽然都长得像字符串，不应共用“版本号”的业务语义。只在误传风险高、已有具体消费者的接口引入 typed boundary 或 newtype，不要求每个字符串都包装。
+同理，内容 revision、catalog revision、状态 CAS、Job observation token、Session message ACK 虽然都长得像字符串，不应共用“版本号”的业务语义。只在误传风险高、已有具体消费者的接口引入 typed boundary 或 newtype，不要求每个字符串都包装。
 
 ## 5. 可以类推到其他领域的设计
 

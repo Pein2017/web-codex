@@ -18,9 +18,9 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "clean",
-                schema_type(
+                nullable_schema(
                     "boolean",
-                    "True when git is available, no findings were reported, and diagnostic evidence was complete.",
+                    "True when Git is available and no findings were reported; null when Git hygiene is not applicable.",
                 ),
             ),
             (
@@ -36,7 +36,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "truncated",
-                schema_type("boolean", "Present as true when findings exceed max_findings, Runner diagnostic output is truncated, or the bounded diagnostic scan is incomplete; omitted otherwise."),
+                schema_type("boolean", "Present as true when findings, diagnostic output or scan bounds make evidence incomplete; omitted otherwise."),
             ),
             (
                 "warnings",

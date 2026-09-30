@@ -4,7 +4,7 @@ use super::access_control::{
 use super::jobs::{
     append_log_limited, assert_active_instance_locked, command_preview, is_final_job_status,
     job_view, notify_job_update, observe_job_terminal, parse_job_lifecycle, process_preview,
-    refresh_job_status_locked, replace_log_limited, script_preview, select_log_lines,
+    refresh_job_status_locked, script_preview, select_log_lines,
 };
 use super::reconciliation::validate_stream_snapshot;
 use super::requests::{
@@ -26,8 +26,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use webcodex_core::runner_operation::{
     RunnerInvocationMetadata, RunnerJobOperation, RunnerJobProcessOperation,
-    RunnerJobScriptOperation, RunnerJobShellOperation, RunnerJobValidationOperation,
-    RunnerOperation,
+    RunnerJobScriptOperation, RunnerJobShellOperation, RunnerJobSkillResourceOperation,
+    RunnerJobValidationOperation, RunnerOperation,
 };
 use webcodex_core::runner_protocol::{
     validate_process_argv, validate_script_request, validation_infrastructure_failure_code,
@@ -36,9 +36,11 @@ use webcodex_core::runner_protocol::{
     ShellJobOpRequest, ShellJobStructuredExecutionMetadata, ShellJobValidationMetadata,
     ShellJobValidationStep, ShellProcessArgv, ShellRunRequest, ShellScriptLanguage,
     ShellScriptPayload, DETACHED_IDEMPOTENCY_KEY_MAX_BYTES, PROCESS_CWD_MAX_BYTES,
-    PROCESS_STDIN_MAX_BYTES, STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
+    PROCESS_STDIN_MAX_BYTES, PROCESS_TIMEOUT_MAX_SECS, STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
     STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS,
 };
+use webcodex_core::runner_skill::RunnerSkillExecutionRequest;
+use webcodex_core::workflow_session_contract::ExecutionShell;
 
 #[derive(Clone, Copy)]
 struct ValidationProtocolError(&'static str);
@@ -558,7 +560,12 @@ pub struct ShellJobStartMetadata {
     pub ssh_resource: Option<String>,
     pub project_cwd: Option<String>,
     pub purpose: Option<String>,
+    /// Descriptive effective-shell metadata for observability/recovery.
     pub shell: Option<String>,
+    /// Authoritative semantic local-shell selector for raw shell execution.
+    /// Distinct from `shell`: descriptive metadata must never grant execution
+    /// semantics.
+    pub explicit_shell: Option<ExecutionShell>,
     pub validation_steps: Vec<ShellJobValidationStep>,
     pub validation: Option<ShellJobValidationMetadata>,
     pub visibility: ShellJobVisibility,
@@ -577,12 +584,14 @@ pub enum StructuredJobExecution {
     Process(ShellProcessArgv),
     DetachedProcess(ShellProcessArgv),
     Script(ShellScriptPayload),
+    SkillResource(RunnerSkillExecutionRequest),
 }
 
 fn validate_structured_job_common(
     cwd: Option<&str>,
     stdin: Option<&str>,
     timeout_secs: u64,
+    timeout_max_secs: u64,
 ) -> Result<(), String> {
     if let Some(stdin) = stdin {
         if stdin.len() > PROCESS_STDIN_MAX_BYTES {
@@ -604,11 +613,9 @@ fn validate_structured_job_common(
             return Err("cwd cannot contain NUL bytes".to_string());
         }
     }
-    if !(STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS..=STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS)
-        .contains(&timeout_secs)
-    {
+    if !(STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS..=timeout_max_secs).contains(&timeout_secs) {
         return Err(format!(
-            "timeout_secs must be between {STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS} and {STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS}"
+            "timeout_secs must be between {STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS} and {timeout_max_secs}"
         ));
     }
     Ok(())
@@ -715,6 +722,12 @@ impl RunnerRegistry {
                 "ssh_session_required: an SSH resource requires a Workflow Session id".to_string(),
             );
         }
+        if metadata.ssh_resource.is_some() && metadata.explicit_shell.is_some() {
+            return Err(
+                "explicit_shell_selection is local-only; named SSH shell selection must stay in the remote compatibility path"
+                    .to_string(),
+            );
+        }
         if metadata.ssh_resource.as_deref().is_some_and(|resource| {
             resource.is_empty()
                 || resource.len() > 80
@@ -730,6 +743,13 @@ impl RunnerRegistry {
         let validation_identity = metadata.validation_identity.clone();
         let validation_tool = metadata.validation_tool.clone();
         let assertion_name = metadata.assertion_name.clone();
+        let explicit_shell = metadata.explicit_shell;
+        let login = body.login;
+        if login
+            && (metadata.ssh_resource.is_some() || explicit_shell != Some(ExecutionShell::Bash))
+        {
+            return Err("bash login mode requires local shell=bash".to_string());
+        }
         let structured_execution = metadata.structured_execution;
         let javascript_script_request = matches!(
             structured_execution.as_ref(),
@@ -741,6 +761,24 @@ impl RunnerRegistry {
             Some(StructuredJobExecution::Script(script))
                 if script.language == ShellScriptLanguage::Typescript
         );
+        let python_script_request = matches!(
+            structured_execution.as_ref(),
+            Some(StructuredJobExecution::Script(script))
+                if script.language == ShellScriptLanguage::Python
+        );
+        let skill_resource_request = matches!(
+            structured_execution.as_ref(),
+            Some(StructuredJobExecution::SkillResource(_))
+        );
+        if explicit_shell.is_some()
+            && (structured_execution.is_some()
+                || !validation_steps.is_empty()
+                || validation.is_some())
+        {
+            return Err(
+                "explicit_shell_selection is valid only for raw shell Job starts".to_string(),
+            );
+        }
         let structured_stdin = metadata.stdin;
         if validation_steps.len() > 3
             || validation_steps.iter().any(|step| !step.is_canonical())
@@ -776,10 +814,15 @@ impl RunnerRegistry {
                     normalized_job_cwd.as_deref(),
                     structured_stdin.as_deref(),
                     timeout_secs,
+                    PROCESS_TIMEOUT_MAX_SECS,
                 )?;
                 let preview =
                     process_preview(&process.executable, process.args.iter().map(String::as_str));
                 let safe = ShellJobStructuredExecutionMetadata {
+                    pytest: webcodex_core::pytest_test_count::is_supported_pytest_argv(
+                        &process.executable,
+                        &process.args,
+                    ),
                     execution_source: "run_process".to_string(),
                     language: None,
                     script_bytes: None,
@@ -797,9 +840,11 @@ impl RunnerRegistry {
                     normalized_job_cwd.as_deref(),
                     structured_stdin.as_deref(),
                     timeout_secs,
+                    PROCESS_TIMEOUT_MAX_SECS,
                 )?;
                 let preview = format!("detached process ({} args)", process.args.len());
                 let safe = ShellJobStructuredExecutionMetadata {
+                    pytest: false,
                     execution_source: "run_detached_process".to_string(),
                     language: None,
                     script_bytes: None,
@@ -824,6 +869,7 @@ impl RunnerRegistry {
                     script.args.len(),
                 );
                 let safe = ShellJobStructuredExecutionMetadata {
+                    pytest: false,
                     execution_source: "run_script".to_string(),
                     language: Some(script.language),
                     script_bytes: Some(script.script.len()),
@@ -835,8 +881,36 @@ impl RunnerRegistry {
                 };
                 (preview, Some(safe), "run_script")
             }
+            Some(StructuredJobExecution::SkillResource(request)) => {
+                request
+                    .validate()
+                    .map_err(|error| format!("invalid Runner Skill execution request: {error}"))?;
+                if structured_stdin.is_some() {
+                    return Err("Skill resource Job does not accept generic stdin".to_string());
+                }
+                validate_structured_job_common(
+                    normalized_job_cwd.as_deref(),
+                    None,
+                    timeout_secs,
+                    STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
+                )?;
+                let preview = format!("trusted Skill resource {}", request.path);
+                let safe = ShellJobStructuredExecutionMetadata {
+                    pytest: false,
+                    execution_source: "run_skill_resource".to_string(),
+                    language: None,
+                    script_bytes: None,
+                    arg_count: request.args.len(),
+                    stdin_present: true,
+                    validation_identity: validation_identity.clone(),
+                    validation_tool: validation_tool.clone(),
+                    assertion_name: assertion_name.clone(),
+                };
+                (preview, Some(safe), "run_skill_resource")
+            }
             None => {
                 let run = ShellRunRequest {
+                    login: false,
                     client_id: client_id.clone(),
                     cwd: normalized_job_cwd.clone(),
                     command: command.clone(),
@@ -949,11 +1023,22 @@ impl RunnerRegistry {
                     context: job_context,
                 })
             }
+            Some(StructuredJobExecution::SkillResource(request)) => {
+                RunnerJobOperation::StartSkillResource(RunnerJobSkillResourceOperation {
+                    job_id: job_id.clone(),
+                    cwd: normalized_job_cwd.clone(),
+                    request,
+                    timeout_secs,
+                    context: job_context,
+                })
+            }
             None if validation_steps.is_empty() => {
                 RunnerJobOperation::StartShell(RunnerJobShellOperation {
                     job_id: job_id.clone(),
                     cwd: normalized_job_cwd.clone(),
                     command: command.clone(),
+                    shell: explicit_shell,
+                    login,
                     timeout_secs,
                     context: job_context,
                 })
@@ -992,6 +1077,24 @@ impl RunnerRegistry {
                 client_id
             ));
         }
+        if explicit_shell.is_some()
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::ExplicitShellSelection)
+        {
+            return Err(format!(
+                "capability_unavailable: runner {client_id} does not support explicit_shell_selection"
+            ));
+        }
+        if login
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::BashLoginShell)
+        {
+            return Err(format!(
+                "capability_unavailable: runner {client_id} does not support bash_login_shell"
+            ));
+        }
         if structured_metadata.is_some()
             && !runner
                 .runner_features
@@ -1017,6 +1120,24 @@ impl RunnerRegistry {
         {
             return Err(format!(
                 "capability_unavailable: runner {client_id} does not support structured_script_typescript"
+            ));
+        }
+        if python_script_request
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::StructuredScriptPython)
+        {
+            return Err(format!(
+                "capability_unavailable: runner {client_id} does not support structured_script_python"
+            ));
+        }
+        if skill_resource_request
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::SkillResourceExecution)
+        {
+            return Err(format!(
+                "capability_unavailable: runner {client_id} does not support skill_resource_execution"
             ));
         }
         if detached_request
@@ -1087,6 +1208,18 @@ impl RunnerRegistry {
         {
             return Err(format!(
                 "structured_cargo_test_lib_unavailable: runner {} does not support Cargo test --lib validation argv",
+                client_id
+            ));
+        }
+        if validation_steps
+            .iter()
+            .any(|step| step.is_multi_package_cargo_check())
+            && !runner
+                .runner_features
+                .supports(RunnerFeature::StructuredCargoCheckPackages)
+        {
+            return Err(format!(
+                "capability_unavailable: structured_cargo_check_packages_unavailable: runner {} does not support repeated Cargo check package selectors",
                 client_id
             ));
         }
@@ -1206,6 +1339,7 @@ impl RunnerRegistry {
             recovery: JobRecoveryState::default(),
             observation: JobObservationState {
                 receipt_candidates: self.inner.capture_candidates(),
+                terminal_event_candidates: self.inner.capture_terminal_event_candidates(),
                 ..JobObservationState::new(self.observation_epoch.clone())
             },
         };
@@ -1230,13 +1364,30 @@ impl RunnerRegistry {
         ids
     }
 
-    pub async fn promote_hidden_job(&self, job_id: &str) -> Result<ShellJobInfo, String> {
+    /// The sole handoff/recovery visibility transition. Authorization, terminal
+    /// races, cleanup ownership and the observation-token proof are checked
+    /// under the same lock; retrying this transition never dispatches execution.
+    pub async fn promote_hidden_job(
+        &self,
+        auth: Option<&crate::RunnerAccess>,
+        job_id: &str,
+    ) -> Result<ShellJobInfo, String> {
+        #[cfg(any(test, feature = "root-test-support"))]
+        self.hidden_handoff_failure_for_test(false).await?;
+        validate_id(job_id, "job_id")?;
         let mut inner = self.inner.lock().await;
         refresh_job_status_locked(&mut inner, job_id);
         let job = inner
             .jobs_by_id
-            .get_mut(job_id)
+            .get(job_id)
             .ok_or_else(|| format!("unknown shell job: {job_id}"))?;
+        if !shell_job_visible_to_auth(auth, &inner, job) {
+            return Err(format!("unknown shell job: {job_id}"));
+        }
+        let job = inner
+            .jobs_by_id
+            .get_mut(job_id)
+            .expect("authorized job exists");
         if job.visibility == ShellJobVisibility::CleanupPending {
             return Err(format!("structured job cleanup is pending: {job_id}"));
         }
@@ -1274,12 +1425,34 @@ impl RunnerRegistry {
         Ok(job_view(job))
     }
 
+    pub async fn job_terminal_registration_snapshot_for_auth(
+        &self,
+        auth: Option<&crate::RunnerAccess>,
+        job_id: &str,
+    ) -> Result<crate::JobTerminalRegistrationSnapshot, String> {
+        validate_id(job_id, "job_id")?;
+        let mut inner = self.inner.lock().await;
+        refresh_job_status_locked(&mut inner, job_id);
+        let job = inner
+            .jobs_by_id
+            .get(job_id)
+            .ok_or_else(|| format!("unknown shell job: {job_id}"))?;
+        if job.visibility != ShellJobVisibility::Public
+            || !shell_job_visible_to_auth(auth, &inner, job)
+        {
+            return Err(format!("unknown shell job: {job_id}"));
+        }
+        Ok(crate::receipts::registration_snapshot(job, now_ts()))
+    }
+
     pub async fn hidden_job_log_for_auth(
         &self,
         auth: Option<&crate::RunnerAccess>,
         job_id: &str,
         tail_lines: Option<usize>,
     ) -> Result<(ShellJobInfo, Option<String>, Option<String>, usize, usize), String> {
+        #[cfg(any(test, feature = "root-test-support"))]
+        self.hidden_handoff_failure_for_test(true).await?;
         validate_id(job_id, "job_id")?;
         let mut inner = self.inner.lock().await;
         refresh_job_status_locked(&mut inner, job_id);
@@ -1610,6 +1783,35 @@ impl RunnerRegistry {
             .collect::<Vec<_>>();
         jobs.sort_by_key(|job| std::cmp::Reverse(job.created_at));
         jobs.into_iter().map(|job| job_view(&job)).collect()
+    }
+
+    /// Passive attention reads only the Server's current Job records. In particular,
+    /// it must not refresh lifecycle or contact a Runner on an unrelated tool call.
+    pub async fn snapshot_jobs_for_auth_filtered(
+        &self,
+        auth: Option<&crate::RunnerAccess>,
+        project_id: &str,
+        session_id: &str,
+        limit: usize,
+    ) -> Vec<ShellJobInfo> {
+        let inner = self.inner.lock().await;
+        let mut jobs = inner
+            .jobs_by_id
+            .values()
+            .filter(|job| job.visibility == ShellJobVisibility::Public)
+            .filter(|job| shell_job_visible_to_auth(auth, &inner, job))
+            .filter(|job| job.project_id.as_deref() == Some(project_id))
+            .filter(|job| job.session_id.as_deref() == Some(session_id))
+            .collect::<Vec<_>>();
+        // Active work must not disappear behind a full page of newer terminal
+        // records. Keep the snapshot bounded while prioritizing active Jobs.
+        jobs.sort_by(|a, b| {
+            a.lifecycle
+                .is_terminal()
+                .cmp(&b.lifecycle.is_terminal())
+                .then_with(|| b.created_at.cmp(&a.created_at))
+        });
+        jobs.into_iter().take(limit.min(32)).map(job_view).collect()
     }
 
     async fn visible_job_records_for_auth(
@@ -2064,14 +2266,9 @@ impl RunnerRegistry {
         if let Some(snapshot) = body.log_snapshot.as_ref() {
             validate_stream_snapshot(&snapshot.stdout, "job update stdout snapshot")?;
             validate_stream_snapshot(&snapshot.stderr, "job update stderr snapshot")?;
-            if body.stdout_chunk.is_some()
-                || body.stderr_chunk.is_some()
-                || body.stdout_tail.is_some()
-                || body.stderr_tail.is_some()
-            {
+            if body.stdout_chunk.is_some() || body.stderr_chunk.is_some() {
                 return Err(
-                    "job update log_snapshot cannot be combined with chunk or legacy tail fields"
-                        .to_string(),
+                    "job update log_snapshot cannot be combined with chunk fields".to_string(),
                 );
             }
         }
@@ -2235,8 +2432,6 @@ impl RunnerRegistry {
                     super::jobs::replace_log_from_snapshot(&mut job.stdout, &snapshot.stdout);
                     super::jobs::replace_log_from_snapshot(&mut job.stderr, &snapshot.stderr);
                 } else {
-                    replace_log_limited(&mut job.stdout, body.stdout_tail);
-                    replace_log_limited(&mut job.stderr, body.stderr_tail);
                     append_log_limited(&mut job.stdout, body.stdout_chunk);
                     append_log_limited(&mut job.stderr, body.stderr_chunk);
                 }

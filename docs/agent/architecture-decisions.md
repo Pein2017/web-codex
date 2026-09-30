@@ -56,9 +56,7 @@ this concrete Agent/Conversation model. Standing rules are:
 - the Session message board remains the explicit manual coordinator/worker handoff
   substrate. It is not migrated into Conversation and its todo semantics are not an
   Agent Task lease;
-- the planned asynchronous work object is an independent **Agent Task** with an
-  exact fenced **Agent TaskAttempt**. It is not the existing Connector Task and is
-  not inferred merely because a Conversation Message exists;
+- the asynchronous work object is an independent **Agent Task** with an exact fenced **Agent TaskAttempt**. It is not a Workflow Session todo, Job, or Conversation Message and is not inferred merely because one of those exists;
 - **Goal** is an independent `wc_goal_*` high-level durable intent/control domain. It is not an Agent Task, Workflow Session, Job, Project selector, execution primitive, or scheduler; Goal identity/status/revision/correlation is never a bearer credential;
 - Goal selection is exact durable identity or explicit creation only. Never infer the current Goal from Project, ClientWindow, credential, MCP/OpenAI session data, Conversation membership, Workflow Session, or shared timing;
 - Goal lifecycle is currently closed to `active | completed | cancelled`. `finish_coding_task`, AgentTask/TaskAttempt completion, Job terminal state, or validation evidence do not automatically transition a Goal;
@@ -93,37 +91,15 @@ When docs or code say "session", identify which kind is meant. Cross-wiring
 workflow ledger APIs to audit UUIDs (or the reverse) is a design change, not a
 drive-by fix.
 
-### Project Connector continuity (standing)
+### One coding runtime (standing)
 
-The canonical project-bound path reuses the existing SQLite Connector Task,
-run, and event model. It adds only a lightweight durable exact mapping:
+WebCodex has one coding runtime: ordinary ToolRuntime over Runner-registered Projects, Workflow Sessions, canonical Jobs, and normal read/search/edit/Git/validation/process/shell tools. `webcodex share` and `webcodex run` are lifecycle/auth/reachability conveniences around that runtime; they do not define Task/Run/Execution/Result/Approval business objects or a second model-facing tool registry.
 
-```text
-hashed client window + authenticated subject + connector project + root hash
-→ current durable connector task
-```
+Project-scoped credentials and project-share OAuth authenticate to a `ProjectGrant`. Runner visibility, canonical Project resolution, OAuth scopes, and normal permission policy enforce that boundary. Direct Adaptive tools and `call_runtime_tool` gateway dispatch share the same authority path. A guessed Runner/Project id grants no visibility and must not become an existence oracle. Project Agent Tokens remain Runner-transport credentials only.
 
-`task_start` owns duplicate-free context create/continue, instruction append,
-project switch/restore, read-only-to-write workspace upgrade after scope
-checks, and selective context-fingerprint refresh. This mapping is neither a Workflow
-Session nor an Action Audit Session, and it must not dual-write either ledger.
-Raw transport identifiers are never persisted or exposed as tool fields.
+Project-scoped model/API credentials cannot use ordinary Project registry mutation to turn broad Runner filesystem policy into new coding authority. `register_project`, `create_project`, and `unregister_project` fail closed for those credentials; path-based coding may reuse only an exact Project already present in the caller-visible ProjectGrant inventory.
 
-Connector execution mode is intentionally binary: `normal` means writable work
-inside the managed isolated Git worktree, with stable-result handoff and
-host-local human accept/reject; `read_only` means analysis without project
-writes, commands, or checks. Pre-0.4 `inspect` is retired with no alias or
-OS-specific restricted-shell successor. A durable legacy inspect Connector Task
-keeps its historical row for review/reject/diagnosis but fails closed on any
-execution, mutation, continuation upgrade, or accept path.
-
-Mode transitions are one-way with respect to writable authority: `read_only →
-read_only`, `read_only → normal`, and `normal → normal` are valid; `normal →
-read_only` is rejected. Canonical durable shape is part of the same contract:
-`read_only` is non-isolated and executes at the target root, while `normal` is
-isolated with a Git baseline. Any inconsistent persisted row fails closed, any
-isolated writable result requires structured checks before finish, and only a
-canonical normal isolated result may apply a patch during host-local accept.
+Managed worktrees have one implementation: `work_on_project(mode=worktree)` asks the Runner to derive and register a normal managed-worktree Project from an already-visible source Project under Runner filesystem policy. Without an isolation request, local `share`/`run` uses its already registered Project.
 
 ### Correlation decision (standing)
 
@@ -304,11 +280,10 @@ canonical authority mode.
 | Env var | `WEBCODEX_AUTHORITY_MODE` = `trusted_agent` \| `restricted` |
 | Default (unset/empty) | `trusted_agent`; source reported as `default` |
 | `trusted_agent` | Consequential runtime tools auto-execute after hard safety with no approval interruptions; external release actions remain user-task-scoped; every permission-bearing call records an auditable ledger decision (`policy=trusted_agent`, `status=auto_approved`, `reason=trusted_agent_authority`) |
-| `restricted` | Runtime tools deny (`restricted_requires_human_authorization`); connector `commands_run` keeps the one-time human approval loop |
+| `restricted` | Consequential runtime tools deny (`restricted_requires_human_authorization`); there is no separate Connector approval loop |
 | Legacy env set | Unambiguous legacy values migrate: `dev_auto_approve` → `trusted_agent`, `require_approval` → `restricted`; legacy-only configuration reports `migrated_env:WEBCODEX_PERMISSION_MODE`. Unknown or conflicting legacy/current values remain invalid and fail closed with source `rejected_legacy_env:WEBCODEX_PERMISSION_MODE` |
 | Shared surfaces | Both modes share the same tool implementations, schemas, session model, evidence, and audit records |
 | Projection | `runtime_status` and internal full startup diagnostics report one canonical `authority` object; the sparse external `work_on_project` projection omits it. The old `permissions` profile object is deleted |
-| Connector | Under `trusted_agent`, `commands_run` records a durable `authority_auto_authorized` task event instead of approval records or `approval_required` interruptions |
 
 Hard boundaries are never relaxed by authority mode: OAuth scopes, project
 boundary/allowed roots, explicitly read-only sessions, path and sensitive-path
@@ -326,11 +301,11 @@ it never infers readiness from configuration.
 | Decision | Choice |
 |---|---|
 | Layer envelope | Every layer carries `{status, observed_at, source, age_secs, stale_after_secs, reason_code}` plus layer facts |
-| No config-inferred readiness | `connector_endpoint` readiness comes only from readiness probes or successful connector requests; configuration presence never implies `ready`. `runner_process` never fakes "running"; a stale registration is never presented as callable |
-| Explicit Workflow targeting | Full-runtime Workflow Sessions have no process-local or durable window binding. `runtime_status` exposes no Workflow binding layer. Ordinary project tools without an explicit business Session or authorized wrapper recorder execute unlinked to Workflow Session state. This remains separate from Connector-owned window/project/task continuity |
+| No config-inferred readiness | Runtime/Project readiness comes from authenticated canonical runtime and Runner/Project observations. `runner_process` never fakes "running"; a stale registration is never presented as callable |
+| Explicit Workflow targeting | Workflow Sessions have no implicit credential/window selection. Ordinary project tools without an explicit business Session or authorized wrapper recorder execute unlinked to Workflow Session state |
 | Full-runtime start/continue | `work_on_project(session_id=<id>)` continues exactly that authorized Active same-project Session; omission creates a fresh Workflow Session. Stable window or credential identity never selects a Workflow Session. `work_on_project` calls the shared coding workflow engine directly; there is no second internal ToolCall identity |
-| Canonical model coding bootstrap | `work_on_project` is the external runtime coding bootstrap. `registered_tool_specs` defines the canonical model-visible runtime universe used by discovery and generic ToolCall admission. A startup-selected model surface may project that universe more narrowly: `local_coding` lists its focused typed set, `adaptive_runtime` lists a smaller typed core plus one generic gateway for long-tail targets and fallback dispatch of otherwise-admitted direct targets, and `full_operator_runtime` expands the runtime universe. Retired wire names such as `start_coding_task` fail closed before dispatch and never contribute selector names or flattened model fields |
-| Runtime exposure selection | The Server owns one top-level `RuntimeExposure`. Complete `WEBCODEX_CONNECTOR_SURFACE=task-v1` configuration selects `ProjectConnector`, exposed publicly as `project_connector`; ProjectConnector is a project-bound ConnectorTask capability contract, not a `ModelSurface`. Without Connector configuration, exposure is `Runtime(ModelSurface)`: an unset `WEBCODEX_MCP_MODEL_SURFACE` selects `adaptive_runtime`, while `local-coding-v1`, `adaptive-runtime-v1`, and `full-operator-v1` select `local_coding`, `adaptive_runtime`, and `full_operator_runtime` explicitly. `local-coding-v1` remains an explicit fixed typed exposure preset for hosts that select it; that preset does not freeze individual tool schemas, legacy aliases, or retired names. Fresh/default model exposure uses Adaptive discovery. `adaptive_runtime` direct admission/order is statically declared by canonical `ToolDefinition`s; ordinary model-visible runtime tools default to the bounded long-tail gateway unless explicitly promoted to direct. Direct availability is preferred exposure rather than exclusive execution authority: an otherwise-admitted direct target may fall back through the same generic gateway. Gateway dispatch preserves the target tool's existing scope, authority, permission, argument, capability, effect, and Session/ACK semantics. MCP `tools/list` schema projection is exposure-aware: unset `WEBCODEX_MCP_COMPACT_SCHEMAS` defaults Adaptive Runtime to compact discovery (omitting only `outputSchema`), while Local Coding, Full Operator, and ProjectConnector retain full-schema projection defaults; explicit true/false always overrides that projection without changing ToolSpec ownership or invocation/result semantics. A Connector + `WEBCODEX_MCP_MODEL_SURFACE` conflict, an unsupported value, or partial Connector configuration fails startup. MCP GET/initialize/discovery, `runtime_status.runtime_exposure`, and the startup log report the same flattened exposure name |
+| Canonical model coding bootstrap | `work_on_project` is the external runtime coding bootstrap. `registered_tool_specs` defines the canonical model-visible runtime universe used by discovery and generic ToolCall admission. There is one model-facing runtime contract: Adaptive Runtime. Canonical `ToolDefinition` rank defines direct admission/order; ordinary model-visible long-tail tools use `call_runtime_tool`; an admitted direct target may also use the gateway as an invocation fallback. Retired wire names such as `start_coding_task` fail closed before dispatch. |
+| Adaptive Runtime presentation | MCP and GPT Actions project the same canonical Adaptive routing policy. Protocol/App-only extensions are admitted independently by server-owned protocol capability and App metadata; they do not create another runtime surface. Direct/gateway dispatch preserves the target tool's scopes, Project authority, permission, argument, Runner capability, effect, and Session/ACK semantics. `WEBCODEX_MCP_COMPACT_SCHEMAS` changes MCP discovery schema projection only; unset defaults to compact discovery and explicit true/false overrides that projection. Runtime status, MCP initialize/discover/info, and tools/list audit summaries do not emit a redundant runtime-surface taxonomy. |
 | Meaningful-activity rule | `last_successful_tool_call` records only successful meaningful calls, scoped by principal/project/surface/session/tool. `runtime_status`, `list_tools`, `list_runners`, `list_projects`, and `tool_manifest` never refresh it. Bounded in-memory store; no arguments, outputs, or secrets |
 | Independence | Layers degrade independently; `not_observed` on one layer must not be collapsed into a global offline verdict |
 
@@ -455,28 +430,33 @@ the explicit `WEBCODEX_MCP_TEXT_JSON_COMPAT=true` compatibility projection to
 mirror that same canonical JSON into standard text content without changing the
 source of truth.
 
-The product concept and public lifecycle namespace are **Runner**. Before the
-`v0.4.0` compatibility floor, the local primary config filename is normalized
-from `agent.toml` to `runner.toml`. The compatibility contract is intentionally
-narrow and deterministic: a config directory containing only legacy
-`agent.toml` continues to use that file; one containing only `runner.toml` uses
-the canonical file; a directory containing both fails closed rather than
-choosing a winner; a directory containing neither creates/targets
-`runner.toml`. Explicit `--config PATH` remains exact and does not inspect a
-sibling filename. Explicit `--profile` similarly selects its authoritative
-profile directory before environment defaults are considered.
-`WEBCODEX_RUNNER_CONFIG` is the canonical default-path env override, while
-`WEBCODEX_AGENT_CONFIG` remains a legacy alias; setting both is an error only
-when environment defaults are actually consulted.
+The product concept and public lifecycle namespace are **Runner**. The local
+primary config filename is `runner.toml`, and all newly generated 0.4.x
+configuration uses that name. Persisted pre-0.4 startup state has a deliberately
+narrow compatibility window through the 0.4.x line: automatic/default/profile
+discovery still accepts a legacy-only `agent.toml`, while a directory containing
+both names fails closed so a stale legacy file cannot silently look authoritative.
+A directory containing neither creates/targets `runner.toml`. Explicit
+`--config PATH` remains exact and does not reinterpret the chosen filename.
+Explicit `--profile` similarly selects its authoritative profile directory
+before environment defaults are considered. `WEBCODEX_RUNNER_CONFIG` is the
+canonical default-path env override; legacy-only `WEBCODEX_AGENT_CONFIG` remains
+a deprecated fallback during 0.4.x, while setting both env names is ambiguous and
+fails closed. These persisted startup aliases are scheduled for removal at the
+0.5.0 compatibility boundary rather than a 0.4.x patch/minor restart.
 
-The same pre-`v0.4.0` normalization applies to the Runner-owned project
-registry: `project_registry_dir` and `project-registry/` are canonical for new
-state, while a sole legacy `projects_dir` field or `projects.d/` directory may
-continue to identify existing state in place. New and legacy fields together,
-or both default directory names together, fail closed; WebCodex does not merge,
-copy, rename, or choose between two registries implicitly. The registry remains
-a directory of Runner-owned project registration records, not a second workspace
-or project-root abstraction.
+Runner-owned project registries use `project_registry_dir` and
+`project-registry/` for new state. During 0.4.x, a legacy-only persisted
+`projects_dir` field is normalized into the canonical runtime
+`project_registry_dir`; configuring both fields remains an error. The old
+`--projects-dir` CLI spelling stays retired because interactive CLI aliases are
+not required for cold-start compatibility. The physical legacy `projects.d/`
+directory remains readable in place when it is the sole default registry layout,
+so upgrading does not require an implicit data move. If both default directory
+names exist WebCodex fails closed; it does not merge, copy, rename, or choose
+between two registries implicitly. The registry remains a directory of
+Runner-owned project registration records, not a second workspace or project-root
+abstraction.
 
 Project registration provenance is also normalized before the `v0.4.0` floor.
 The generic project-record `kind` field remains open project metadata, while the

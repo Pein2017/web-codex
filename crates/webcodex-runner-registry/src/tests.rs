@@ -118,8 +118,8 @@ fn file_request(op: &str) -> ShellFileOpRequest {
         pattern: None,
         expected_sha256: None,
         expected_prefix: None,
-        start_line: None,
-        end_line: None,
+        start_line: (op == "read").then_some(1),
+        end_line: (op == "read").then_some(1),
         line: None,
         create_dirs: false,
         wait_timeout_secs: 0,
@@ -303,6 +303,8 @@ mod apply_text_edit_local_guard;
 mod apply_text_edit_occurrence;
 #[path = "tests/artifact_export.rs"]
 mod artifact_export;
+#[path = "tests/browser.rs"]
+mod browser;
 #[path = "tests/capabilities.rs"]
 mod capabilities;
 #[path = "tests/computer_accessibility.rs"]
@@ -325,6 +327,8 @@ mod file_validation;
 mod instance_lease;
 #[path = "tests/internal_posix.rs"]
 mod internal_posix;
+#[path = "tests/job_handoff.rs"]
+mod job_handoff;
 #[path = "tests/job_lifecycle.rs"]
 mod job_lifecycle;
 #[path = "tests/job_log_wait.rs"]
@@ -371,3 +375,5 @@ mod skills;
 mod ssh_resource;
 #[path = "tests/structured_file_delete.rs"]
 mod structured_file_delete;
+#[path = "tests/throughput_telemetry.rs"]
+mod throughput_telemetry;

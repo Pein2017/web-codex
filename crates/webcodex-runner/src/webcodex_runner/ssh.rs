@@ -814,7 +814,16 @@ fn ensure_control_root(state: &mut SshPoolState) -> Result<PathBuf, String> {
         return Ok(root.clone());
     }
     for _ in 0..4 {
-        let candidate = std::env::temp_dir().join(format!(
+        // macOS per-user TMPDIR is already ~50 bytes; appending our random
+        // directory, control name and OpenSSH's temporary mux suffix exceeds
+        // sockaddr_un.sun_path before any remote command can start. Use the
+        // short system temp parent there, retaining exclusive creation, a
+        // full random UUID and 0700 ownership on the actual private directory.
+        #[cfg(target_os = "macos")]
+        let parent = PathBuf::from("/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let parent = std::env::temp_dir();
+        let candidate = parent.join(format!(
             "wc-ssh-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()
@@ -844,6 +853,10 @@ fn ensure_control_root(state: &mut SshPoolState) -> Result<PathBuf, String> {
         "ssh_connection_pool_unavailable: could not allocate Runner-local control socket directory; command was not started".to_string(),
     )
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "ssh_macos_control_path_tests.rs"]
+mod macos_control_path_tests;
 
 fn establish_control_socket(connection: &SshConnection) -> Result<(), String> {
     let mut ssh = ssh_command(connection);
@@ -2334,30 +2347,7 @@ mod tests {
         // SAFETY: the pid is reported by the control socket owned by this
         // test's pool, so it identifies only the temporary test master.
         assert_eq!(unsafe { libc::kill(master_pid, libc::SIGTERM) }, 0);
-        // The reconnect assertion requires a dead master, not merely a sent
-        // signal. Observe control-socket shutdown instead of assuming that
-        // OpenSSH has completed teardown within a fixed 50 ms scheduling gap.
-        let shutdown_deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let check = Command::new("ssh")
-                .arg("-F")
-                .arg(&server.client_config)
-                .arg("-S")
-                .arg(&first_control)
-                .arg("-O")
-                .arg("check")
-                .arg(&server.alias)
-                .output()
-                .expect("observe test SSH master shutdown");
-            if !check.status.success() {
-                break;
-            }
-            assert!(
-                Instant::now() < shutdown_deadline,
-                "test SSH master did not stop"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        std::thread::sleep(Duration::from_millis(50));
         let reconnected = run(
             &pool,
             &config,
@@ -2408,8 +2398,10 @@ mod tests {
             return;
         };
         let config = ssh_config(&server);
-        let mut manager = crate::JobManager::new(1);
-        manager.ssh_pool = SshConnectionPool::with_test_config(server.client_config.clone());
+        let manager = crate::webcodex_runner::job_manager::JobManager::new(1)
+            .with_ssh_pool_for_test(SshConnectionPool::with_test_config(
+                server.client_config.clone(),
+            ));
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let sink = crate::webcodex_runner::RunnerSink::WebSocket {
             tx,
@@ -2418,7 +2410,7 @@ mod tests {
         };
         manager.enqueue(
             sink.clone(),
-            crate::PendingJobStart::from_wire(
+            crate::webcodex_runner::job_manager::PendingJobStart::from_wire(
                 11,
                 RunnerPolicy::default(),
                 crate::webcodex_runner::ShellConfig::default(),
@@ -2445,7 +2437,7 @@ mod tests {
 
         manager.enqueue(
             sink.clone(),
-            crate::PendingJobStart::from_wire(
+            crate::webcodex_runner::job_manager::PendingJobStart::from_wire(
                 11,
                 RunnerPolicy::default(),
                 crate::webcodex_runner::ShellConfig::default(),
@@ -2476,7 +2468,7 @@ mod tests {
 
         manager.enqueue(
             sink,
-            crate::PendingJobStart::from_wire(
+            crate::webcodex_runner::job_manager::PendingJobStart::from_wire(
                 11,
                 RunnerPolicy::default(),
                 crate::webcodex_runner::ShellConfig::default(),
@@ -3663,12 +3655,12 @@ fn main() {
     fn wait_for_process_exit(pid: u32) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            if !crate::job_manager_tests::process_running(pid) {
+            if !crate::webcodex_runner::job_manager::job_manager_tests::process_running(pid) {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        !crate::job_manager_tests::process_running(pid)
+        !crate::webcodex_runner::job_manager::job_manager_tests::process_running(pid)
     }
 
     fn ssh_job_request(
@@ -3735,7 +3727,7 @@ fn main() {
     }
 
     fn enqueue_job(
-        manager: &crate::JobManager,
+        manager: &crate::webcodex_runner::job_manager::JobManager,
         sink: crate::webcodex_runner::RunnerSink,
         config: SshConfig,
         policy: RunnerPolicy,
@@ -3745,7 +3737,7 @@ fn main() {
     ) {
         manager.enqueue(
             sink,
-            crate::PendingJobStart::from_wire(
+            crate::webcodex_runner::job_manager::PendingJobStart::from_wire(
                 11,
                 policy,
                 crate::webcodex_runner::ShellConfig::default(),
@@ -3849,7 +3841,10 @@ fn main() {
         let pool = SshConnectionPool::default();
         let authored = "'".repeat(crate::runner_protocol::RAW_SHELL_COMMAND_MAX_BYTES);
         let wrapped = explicit_bash_wire_command(&authored);
-        assert_eq!(wrapped.len(), 64_015);
+        assert_eq!(
+            wrapped.len(),
+            explicit_bash_wire_command("").len() + 4 * authored.len()
+        );
         assert!(wrapped.len() <= crate::runner_protocol::RAW_SHELL_WIRE_MAX_BYTES);
 
         let max_host = "h".repeat(512);
@@ -3862,7 +3857,7 @@ fn main() {
                 None,
                 &wrapped,
             )
-            .expect("prepare 16K quote-dense explicit bash command");
+            .expect("prepare maximum-size quote-dense explicit bash command");
         let args = command_args(&prepared.command);
         assert_direct_args(&args, &max_host);
         assert_eq!(
@@ -4396,9 +4391,10 @@ fn main() {
     #[test]
     fn windows_background_ssh_spawn_failure_is_not_started() {
         let temp = tempfile::tempdir().unwrap();
-        let mut manager = crate::JobManager::new(1);
-        manager.ssh_pool =
-            SshConnectionPool::with_test_executable(temp.path().join("missing-ssh.exe"));
+        let manager = crate::webcodex_runner::job_manager::JobManager::new(1)
+            .with_ssh_pool_for_test(SshConnectionPool::with_test_executable(
+                temp.path().join("missing-ssh.exe"),
+            ));
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let sink = crate::webcodex_runner::RunnerSink::WebSocket {
             tx,
@@ -4449,24 +4445,16 @@ fn main() {
                 "runner lost the Job record after command start",
             ),
         ] {
-            let error = crate::post_spawn_interruption_reason(
+            let error = crate::webcodex_runner::job_manager::job_manager_tests::post_spawn_interruption_reason_for_test(
                 shutting_down,
                 stop_requested,
                 job_record_present,
             )
             .expect("post-spawn interruption is rejected");
             assert_eq!(error, expected_error);
-            let delta = crate::post_spawn_interruption_delta(&operation, 7, error);
-            assert_eq!(delta.status, "failed");
-            assert_eq!(delta.exit_code, None);
-            assert_eq!(delta.duration_ms, Some(7));
-            assert_eq!(
-                delta.command_execution_state,
-                Some(ShellCommandExecutionState::OutcomeUnknown)
-            );
-            assert!(delta.finished);
+            crate::webcodex_runner::job_manager::job_manager_tests::assert_post_spawn_interruption_delta(&operation, 7, error);
         }
-        assert!(crate::post_spawn_interruption_reason(false, false, true).is_none());
+        assert!(crate::webcodex_runner::job_manager::job_manager_tests::post_spawn_interruption_reason_for_test(false, false, true).is_none());
     }
 
     #[test]
@@ -4505,7 +4493,7 @@ fn main() {
         let pid = grandchild_pid(&line);
         let child = Arc::new(Mutex::new(child));
 
-        let error = crate::post_spawn_interruption_reason(true, false, true)
+        let error = crate::webcodex_runner::job_manager::job_manager_tests::post_spawn_interruption_reason_for_test(true, false, true)
             .expect("shutdown after spawn is rejected");
         crate::terminate_managed_tree(&child).expect("terminate owned SSH tree");
         assert!(
@@ -4514,13 +4502,7 @@ fn main() {
         );
         assert!(!marker.exists(), "terminated grandchild reached marker");
 
-        let delta = crate::post_spawn_interruption_delta(&operation, 0, error);
-        assert_eq!(
-            delta.command_execution_state,
-            Some(ShellCommandExecutionState::OutcomeUnknown)
-        );
-        assert_eq!(delta.status, "failed");
-        assert_eq!(delta.exit_code, None);
+        crate::webcodex_runner::job_manager::job_manager_tests::assert_post_spawn_interruption_delta(&operation, 0, error);
     }
 
     #[test]
@@ -4563,8 +4545,8 @@ fn main() {
     #[ignore = "runner real-process lane: background fake SSH exercises repeated child-process lifecycle"]
     fn runner_real_process_windows_background_ssh_reuses_job_manager_lifecycle_and_bounds_output() {
         let config = ssh_config("spe", None);
-        let mut manager = crate::JobManager::new(1);
-        manager.ssh_pool = fake_pool();
+        let manager = crate::webcodex_runner::job_manager::JobManager::new(1)
+            .with_ssh_pool_for_test(fake_pool());
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let sink = crate::webcodex_runner::RunnerSink::WebSocket {
             tx,
@@ -4698,8 +4680,8 @@ fn main() {
     fn runner_real_process_windows_background_ssh_stop_and_timeout_reap_owned_trees() {
         let temp = tempfile::tempdir().unwrap();
         let config = ssh_config("spe", None);
-        let mut manager = crate::JobManager::new(1);
-        manager.ssh_pool = fake_pool();
+        let manager = crate::webcodex_runner::job_manager::JobManager::new(1)
+            .with_ssh_pool_for_test(fake_pool());
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let sink = crate::webcodex_runner::RunnerSink::WebSocket {
             tx,
@@ -4777,8 +4759,8 @@ fn main() {
     fn runner_real_process_windows_background_ssh_shutdown_drain_is_bounded_and_reaps_tree() {
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("shutdown-grandchild.marker");
-        let mut manager = crate::JobManager::new(1);
-        manager.ssh_pool = fake_pool();
+        let manager = crate::webcodex_runner::job_manager::JobManager::new(1)
+            .with_ssh_pool_for_test(fake_pool());
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let sink = crate::webcodex_runner::RunnerSink::WebSocket {
             tx,
@@ -4805,7 +4787,7 @@ fn main() {
         manager.stop_accepting_work();
         let batch = manager.signal_all_for_shutdown();
         let outcome = manager.drain_shutdown(batch, Instant::now() + Duration::from_secs(2));
-        assert_eq!(outcome.timed_out, 0, "{outcome:?}");
+        assert_eq!(outcome.timed_out(), 0, "{outcome:?}");
         assert!(
             started.elapsed() < Duration::from_millis(2500),
             "SSH shutdown drain exceeded its bound"
@@ -5080,7 +5062,7 @@ fn main() {
             Some("wc-max-wire")
         );
 
-        let manager = crate::JobManager::new(1);
+        let manager = crate::webcodex_runner::job_manager::JobManager::new(1);
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         let sink = crate::webcodex_runner::RunnerSink::WebSocket {
             tx,

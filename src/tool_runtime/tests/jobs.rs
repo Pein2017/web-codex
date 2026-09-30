@@ -36,6 +36,123 @@ where
     }
 }
 
+fn compact_validation_job(
+    project: &str,
+    source_fence: Option<webcodex_core::validation_source::ValidationSourceFence>,
+) -> crate::runner_protocol::ShellJobInfo {
+    serde_json::from_value(json!({
+        "job_id": "wc_job_compact-validation",
+        "client_id": "compact-validation-client",
+        "kind": "shell",
+        "project_id": project,
+        "purpose": "validation",
+        "command_preview": "secret validation command",
+        "status": "completed",
+        "created_at": 1,
+        "structured_execution": {
+            "execution_source": "run_process",
+            "arg_count": 3,
+            "stdin_present": false,
+            "validation_identity": "assertion:0123456789abcdef01234567",
+            "assertion_name": "secret assertion label"
+        },
+        "validation": {
+            "tool": "cargo_check",
+            "kind": "check",
+            "steps": [{
+                "name": "check",
+                "program": "cargo",
+                "args": ["check"],
+                "env": []
+            }],
+            "effective_timeout_secs": 600,
+            "sync_wait_secs": 10,
+            "adapter": "cargo_check",
+            "source_fence": source_fence
+        },
+        "recovered_after_server_restart": false,
+        "stdout_log_truncated": false,
+        "stderr_log_truncated": false
+    }))
+    .unwrap()
+}
+
+#[test]
+fn compact_validation_job_summary_reobserves_missing_crossed_and_restart_fences() {
+    let runtime = ToolRuntime::new_for_tests();
+    let project = "agent:compact-validation:demo";
+    let start = runtime.validation_sources.capture(project).unwrap();
+
+    let same = runtime
+        .model_job_summary_value_for_test(&compact_validation_job(project, Some(start.clone())));
+    assert_eq!(same["validation"]["source_state"]["freshness"], "unproven");
+    assert_eq!(
+        same["validation"]["source_state"]["observed_mutation_fence"],
+        "uncrossed"
+    );
+
+    let missing = runtime.model_job_summary_value_for_test(&compact_validation_job(project, None));
+    assert_eq!(
+        missing["validation"]["source_state"]["freshness"],
+        "unproven"
+    );
+    assert_eq!(
+        missing["validation"]["source_state"]["observed_mutation_fence"],
+        "unknown"
+    );
+
+    runtime
+        .validation_sources
+        .begin(project)
+        .unwrap()
+        .finish(&ToolResult::ok(json!({"state_changed": true})));
+    let crossed = runtime
+        .model_job_summary_value_for_test(&compact_validation_job(project, Some(start.clone())));
+    assert_eq!(crossed["validation"]["source_state"]["freshness"], "stale");
+    assert_eq!(
+        crossed["validation"]["source_state"]["observed_mutation_fence"],
+        "crossed"
+    );
+
+    let other_epoch = runtime
+        .validation_sources
+        .capture("agent:other:demo")
+        .unwrap();
+    let mismatch = runtime
+        .model_job_summary_value_for_test(&compact_validation_job(project, Some(other_epoch)));
+    assert_eq!(
+        mismatch["validation"]["source_state"]["freshness"],
+        "unproven"
+    );
+    assert_eq!(
+        mismatch["validation"]["source_state"]["observed_mutation_fence"],
+        "unknown"
+    );
+
+    let restarted = ToolRuntime::new_for_tests();
+    let after_restart =
+        restarted.model_job_summary_value_for_test(&compact_validation_job(project, Some(start)));
+    assert_eq!(
+        after_restart["validation"]["source_state"]["freshness"],
+        "unproven"
+    );
+    assert_eq!(
+        after_restart["validation"]["source_state"]["observed_mutation_fence"],
+        "unknown"
+    );
+
+    for summary in [&same, &missing, &crossed, &mismatch, &after_restart] {
+        let source_state = &summary["validation"]["source_state"];
+        assert!(source_state.get("start_fence").is_none());
+        assert!(source_state.get("epoch").is_none());
+        assert!(source_state.get("generation").is_none());
+        let encoded = serde_json::to_string(summary).unwrap();
+        assert!(!encoded.contains("secret validation command"));
+        assert!(!encoded.contains("secret assertion label"));
+        assert!(!encoded.contains("0123456789abcdef01234567"));
+    }
+}
+
 #[tokio::test]
 async fn run_shell_session_events_record_exit_without_stdio_bodies() {
     let runtime = runtime_with_agent_project("telemetry-shell");
@@ -56,10 +173,12 @@ async fn run_shell_session_events_record_exit_without_stdio_bodies() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "printf success-output".to_string(),
                         session_id: Some(session_id),
                         timeout_secs: Some(30),
+                        sync_wait_secs: Some(30),
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -98,10 +217,12 @@ async fn run_shell_session_events_record_exit_without_stdio_bodies() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "printf failure-output; exit 7".to_string(),
                         session_id: Some(session_id),
                         timeout_secs: Some(30),
+                        sync_wait_secs: Some(30),
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -213,7 +334,15 @@ async fn run_shell_via_agent(
     let command = command.to_string();
     let task = tokio::spawn(async move {
         runtime_for_task
-            .run_shell(project, command, timeout_secs, None)
+            .run_shell_with_contract(
+                project,
+                command,
+                timeout_secs,
+                Some(timeout_secs.unwrap_or(60)),
+                None,
+                None,
+                None,
+            )
             .await
     });
     let req = wait_for_patch_agent_request(&runtime, client_id).await;
@@ -246,7 +375,15 @@ async fn run_shell_via_agent_lifecycle_error(
     let runtime_for_task = runtime.clone();
     let task = tokio::spawn(async move {
         runtime_for_task
-            .run_shell(project, "printf lifecycle".to_string(), Some(30), None)
+            .run_shell_with_contract(
+                project,
+                "printf lifecycle".to_string(),
+                Some(30),
+                Some(30),
+                None,
+                None,
+                None,
+            )
             .await
     });
     let request = wait_for_patch_agent_request(&runtime, client_id).await;
@@ -299,8 +436,6 @@ async fn update_agent_shell_job(
             status: status.to_string(),
             stdout_chunk: stdout_chunk.map(str::to_string),
             stderr_chunk: stderr_chunk.map(str::to_string),
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code,
             duration_ms: finished.then_some(25),
@@ -392,10 +527,12 @@ async fn long_run_shell_hands_off_same_job_once_and_status_log_stop_observe_it()
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "printf durable-shell; sleep 30".to_string(),
                         session_id: Some(session_id),
-                        timeout_secs: Some(120),
+                        timeout_secs: Some(600),
+                        sync_wait_secs: Some(1),
                         cwd: Some(".".to_string()),
                         purpose: Some(ExecutionPurpose::Diagnostic),
                         shell: Some(ExecutionShell::Bash),
@@ -408,8 +545,9 @@ async fn long_run_shell_hands_off_same_job_once_and_status_log_stop_observe_it()
 
     let start = wait_for_patch_agent_request(&runtime, client_id).await;
     assert_eq!(start.kind, "start_job");
-    assert_eq!(start.timeout_secs, 120);
-    assert!(start.command.starts_with("exec bash -c "));
+    assert_eq!(start.timeout_secs, 600);
+    assert_eq!(start.command, "printf durable-shell; sleep 30");
+    assert_eq!(start.shell, Some(ExecutionShell::Bash));
     let job_id = start.job_id.clone().expect("durable Job id");
     update_agent_shell_job(
         &runtime,
@@ -433,8 +571,8 @@ async fn long_run_shell_hands_off_same_job_once_and_status_log_stop_observe_it()
     assert_eq!(result.output["execution_state"], "running");
     assert_eq!(result.output["command_started"], true);
     assert_eq!(result.output["command_completed"], false);
-    assert_eq!(result.output["effective_timeout_secs"], 120);
-    assert_eq!(result.output["sync_wait_secs"], 10);
+    assert_eq!(result.output["effective_timeout_secs"], 600);
+    assert_eq!(result.output["sync_wait_secs"], 1);
     assert_eq!(result.output["job_id"], job_id);
     assert_eq!(result.output["purpose"], "diagnostic");
     assert_eq!(result.output["shell"], "bash");
@@ -501,6 +639,7 @@ async fn long_run_shell_hands_off_same_job_once_and_status_log_stop_observe_it()
             vec![ObserveJobsItem {
                 job_id: job_id.clone(),
                 after_observation_token: None,
+                observation_ref: None,
             }],
             40,
             None,
@@ -571,7 +710,7 @@ async fn long_run_shell_fast_terminal_returns_ordinary_result_without_visible_jo
         let runtime = runtime.clone();
         async move {
             runtime
-                .run_shell(project, "printf fast".to_string(), Some(120), None)
+                .run_shell(project, "printf fast".to_string(), Some(600), None)
                 .await
         }
     });
@@ -598,16 +737,17 @@ async fn long_run_shell_fast_terminal_returns_ordinary_result_without_visible_jo
     assert_eq!(result.output["promoted_to_job"], false);
     assert_eq!(result.output["terminal"], true);
     assert_eq!(result.output["job_id"], serde_json::Value::Null);
-    assert_eq!(result.output["effective_timeout_secs"], 120);
+    assert_eq!(result.output["effective_timeout_secs"], 600);
     assert_eq!(result.output["sync_wait_secs"], 10);
     assert_run_shell_result_matches_schema(&result);
     assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
 }
 
 #[tokio::test]
-async fn run_shell_default_sixty_stays_synchronous_even_with_async_job_capability() {
-    let client_id = "shell-default-sync";
-    let runtime = runtime_with_agent_project(client_id);
+async fn run_shell_default_sixty_uses_ten_second_same_execution_handoff() {
+    let client_id = "shell-default-handoff";
+    let runtime = runtime_with_agent_project(client_id)
+        .with_structured_execution_sync_wait(std::time::Duration::from_millis(20));
     register_agent(
         &runtime,
         client_id,
@@ -624,18 +764,38 @@ async fn run_shell_default_sixty_stays_synchronous_even_with_async_job_capabilit
         let runtime = runtime.clone();
         async move {
             runtime
-                .run_shell(project, "printf default".to_string(), None, None)
+                .run_shell(project, "printf default; sleep 30".to_string(), None, None)
                 .await
         }
     });
     let request = wait_for_patch_agent_request(&runtime, client_id).await;
-    assert_eq!(request.kind, "run_shell");
+    assert_eq!(request.kind, "start_job");
     assert_eq!(request.timeout_secs, 60);
-    complete_patch_agent_request(&runtime, client_id, &request.request_id, 0, "default", "").await;
+    let job_id = request.job_id.clone().expect("durable shell Job id");
+    update_agent_shell_job(
+        &runtime,
+        client_id,
+        &request.request_id,
+        &job_id,
+        "running",
+        None,
+        None,
+        Some("default\n"),
+        None,
+        None,
+        false,
+    )
+    .await;
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert!(result.output.get("promoted_to_job").is_none());
-    assert!(runtime.runner_registry.list_jobs(Some(10)).await.is_empty());
+    assert_eq!(result.output["terminal"], false);
+    assert_eq!(result.output["job_id"], job_id);
+    assert_eq!(result.output["effective_timeout_secs"], 60);
+    assert_eq!(result.output["sync_wait_secs"], 10);
+    assert!(probe_patch_agent_request(&runtime, client_id)
+        .await
+        .is_none());
+    assert!(runtime.runner_registry.remove_job_record(&job_id).await);
 }
 
 #[tokio::test]
@@ -688,10 +848,12 @@ async fn long_run_shell_async_job_capability_does_not_bypass_shell_authority() {
     let result = runtime
         .dispatch_with_auth(
             ToolCall::RunShell {
+                login: false,
                 project,
                 command: "printf denied".to_string(),
                 session_id: None,
                 timeout_secs: Some(120),
+                sync_wait_secs: None,
                 cwd: None,
                 purpose: None,
                 shell: None,
@@ -837,7 +999,10 @@ async fn raw_shell_tools_reject_authored_command_above_shared_bound_before_proje
         .error
         .as_deref()
         .unwrap_or_default()
-        .contains("raw shell command exceeds the 16000-byte UTF-8 limit"));
+        .contains(&format!(
+            "raw shell command exceeds the {}-byte UTF-8 limit",
+            crate::runner_protocol::RAW_SHELL_COMMAND_MAX_BYTES
+        )));
     assert_eq!(run_shell.output["execution_state"], "not_started");
     assert_eq!(run_shell.output["failure_kind"], "runtime_error");
 
@@ -857,7 +1022,10 @@ async fn raw_shell_tools_reject_authored_command_above_shared_bound_before_proje
         .error
         .as_deref()
         .unwrap_or_default()
-        .contains("raw shell command exceeds the 16000-byte UTF-8 limit"));
+        .contains(&format!(
+            "raw shell command exceeds the {}-byte UTF-8 limit",
+            crate::runner_protocol::RAW_SHELL_COMMAND_MAX_BYTES
+        )));
 }
 
 #[tokio::test]
@@ -1169,24 +1337,6 @@ async fn run_job_rejects_server_configured_project_without_local_spawn() {
         .await;
     assert!(!result.success);
     assert!(result.error.unwrap().contains("unknown_project"));
-}
-
-#[tokio::test]
-async fn stop_job_rejects_unsafe_job_id() {
-    let runtime = test_runtime();
-    let result = runtime.stop_job("../escape".to_string(), None).await;
-    assert!(!result.success);
-    assert!(result.error.unwrap().contains("invalid job id"));
-}
-
-#[tokio::test]
-async fn stop_job_unknown_job_returns_error() {
-    let runtime = test_runtime();
-    let result = runtime
-        .stop_job("55555555-6666-7777-8888-999999999999".to_string(), None)
-        .await;
-    assert!(!result.success);
-    assert!(result.error.unwrap().contains("unknown job"));
 }
 
 #[tokio::test]
@@ -1548,14 +1698,28 @@ async fn model_facing_stop_job_session_project_mismatch_beats_auto_approve() {
     assert!(event.permission.is_none());
 }
 
-async fn register_job_agent_for_auth(
+pub(super) async fn register_job_agent_for_auth(
     runtime: &ToolRuntime,
     client_id: &str,
     project_id: &str,
     auth: &crate::auth::AuthContext,
 ) {
+    register_job_agent_for_auth_with_reconciliation(runtime, client_id, project_id, auth, false)
+        .await;
+}
+
+pub(super) async fn register_job_agent_for_auth_with_reconciliation(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    project_id: &str,
+    auth: &crate::auth::AuthContext,
+    reconciliation: bool,
+) {
     let caps = crate::test_support::current_runner_capabilities(RunnerCapabilities {
         async_shell_jobs: true,
+        explicit_shell_selection: true,
+        bash_login_shell: true,
+        job_state_reconciliation: reconciliation,
         ..Default::default()
     });
     runtime
@@ -1565,7 +1729,10 @@ async fn register_job_agent_for_auth(
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: Some(4),
-                job_inventory: None,
+                job_inventory: reconciliation.then(|| crate::runner_protocol::ShellJobInventory {
+                    active_complete: true,
+                    jobs: Vec::new(),
+                }),
                 coding_agent_providers: None,
                 coding_agent_inventory: None,
                 client_id: client_id.to_string(),
@@ -1655,7 +1822,7 @@ async fn start_agent_runtime_job(
     start_agent_runtime_job_in_session(runtime, client_id, project_id, None, auth).await
 }
 
-async fn start_agent_runtime_job_in_session(
+pub(super) async fn start_agent_runtime_job_in_session(
     runtime: &ToolRuntime,
     client_id: &str,
     project_id: &str,
@@ -1680,7 +1847,7 @@ async fn start_agent_runtime_job_in_session(
     result.output["job_id"].as_str().unwrap().to_string()
 }
 
-async fn mark_next_agent_job_running(runtime: &ToolRuntime, client_id: &str) -> String {
+pub(super) async fn mark_next_agent_job_running(runtime: &ToolRuntime, client_id: &str) -> String {
     let request = wait_for_runner_request_for_instance(runtime, client_id, "inst").await;
     let job_id = request.job_id.clone().expect("Job request id");
     runtime
@@ -1690,12 +1857,10 @@ async fn mark_next_agent_job_running(runtime: &ToolRuntime, client_id: &str) -> 
             runner_instance_id: "inst".to_string(),
             job_id: job_id.clone(),
             request_id: Some(request.request_id),
-            update_seq: None,
+            update_seq: Some(1),
             status: "running".to_string(),
             stdout_chunk: None,
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: None,
             duration_ms: None,

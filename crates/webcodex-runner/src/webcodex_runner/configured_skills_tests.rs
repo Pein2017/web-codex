@@ -142,11 +142,7 @@ fn missing_root_is_a_bounded_path_free_diagnostic_not_an_empty_fallback() {
     assert!(discovery.skills.is_empty());
     assert_eq!(
         discovery.diagnostics,
-        vec![RunnerSkillDiagnostic {
-            reason_code: "configured_skill_root_not_found".to_string(),
-            candidate_name: None,
-            source_scope: Some("runner".to_string()),
-        }]
+        vec!["configured_skill_root_not_found".to_string()]
     );
     assert!(!serde_json::to_string(&discovery.diagnostics)
         .unwrap()
@@ -195,7 +191,7 @@ fn configured_root_symlink_is_rejected() {
         assert!(discovery
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.reason_code == "configured_skill_root_link_not_allowed"));
+            .any(|code| code == "configured_skill_root_link_not_allowed"));
     }
 }
 
@@ -270,7 +266,7 @@ fn sensitive_package_names_are_not_discovered() {
     assert!(discovery
         .diagnostics
         .iter()
-        .any(|diagnostic| diagnostic.reason_code == "sensitive_skill_definition"));
+        .any(|code| code == "sensitive_skill_definition"));
 }
 
 #[test]
@@ -293,30 +289,7 @@ fn malformed_and_oversized_definitions_are_bounded_diagnostics() {
     assert!(discovery
         .diagnostics
         .iter()
-        .any(|diagnostic| diagnostic.reason_code == "skill_definition_too_large"));
-}
-
-#[test]
-fn missing_definition_diagnostic_is_candidate_scoped_and_path_free() {
-    let temp = tempfile::tempdir().unwrap();
-    fs::create_dir_all(temp.path().join("incomplete")).unwrap();
-
-    let discovery = discover(&SkillsConfig {
-        roots: vec![temp.path().to_path_buf()],
-    })
-    .unwrap();
-    assert_eq!(discovery.invalid_count, 1);
-    assert_eq!(
-        discovery.diagnostics,
-        vec![RunnerSkillDiagnostic {
-            reason_code: "missing_skill_definition".to_string(),
-            candidate_name: Some("incomplete".to_string()),
-            source_scope: Some("runner".to_string()),
-        }]
-    );
-    let serialized = serde_json::to_string(&discovery.diagnostics).unwrap();
-    assert!(!serialized.contains(temp.path().to_string_lossy().as_ref()));
-    assert!(!serialized.contains("wc_skill_"));
+        .any(|code| code == "skill_definition_too_large"));
 }
 
 #[test]

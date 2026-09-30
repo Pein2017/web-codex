@@ -54,6 +54,45 @@ fn search_request_and_pattern_mode(
     )
 }
 
+fn include_glob_diagnostic_query(
+    query: &SearchProjectTextsQuery,
+) -> Option<SearchProjectTextsQuery> {
+    if query.include_globs.as_ref().is_none_or(Vec::is_empty) {
+        return None;
+    }
+    let mut diagnostic = query.clone();
+    diagnostic.include_globs = None;
+    diagnostic.result_mode = Some(super::SearchResultMode::Matches);
+    diagnostic.context_before = Some(0);
+    diagnostic.context_after = Some(0);
+    diagnostic.limit = Some(1);
+    Some(diagnostic)
+}
+
+fn successful_search_is_complete_and_empty(result: &ToolResult) -> bool {
+    if !result.success || result.output["truncated"].as_bool() != Some(false) {
+        return false;
+    }
+    match result.output["result_mode"].as_str() {
+        Some("matches") => result.output["matches"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        Some("files_with_matches") => result.output["files"].as_array().is_some_and(Vec::is_empty),
+        Some("count") => {
+            result.output["count_complete"].as_bool() == Some(true)
+                && result.output["total_matches"].as_u64() == Some(0)
+        }
+        _ => false,
+    }
+}
+
+fn successful_diagnostic_has_match(result: &ToolResult) -> bool {
+    result.success
+        && result.output["matches"]
+            .as_array()
+            .is_some_and(|matches| !matches.is_empty())
+}
+
 pub(crate) fn normalized_result_budget(max_result_bytes: Option<usize>) -> usize {
     max_result_bytes
         .unwrap_or(DEFAULT_SEARCH_PROJECT_TEXTS_RESULT_BYTES)
@@ -132,6 +171,7 @@ fn retryable_runner_request_failure(result: &ToolResult) -> bool {
         && result.output.get("code").and_then(Value::as_str) == Some("search_request_dropped")
 }
 
+#[cfg(test)]
 fn apply_output_budget(
     project: &str,
     requested_count: usize,
@@ -172,15 +212,7 @@ fn apply_output_budget_with_continuation(
     // First evaluate the exact sparse model projection. Canonical search
     // metadata stays intact unless that final applicable projection itself
     // exceeds the response budget.
-    if projected_batch_serialized_len_with_continuation(
-        &complete,
-        default_timeouts,
-        project,
-        original_queries,
-        session_id,
-        max_result_bytes,
-    ) <= payload_budget
-    {
+    if projected_batch_serialized_len(&complete, default_timeouts) <= payload_budget {
         return complete;
     }
 
@@ -192,82 +224,66 @@ fn apply_output_budget_with_continuation(
     let mut returned = Vec::with_capacity(completed.len());
     let mut omitted_indices = BTreeSet::new();
 
-    for item in completed {
+    for item in &completed {
         let index = item["index"].as_u64().unwrap_or(returned.len() as u64) as usize;
         let mut candidate_items = returned.clone();
         candidate_items.push(item.clone());
-        let next_index = omitted_indices
-            .iter()
-            .copied()
-            .chain(std::iter::once(index))
-            .min();
         let candidate = batch_output(
             project,
             requested_count,
             candidate_items,
             true,
-            next_index,
+            omitted_indices.iter().next().copied().or(Some(index)),
             Some(truncation_reason),
         );
-        // Search items are whole-query units. Measure each candidate with the
-        // exact omitted-query follow-up so a later small query may be retained
-        // without losing an earlier oversized request.
-        let exact_fits = projected_batch_serialized_len_with_continuation(
+        if projected_batch_serialized_len_with_continuation(
             &candidate,
             default_timeouts,
             project,
             original_queries,
             session_id,
             max_result_bytes,
-        ) <= payload_budget;
-        let bounded_without_followup =
-            projected_batch_serialized_len(&candidate, default_timeouts) <= payload_budget;
-        if exact_fits || bounded_without_followup {
-            returned.push(item);
+        ) <= payload_budget
+        {
+            returned.push(item.clone());
         } else {
             omitted_indices.insert(index);
         }
     }
 
-    let mut next_index = omitted_indices.iter().next().copied();
-    let mut output = batch_output(
+    // Very large query arguments may make every parser-ready follow-up exceed
+    // the budget. Preserve fitting observations; the caller suppresses that
+    // oversized continuation and retains bounded omitted-query summaries.
+    if returned.is_empty() {
+        for item in completed {
+            let index = item["index"].as_u64().unwrap_or(0) as usize;
+            let mut candidate_items = returned.clone();
+            candidate_items.push(item.clone());
+            let candidate = batch_output(
+                project,
+                requested_count,
+                candidate_items,
+                true,
+                omitted_indices.iter().next().copied(),
+                Some(truncation_reason),
+            );
+            if projected_batch_serialized_len(&candidate, default_timeouts) <= payload_budget {
+                returned.push(item);
+                omitted_indices.remove(&index);
+            }
+        }
+    }
+
+    // Whole-query omissions retain their original indices; backend match order
+    // is intentionally not used as a cursor across reruns.
+    batch_output(
         project,
         requested_count,
         returned,
         true,
-        next_index,
+        omitted_indices.iter().next().copied(),
         Some(truncation_reason),
-    );
-    while projected_batch_serialized_len_with_continuation(
-        &output,
-        default_timeouts,
-        project,
-        original_queries,
-        session_id,
-        max_result_bytes,
-    ) > payload_budget
-        && projected_batch_serialized_len(&output, default_timeouts) > payload_budget
-    {
-        let Some(items) = output.get_mut("items").and_then(Value::as_array_mut) else {
-            break;
-        };
-        let Some(removed) = items.pop() else {
-            break;
-        };
-        next_index = next_index
-            .into_iter()
-            .chain(removed["index"].as_u64().map(|index| index as usize))
-            .min();
-        output = batch_output(
-            project,
-            requested_count,
-            items.clone(),
-            true,
-            next_index,
-            Some(truncation_reason),
-        );
-    }
-    output
+    )
 }
 
 fn failure_reason_code(result: &ToolResult) -> &'static str {
@@ -429,6 +445,111 @@ fn batch_item(index: usize, mut result: ToolResult) -> Value {
     })
 }
 
+fn omitted_query_summary(item: &Value) -> Option<Value> {
+    let index = item.get("index")?.as_u64()?;
+    let success = item.get("success")?.as_bool()?;
+    let output = item.get("output")?.as_object()?;
+    if !success {
+        return Some(json!({
+            "index": index,
+            "success": false,
+            "reason_code": output.get("reason_code")?.as_str()?,
+            "failure_stage": output.get("failure_stage")?.as_str()?,
+            "detail_code": output.get("detail_code")?.as_str()?,
+        }));
+    }
+
+    let result_mode = output.get("result_mode")?.as_str()?;
+    let truncated = output.get("truncated")?.as_bool()?;
+    let mut summary = json!({
+        "index": index,
+        "success": true,
+        "result_mode": result_mode,
+        "truncated": truncated,
+    });
+    match result_mode {
+        "matches" => {
+            if let Some(count) = output.get("count").and_then(Value::as_u64).or_else(|| {
+                output
+                    .get("matches")
+                    .and_then(Value::as_array)
+                    .map(|matches| matches.len() as u64)
+            }) {
+                summary["returned_match_count"] = json!(count);
+            }
+        }
+        "files_with_matches" => {
+            if let Some(count) = output
+                .get("returned_file_count")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    output
+                        .get("files")
+                        .and_then(Value::as_array)
+                        .map(|files| files.len() as u64)
+                })
+            {
+                summary["returned_file_count"] = json!(count);
+            }
+        }
+        "count" => {
+            if output.get("count_complete").and_then(Value::as_bool) == Some(true) {
+                if let Some(total_matches) = output.get("total_matches").and_then(Value::as_u64) {
+                    summary["total_matches"] = json!(total_matches);
+                }
+            }
+        }
+        _ => return None,
+    }
+    Some(summary)
+}
+
+fn remaining_query_summaries(completed: &[Value], returned: &[Value]) -> Vec<Value> {
+    let returned_indices = returned
+        .iter()
+        .filter_map(|item| item["index"].as_u64())
+        .collect::<BTreeSet<_>>();
+    completed
+        .iter()
+        .filter(|item| {
+            item.get("index")
+                .and_then(Value::as_u64)
+                .is_some_and(|index| !returned_indices.contains(&index))
+        })
+        .filter_map(omitted_query_summary)
+        .collect()
+}
+
+fn sort_dedup_remaining_summaries(summaries: &mut Vec<Value>) {
+    summaries.sort_by_key(|summary| summary["index"].as_u64().unwrap_or(u64::MAX));
+    summaries.dedup_by_key(|summary| summary["index"].as_u64().unwrap_or(u64::MAX));
+}
+
+fn attach_bounded_remaining_summaries(
+    output: &mut Value,
+    summaries: &[Value],
+    max_len: usize,
+    measure: impl Fn(&Value) -> usize,
+) {
+    if summaries.is_empty() {
+        return;
+    }
+    if let Some(root) = output.as_object_mut() {
+        root.remove("remaining_summaries");
+    }
+    let mut accepted = Vec::with_capacity(summaries.len());
+    for summary in summaries {
+        accepted.push(summary.clone());
+        let mut candidate = output.clone();
+        candidate["remaining_summaries"] = json!(accepted);
+        if measure(&candidate) <= max_len {
+            *output = candidate;
+        } else {
+            break;
+        }
+    }
+}
+
 fn search_query_argument_value(query: &SearchProjectTextsQuery) -> Value {
     let mut value =
         serde_json::to_value(query).expect("SearchProjectTextsQuery serialization is infallible");
@@ -458,9 +579,8 @@ fn search_suggested_arguments(
 }
 
 /// Compile producer-only whole-query next_index bookkeeping into one directly
-/// reusable rerun containing every omitted original query. Individual query
-/// match positions remain deliberately non-resumable because backend order is
-/// not a stable cursor.
+/// reusable omitted-query rerun. Individual query match positions remain deliberately
+/// non-resumable because backend order is not a stable cursor.
 pub(crate) fn add_actionable_search_continuation(
     result: &mut ToolResult,
     project: &str,
@@ -474,6 +594,7 @@ pub(crate) fn add_actionable_search_continuation(
     let Some(output) = result.output.as_object_mut() else {
         return;
     };
+    output.remove("suggested_call");
     let truncated = output.get("output_truncated").and_then(Value::as_bool) == Some(true);
     let next_index = output
         .get("next_index")
@@ -483,7 +604,7 @@ pub(crate) fn add_actionable_search_continuation(
         output.remove("next_index");
         return;
     }
-    let Some(next_index) = next_index else {
+    let Some(_) = next_index else {
         return;
     };
     let Some(returned) = output.get("items").and_then(Value::as_array) else {
@@ -491,39 +612,29 @@ pub(crate) fn add_actionable_search_continuation(
     };
     let returned_indices = returned
         .iter()
-        .filter_map(|item| item.get("index").and_then(Value::as_u64))
-        .map(|index| index as usize)
+        .filter_map(|item| item["index"].as_u64().map(|index| index as usize))
         .collect::<BTreeSet<_>>();
+    if returned_indices.is_empty() {
+        // A same-budget zero-progress replay is not actionable.
+        output.remove("next_index");
+        return;
+    }
     let remaining = original_queries
         .iter()
         .enumerate()
         .filter(|(index, _)| !returned_indices.contains(index))
         .map(|(_, query)| query.clone())
         .collect::<Vec<_>>();
-    if remaining.is_empty() {
-        output.remove("next_index");
-        return;
+    if !remaining.is_empty() {
+        output.insert(
+            "suggested_call".to_string(),
+            SuggestedToolCall::new(
+                "search_project_texts",
+                search_suggested_arguments(project, &remaining, session_id, max_result_bytes),
+            )
+            .to_value(),
+        );
     }
-    let mut next_budget = max_result_bytes;
-    if returned_indices.is_empty() && next_index == 0 {
-        let reason = output.get("truncation_reason").and_then(Value::as_str);
-        let current_budget = normalized_result_budget(max_result_bytes);
-        if reason == Some("hard_result_cap") || current_budget >= MAX_SERIALIZED_OUTPUT_BYTES {
-            // No bounded parameter change can prove progress. Preserve the
-            // truncation reason, but never manufacture a looping next call.
-            output.remove("next_index");
-            return;
-        }
-        next_budget = Some(MAX_SERIALIZED_OUTPUT_BYTES);
-    }
-    output.insert(
-        "suggested_call".to_string(),
-        SuggestedToolCall::new(
-            "search_project_texts",
-            search_suggested_arguments(project, &remaining, session_id, next_budget),
-        )
-        .to_value(),
-    );
     output.remove("next_index");
 }
 
@@ -562,34 +673,59 @@ pub(crate) fn apply_model_facing_output_budget(
     let mut budgeted = apply_output_budget_with_continuation(
         &output_project,
         requested_count,
-        completed,
+        completed.clone(),
         default_timeouts,
         max_result_bytes,
         original_queries,
         session_id,
     );
 
-    // The parser-ready suffix call is part of the primary model-facing search
-    // projection. Measure it against that primary budget before reattaching
-    // independently bounded Session/continuity overlays. The producer packer
-    // already accounted for every omitted original query. If an outer caller
-    // added enough metadata to exceed the primary budget, retain useful
-    // returned items but suppress the producer-only cursor bookkeeping rather
-    // than returning an oversized/fake continuation.
+    // The parser-ready omitted-query call is part of the primary model-facing search
+    // projection. Measure it before the optional omitted-query summaries. The
+    // summaries describe omitted queries without repeating returned items.
     let payload_budget = normalized_result_budget(max_result_bytes)
         .saturating_sub(MODEL_RESULT_ENVELOPE_RESERVE_BYTES);
-    if projected_batch_serialized_len_with_continuation(
+    let summaries = remaining_query_summaries(
+        &completed,
+        budgeted["items"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]),
+    );
+    let continuation_fits = projected_batch_serialized_len_with_continuation(
         &budgeted,
         default_timeouts,
         project,
         original_queries,
         session_id,
         max_result_bytes,
-    ) > payload_budget
-    {
+    ) <= payload_budget;
+    if continuation_fits {
+        attach_bounded_remaining_summaries(
+            &mut budgeted,
+            &summaries,
+            payload_budget,
+            |candidate| {
+                projected_batch_serialized_len_with_continuation(
+                    candidate,
+                    default_timeouts,
+                    project,
+                    original_queries,
+                    session_id,
+                    max_result_bytes,
+                )
+            },
+        );
+    } else {
         if let Some(root) = budgeted.as_object_mut() {
             root.remove("next_index");
         }
+        attach_bounded_remaining_summaries(
+            &mut budgeted,
+            &summaries,
+            payload_budget,
+            |candidate| projected_batch_serialized_len(candidate, default_timeouts),
+        );
     }
 
     let Some(root) = result.output.as_object_mut() else {
@@ -605,6 +741,7 @@ pub(crate) fn apply_model_facing_output_budget(
         "output_truncated",
         "next_index",
         "truncation_reason",
+        "remaining_summaries",
     ] {
         root.remove(key);
     }
@@ -657,6 +794,13 @@ fn mark_final_hard_cap_truncation(output: &mut Value, next_index: usize) {
         json!(returned_count.saturating_sub(succeeded_count)),
     );
     root.insert("output_truncated".to_string(), json!(true));
+    let next_index = root
+        .get("next_index")
+        .and_then(Value::as_u64)
+        .map(|index| index as usize)
+        .into_iter()
+        .chain(std::iter::once(next_index))
+        .min();
     root.insert("next_index".to_string(), json!(next_index));
     root.insert("truncation_reason".to_string(), json!("hard_result_cap"));
 }
@@ -699,8 +843,41 @@ pub(crate) fn enforce_final_model_facing_hard_cap(
         return;
     }
 
+    let mut summary_candidates = result
+        .output
+        .as_object_mut()
+        .and_then(|root| root.remove("remaining_summaries"))
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    if final_model_result_len(
+        &result.output,
+        default_timeouts,
+        project,
+        original_queries,
+        session_id,
+        max_result_bytes,
+    ) <= MAX_SERIALIZED_OUTPUT_BYTES
+    {
+        attach_bounded_remaining_summaries(
+            &mut result.output,
+            &summary_candidates,
+            MAX_SERIALIZED_OUTPUT_BYTES,
+            |candidate| {
+                final_model_result_len(
+                    candidate,
+                    default_timeouts,
+                    project,
+                    original_queries,
+                    session_id,
+                    max_result_bytes,
+                )
+            },
+        );
+        return;
+    }
+
     loop {
-        let removed_index = {
+        let removed = {
             let Some(items) = result.output.get_mut("items").and_then(Value::as_array_mut) else {
                 return;
             };
@@ -711,10 +888,30 @@ pub(crate) fn enforce_final_model_facing_hard_cap(
                 if let Some(root) = result.output.as_object_mut() {
                     root.remove("next_index");
                 }
+                attach_bounded_remaining_summaries(
+                    &mut result.output,
+                    &summary_candidates,
+                    MAX_SERIALIZED_OUTPUT_BYTES,
+                    |candidate| {
+                        final_model_result_len(
+                            candidate,
+                            default_timeouts,
+                            project,
+                            original_queries,
+                            session_id,
+                            max_result_bytes,
+                        )
+                    },
+                );
                 return;
             };
-            removed["index"].as_u64().unwrap_or(0) as usize
+            removed
         };
+        let removed_index = removed["index"].as_u64().unwrap_or(0) as usize;
+        if let Some(summary) = omitted_query_summary(&removed) {
+            summary_candidates.push(summary);
+            sort_dedup_remaining_summaries(&mut summary_candidates);
+        }
         mark_final_hard_cap_truncation(&mut result.output, removed_index);
         if final_model_result_len(
             &result.output,
@@ -725,6 +922,21 @@ pub(crate) fn enforce_final_model_facing_hard_cap(
             max_result_bytes,
         ) <= MAX_SERIALIZED_OUTPUT_BYTES
         {
+            attach_bounded_remaining_summaries(
+                &mut result.output,
+                &summary_candidates,
+                MAX_SERIALIZED_OUTPUT_BYTES,
+                |candidate| {
+                    final_model_result_len(
+                        candidate,
+                        default_timeouts,
+                        project,
+                        original_queries,
+                        session_id,
+                        max_result_bytes,
+                    )
+                },
+            );
             return;
         }
     }
@@ -763,8 +975,9 @@ impl ToolRuntime {
                 let project = &resolved.config;
                 let output_project = runtime_project_id.as_str();
                 async move {
+                    let diagnostic_query = include_glob_diagnostic_query(&query);
                     let (request, pattern_mode) = search_request_and_pattern_mode(query);
-                    let result =
+                    let mut result =
                         match SearchOptions::normalize_with_pattern_mode(request, pattern_mode) {
                             Ok(options) => {
                                 let first = self
@@ -791,6 +1004,28 @@ impl ToolRuntime {
                             }
                             Err(error) => error.into_tool_result(),
                         };
+                    if successful_search_is_complete_and_empty(&result) {
+                        if let Some(diagnostic_query) = diagnostic_query {
+                            let (request, pattern_mode) =
+                                search_request_and_pattern_mode(diagnostic_query);
+                            if let Ok(options) =
+                                SearchOptions::normalize_with_pattern_mode(request, pattern_mode)
+                            {
+                                let diagnostic = self
+                                    .search_one_resolved_project_text(
+                                        project,
+                                        output_project,
+                                        options,
+                                        Some(deadline),
+                                    )
+                                    .await;
+                                if successful_diagnostic_has_match(&diagnostic) {
+                                    result.output["zero_match_hint"] =
+                                        json!("include_globs_excluded_matches");
+                                }
+                            }
+                        }
+                    }
                     batch_item(index, result)
                 }
             }))
@@ -855,6 +1090,71 @@ mod tests {
         output.insert("context_before".to_string(), json!(0));
         output.insert("context_after".to_string(), json!(0));
         item
+    }
+
+    fn test_query(
+        index: usize,
+        result_mode: Option<super::super::SearchResultMode>,
+    ) -> SearchProjectTextsQuery {
+        SearchProjectTextsQuery {
+            pattern: format!("needle-{index}"),
+            pattern_mode: None,
+            path: None,
+            limit: None,
+            context_before: None,
+            context_after: None,
+            include_globs: None,
+            exclude_globs: None,
+            result_mode,
+            timeout_secs: None,
+        }
+    }
+
+    fn files_item(index: usize, count: usize) -> Value {
+        json!({
+            "index": index,
+            "success": true,
+            "output": {
+                "backend": "rg",
+                "result_mode": "files_with_matches",
+                "pattern_mode": "regex",
+                "path": ".",
+                "effective_timeout_secs": 30,
+                "exit_code": 0,
+                "context_before": 0,
+                "context_after": 0,
+                "files": (0..count).map(|file_index| json!({"path": format!("src/{index}-{file_index}.rs")})).collect::<Vec<_>>(),
+                "returned_file_count": count,
+                "truncated": false,
+                "truncation_reason": null
+            },
+            "error": null
+        })
+    }
+
+    fn count_item(index: usize, total_matches: usize) -> Value {
+        json!({
+            "index": index,
+            "success": true,
+            "output": {
+                "backend": "rg",
+                "result_mode": "count",
+                "pattern_mode": "regex",
+                "path": ".",
+                "effective_timeout_secs": 30,
+                "exit_code": 0,
+                "context_before": 0,
+                "context_after": 0,
+                "files": [],
+                "returned_file_count": 0,
+                "returned_match_count": total_matches,
+                "count_complete": true,
+                "total_matches": total_matches,
+                "truncated": false,
+                "truncation_reason": null
+            },
+            "error": null
+        })
     }
 
     #[test]
@@ -956,6 +1256,7 @@ mod tests {
         assert_eq!(result.output["output_truncated"], false);
         assert!(result.output["next_index"].is_null());
         assert_eq!(result.output["items"].as_array().unwrap().len(), 8);
+        assert!(result.output.get("remaining_summaries").is_none());
         for (actual, expected) in result.output["items"]
             .as_array()
             .unwrap()
@@ -969,6 +1270,220 @@ mod tests {
         assert!(result.output.get("output_truncated").is_none());
         assert!(result.output.get("next_index").is_none());
         assert_eq!(result.output["items"].as_array().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn omitted_query_summaries_cover_result_modes_without_content() {
+        let completed = vec![matches_item(0, 0, 12), files_item(1, 4), count_item(2, 17)];
+        let summaries = remaining_query_summaries(&completed, &[]);
+        assert_eq!(summaries.len(), 3);
+        assert_eq!(summaries[0]["result_mode"], "matches");
+        assert_eq!(summaries[0]["returned_match_count"], 0);
+        assert_eq!(summaries[0]["truncated"], false);
+        assert_eq!(summaries[1]["result_mode"], "files_with_matches");
+        assert_eq!(summaries[1]["returned_file_count"], 4);
+        assert_eq!(summaries[2]["result_mode"], "count");
+        assert_eq!(summaries[2]["total_matches"], 17);
+        let rendered = serde_json::to_string(&summaries).unwrap();
+        assert!(!rendered.contains("src/"));
+        assert!(!rendered.contains("preview"));
+        assert!(!rendered.contains("read_hint"));
+    }
+
+    #[test]
+    fn omitted_query_failure_summary_uses_only_stable_classification() {
+        let mut failed = ToolResult::err("RAW_BACKEND_BODY_NEVER_RETURN");
+        failed.output = json!({
+            "code": "search_timeout",
+            "reason_code": "timeout",
+            "failure_stage": "agent_transport",
+            "stderr": "RAW_BACKEND_BODY_NEVER_RETURN",
+            "path": "/private/never-return.rs"
+        });
+        let item = batch_item(5, failed);
+        let summary = omitted_query_summary(&item).unwrap();
+        assert_eq!(summary["index"], 5);
+        assert_eq!(summary["success"], false);
+        assert_eq!(summary["reason_code"], "timeout");
+        assert_eq!(summary["failure_stage"], "agent_transport");
+        assert_eq!(summary["detail_code"], "timeout");
+        let rendered = serde_json::to_string(&summary).unwrap();
+        assert!(!rendered.contains("RAW_BACKEND_BODY_NEVER_RETURN"));
+        assert!(!rendered.contains("/private/"));
+        assert!(!rendered.contains("stderr"));
+    }
+
+    #[test]
+    fn batch_budget_summarizes_only_omitted_queries_without_consuming_continuation() {
+        let mut first = default_matches_item(0, 1, 8_000);
+        first["output"]["pattern_mode"] = json!("regex");
+        let completed = vec![
+            first.clone(),
+            default_matches_item(1, 120, 900),
+            default_matches_item(2, 0, 16),
+            files_item(3, 4),
+        ];
+        let queries = vec![
+            test_query(0, Some(super::super::SearchResultMode::Matches)),
+            test_query(1, Some(super::super::SearchResultMode::Matches)),
+            test_query(2, Some(super::super::SearchResultMode::Matches)),
+            test_query(3, Some(super::super::SearchResultMode::FilesWithMatches)),
+        ];
+        let mut result = ToolResult::ok(batch_output(
+            "agent:oe:demo",
+            4,
+            completed,
+            false,
+            None,
+            None,
+        ));
+        apply_model_facing_output_budget(
+            &mut result,
+            &[true; 4],
+            None,
+            "agent:oe:demo",
+            &queries,
+            None,
+        );
+        assert_eq!(result.output["returned_count"], 3);
+        assert_eq!(result.output["items"][0], first);
+        assert_eq!(result.output["next_index"], 1);
+        let summaries = result.output["remaining_summaries"].as_array().unwrap();
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| summary["index"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(summaries[0]["returned_match_count"], 120);
+        assert!(!serde_json::to_string(summaries).unwrap().contains("src/3-"));
+
+        super::super::dispatch::sparsify_search_batch_success_for_model(&[true; 4], &mut result);
+        add_actionable_search_continuation(&mut result, "agent:oe:demo", &queries, None, None);
+        let suggested_queries = result.output["suggested_call"]["arguments"]["queries"]
+            .as_array()
+            .unwrap();
+        assert_eq!(suggested_queries.len(), 1);
+        assert_eq!(suggested_queries[0]["pattern"], "needle-1");
+        assert!(result.output.get("next_index").is_none());
+        assert!(serialized_json_len(&result).unwrap() <= DEFAULT_SEARCH_PROJECT_TEXTS_RESULT_BYTES);
+    }
+
+    #[test]
+    fn continuation_budget_has_priority_over_remaining_summaries() {
+        let queries = (0..4)
+            .map(|index| test_query(index, None))
+            .collect::<Vec<_>>();
+        let completed = vec![
+            default_matches_item(0, 1, 12_000),
+            default_matches_item(1, 1, 12),
+            default_matches_item(2, 0, 12),
+            files_item(3, 4),
+        ];
+        let mut output = batch_output(
+            "agent:oe:demo",
+            4,
+            vec![completed[0].clone()],
+            true,
+            Some(1),
+            Some("batch_response_budget"),
+        );
+        let summaries = remaining_query_summaries(&completed, &completed[..1]);
+        let base_len = projected_batch_serialized_len_with_continuation(
+            &output,
+            &[true; 4],
+            "agent:oe:demo",
+            &queries,
+            None,
+            None,
+        );
+        let mut all = output.clone();
+        all["remaining_summaries"] = json!(summaries);
+        let all_len = projected_batch_serialized_len_with_continuation(
+            &all,
+            &[true; 4],
+            "agent:oe:demo",
+            &queries,
+            None,
+            None,
+        );
+        assert!(all_len > base_len);
+        let budget = base_len + (all_len - base_len) / 2;
+        attach_bounded_remaining_summaries(&mut output, &summaries, budget, |candidate| {
+            projected_batch_serialized_len_with_continuation(
+                candidate,
+                &[true; 4],
+                "agent:oe:demo",
+                &queries,
+                None,
+                None,
+            )
+        });
+        assert_eq!(output["next_index"], 1);
+        assert!(
+            output
+                .get("remaining_summaries")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0)
+                < summaries.len()
+        );
+        assert!(
+            projected_batch_serialized_len_with_continuation(
+                &output,
+                &[true; 4],
+                "agent:oe:demo",
+                &queries,
+                None,
+                None,
+            ) <= budget
+        );
+        let mut result = ToolResult::ok(output);
+        super::super::dispatch::sparsify_search_batch_success_for_model(&[true; 4], &mut result);
+        add_actionable_search_continuation(&mut result, "agent:oe:demo", &queries, None, None);
+        assert_eq!(
+            result.output["suggested_call"]["tool"],
+            "search_project_texts"
+        );
+    }
+
+    #[test]
+    fn tiny_budget_summary_fallback_is_deterministic_and_bounded() {
+        let query = test_query(0, Some(super::super::SearchResultMode::Matches));
+        let canonical = batch_output(
+            "agent:oe:demo",
+            1,
+            vec![default_matches_item(0, 120, 900)],
+            false,
+            None,
+            None,
+        );
+        let project_once = || {
+            let mut result = ToolResult::ok(canonical.clone());
+            apply_model_facing_output_budget(
+                &mut result,
+                &[true],
+                Some(0),
+                "agent:oe:demo",
+                std::slice::from_ref(&query),
+                None,
+            );
+            super::super::dispatch::sparsify_search_batch_success_for_model(&[true], &mut result);
+            add_actionable_search_continuation(
+                &mut result,
+                "agent:oe:demo",
+                std::slice::from_ref(&query),
+                None,
+                Some(0),
+            );
+            result
+        };
+        let first = project_once();
+        let second = project_once();
+        assert_eq!(first.output, second.output);
+        assert!(first.output["output_truncated"].as_bool().unwrap());
+        assert!(serialized_json_len(&first).unwrap() <= normalized_result_budget(Some(0)));
     }
 
     #[test]
@@ -1042,61 +1557,121 @@ mod tests {
 
     #[test]
     fn oversized_query_does_not_suppress_later_small_queries_or_their_followup() {
-        let queries = (0..3)
-            .map(|index| SearchProjectTextsQuery {
-                pattern: format!("needle-{index}"),
-                pattern_mode: None,
-                path: None,
-                limit: None,
-                context_before: None,
-                context_after: None,
-                include_globs: None,
-                exclude_globs: None,
-                result_mode: None,
-                timeout_secs: None,
-            })
+        let budget = MIN_SEARCH_PROJECT_TEXTS_RESULT_BYTES;
+        let mut queries = (0..4)
+            .map(|index| test_query(index, None))
             .collect::<Vec<_>>();
-        let output = apply_output_budget_with_continuation(
+        queries[2].limit = Some(17);
+        queries[2].context_after = Some(2);
+        let mut result = ToolResult::ok(batch_output(
             "agent:oe:demo",
-            queries.len(),
+            4,
             vec![
-                matches_item(0, 199, 3_000),
-                default_matches_item(1, 1, 100),
-                default_matches_item(2, 1, 100),
+                default_matches_item(0, 120, 900),
+                default_matches_item(1, 0, 12),
+                default_matches_item(2, 120, 900),
+                default_matches_item(3, 1, 12),
             ],
-            &[true; 3],
-            Some(256 * 1024),
+            false,
+            None,
+            None,
+        ));
+        apply_model_facing_output_budget(
+            &mut result,
+            &[true; 4],
+            Some(budget),
+            "agent:oe:demo",
             &queries,
             Some("wc_sess_demo"),
         );
-        assert_eq!(output["output_truncated"], true);
         assert_eq!(
-            output["items"]
+            result.output["items"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .map(|item| item["index"].as_u64().unwrap())
                 .collect::<Vec<_>>(),
-            vec![1, 2]
+            vec![1, 3]
         );
-        assert_eq!(output["next_index"], 0);
-
-        let mut result = ToolResult::ok(output);
-        super::super::dispatch::sparsify_search_batch_success_for_model(&[true; 3], &mut result);
+        assert_eq!(result.output["next_index"], 0);
+        assert_eq!(
+            result.output["remaining_summaries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["index"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        super::super::dispatch::sparsify_search_batch_success_for_model(&[true; 4], &mut result);
         add_actionable_search_continuation(
             &mut result,
             "agent:oe:demo",
             &queries,
             Some("wc_sess_demo"),
-            Some(256 * 1024),
+            Some(budget),
         );
         let suggested = &result.output["suggested_call"];
         assert_eq!(
             suggested["arguments"]["queries"],
-            json!([{
-                "pattern": "needle-0"
-            }])
+            json!([
+                search_query_argument_value(&queries[0]),
+                search_query_argument_value(&queries[2]),
+            ])
         );
+        let crate::tool_runtime::ToolCall::SearchProjectTexts {
+            queries: next_queries,
+            max_result_bytes,
+            session_id,
+            ..
+        } = crate::tool_runtime::ToolCall::from_tool_name(
+            suggested["tool"].as_str().unwrap(),
+            suggested["arguments"].clone(),
+        )
+        .unwrap()
+        else {
+            panic!("search continuation must parse");
+        };
+        assert_eq!(max_result_bytes, Some(budget));
+        assert_eq!(session_id.as_deref(), Some("wc_sess_demo"));
+        assert!(serialized_json_len(&result).unwrap() <= budget);
+
+        let mut replay = ToolResult::ok(batch_output(
+            "agent:oe:demo",
+            2,
+            vec![
+                default_matches_item(0, 120, 900),
+                default_matches_item(1, 120, 900),
+            ],
+            false,
+            None,
+            None,
+        ));
+        apply_model_facing_output_budget(
+            &mut replay,
+            &[true; 2],
+            max_result_bytes,
+            "agent:oe:demo",
+            &next_queries,
+            session_id.as_deref(),
+        );
+        add_actionable_search_continuation(
+            &mut replay,
+            "agent:oe:demo",
+            &next_queries,
+            session_id.as_deref(),
+            max_result_bytes,
+        );
+        assert!(replay.output["items"].as_array().unwrap().is_empty());
+        assert!(replay.output.get("suggested_call").is_none());
+        assert_eq!(
+            replay.output["remaining_summaries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(serialized_json_len(&replay).unwrap() <= budget);
     }
 
     #[test]
@@ -1176,7 +1751,7 @@ mod tests {
     }
 
     #[test]
-    fn actionable_search_continuation_is_parser_ready_and_hard_cap_fails_closed() {
+    fn zero_progress_search_continuation_never_grows_budget_or_replays() {
         let query = SearchProjectTextsQuery {
             pattern: "needle".to_string(),
             pattern_mode: None,
@@ -1205,23 +1780,7 @@ mod tests {
             None,
         );
         assert!(soft.output.get("next_index").is_none());
-        let suggested = &soft.output["suggested_call"];
-        assert_eq!(suggested["tool"], "search_project_texts");
-        assert_eq!(suggested["arguments"]["project"], "agent:resolved:demo");
-        assert_eq!(suggested["arguments"]["session_id"], "wc_sess_demo");
-        assert_eq!(
-            suggested["arguments"]["max_result_bytes"],
-            MAX_SERIALIZED_OUTPUT_BYTES
-        );
-        assert_eq!(suggested["arguments"]["queries"][0]["pattern"], "needle");
-        assert!(suggested["arguments"]["queries"][0]
-            .get("pattern_mode")
-            .is_none());
-        crate::tool_runtime::ToolCall::from_tool_name(
-            suggested["tool"].as_str().unwrap(),
-            suggested["arguments"].clone(),
-        )
-        .expect("whole-query search follow-up must be parser-ready");
+        assert!(soft.output.get("suggested_call").is_none());
 
         let mut hard = ToolResult::ok(apply_output_budget(
             "agent:resolved:demo",
@@ -1286,8 +1845,8 @@ mod tests {
             None,
             None,
         ));
-        result.output["session_recovery"] = json!({
-            "model_facing_events": ["o".repeat(220 * 1024)]
+        result.output["context_projection"] = json!({
+            "materials": ["o".repeat(220 * 1024)]
         });
         assert!(
             final_model_result_len(
@@ -1315,8 +1874,14 @@ mod tests {
         let next_index = result.output["next_index"].as_u64().unwrap();
         assert!(returned_count < 3);
         assert_eq!(next_index, returned_count);
+        let summaries = result.output["remaining_summaries"].as_array().unwrap();
+        assert!(!summaries.is_empty());
+        assert_eq!(summaries[0]["index"].as_u64().unwrap(), next_index);
+        assert!(summaries
+            .iter()
+            .all(|summary| summary["index"].as_u64().unwrap() >= next_index));
         assert_eq!(
-            result.output["session_recovery"]["model_facing_events"][0]
+            result.output["context_projection"]["materials"][0]
                 .as_str()
                 .unwrap()
                 .len(),

@@ -41,6 +41,20 @@ pub(super) fn tool_supports_agent_continuation_app(tool_name: &str) -> bool {
     )
 }
 
+/// Dedicated Job terminal continuation App. Only explicit presentation creates
+/// the card; wait_for_job_terminal remains Host-neutral terminal attention.
+pub(super) fn tool_supports_job_terminal_continuation_app(tool_name: &str) -> bool {
+    tool_name == "present_job_terminal_continuation"
+}
+
+/// Explicit presentation entries rely on their own MCP tool descriptor carrying
+/// Host App resource metadata. Routing one through the generic Adaptive Runtime
+/// gateway preserves ToolRuntime semantics, but the Host sees only the gateway
+/// descriptor and therefore cannot create the requested App card.
+pub(super) fn tool_requires_direct_app_presentation(tool_name: &str) -> bool {
+    crate::model_surface::tool_requires_direct_app_presentation(tool_name)
+}
+
 /// Bounded presentation projections retained for current milestone cards and for
 /// already-cached older tool descriptors. Projection support does not itself bind
 /// a new App card in tools/list.

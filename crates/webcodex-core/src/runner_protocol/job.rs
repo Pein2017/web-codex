@@ -15,6 +15,10 @@ pub const RUST_TEST_FILTER_MAX_BYTES: usize = 200;
 /// `-p`). Matches the `is_canonical` per-argument bound.
 pub const CARGO_VALUE_MAX_BYTES: usize = 500;
 
+/// Maximum number of workspace packages accepted by one structured Cargo
+/// validation request.
+pub const CARGO_PACKAGE_MAX_ITEMS: usize = 32;
+
 /// Largest caller-declared Cargo test-count minimum.
 pub const CARGO_TEST_MIN_TESTS_MAX: u64 = 1_000_000;
 
@@ -44,9 +48,9 @@ pub const JOB_INVENTORY_MAX_JOBS: usize =
 /// ceiling as well as the shared 8 MiB WebSocket/QUIC frame ceiling for
 /// registration, project, policy, and envelope metadata.
 pub const JOB_INVENTORY_MAX_SERIALIZED_BYTES: usize = 1024 * 1024;
-/// Same-process terminal results remain available long enough for ordinary
-/// reconnect backoff without becoming an unbounded process-lifetime ledger.
-pub const JOB_TERMINAL_RETENTION_SECS: i64 = 15 * 60;
+/// Same-process terminal results remain available for long-running Job recovery
+/// while count and payload bounds prevent an unbounded process-lifetime ledger.
+pub const JOB_TERMINAL_RETENTION_SECS: i64 = 24 * 60 * 60;
 
 fn default_shell_job_kind() -> String {
     "shell".to_string()
@@ -107,10 +111,6 @@ pub struct RunnerJobUpdateRequest {
     pub stdout_chunk: Option<String>,
     #[serde(default)]
     pub stderr_chunk: Option<String>,
-    #[serde(default)]
-    pub stdout_tail: Option<String>,
-    #[serde(default)]
-    pub stderr_tail: Option<String>,
     /// Full authoritative tails with absolute line metadata. Reconciliation-
     /// capable runners use this for sequenced updates and post-register replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,6 +177,8 @@ pub struct ShellJobOpRequest {
     pub cwd: Option<String>,
     #[serde(default)]
     pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub login: bool,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
     #[serde(default)]
@@ -260,13 +262,20 @@ impl ShellJobValidationStep {
         let args = self.args.iter().map(String::as_str).collect::<Vec<_>>();
         is_canonical_go_test_json_args(&args)
     }
+
+    pub fn is_multi_package_cargo_check(&self) -> bool {
+        self.name == "check"
+            && self.program == "cargo"
+            && self.is_canonical()
+            && self.args.iter().filter(|arg| arg.as_str() == "-p").count() > 1
+    }
 }
 
 /// Canonical `cargo check` argv: `check` followed by zero or more distinct
 /// read-only flags (`--all-targets`, `--all-features`,
 /// `--no-default-features`) and `--features <value>` / `-p <value>` pairs.
 fn is_canonical_cargo_check_args(args: &[&str]) -> bool {
-    args.first() == Some(&"check") && is_canonical_cargo_flags(&args[1..], false)
+    args.first() == Some(&"check") && is_canonical_cargo_flags(&args[1..], false, true)
 }
 
 /// Canonical `cargo test` argv: the `test` subcommand, an optional libtest
@@ -287,7 +296,7 @@ fn is_canonical_cargo_test_args(args: &[&str]) -> bool {
         Some(filter) if valid_rust_test_filter(filter) => 2,
         _ => 1,
     };
-    is_canonical_cargo_flags(&args[flags_start..], true)
+    is_canonical_cargo_flags(&args[flags_start..], true, false)
 }
 
 /// Normalize and validate one value-taking Cargo argument (`--features`,
@@ -320,6 +329,40 @@ pub fn normalize_cargo_value(raw: &str) -> Result<Option<String>, &'static str> 
         return Err("exceeds 500 bytes");
     }
     Ok(Some(trimmed.to_string()))
+}
+
+/// Canonicalize the legacy single-package selector and the multi-package
+/// selector into one sorted, duplicate-free representation.
+pub fn normalize_cargo_packages(
+    package: Option<&str>,
+    packages: Option<&[String]>,
+) -> Result<Option<Vec<String>>, &'static str> {
+    if package.is_some() && packages.is_some() {
+        return Err("package and packages are mutually exclusive");
+    }
+    let mut normalized = match (package, packages) {
+        (Some(package), None) => match normalize_cargo_value(package)? {
+            Some(package) => vec![package],
+            None => return Ok(None),
+        },
+        (None, Some(packages)) => {
+            if packages.is_empty() || packages.len() > CARGO_PACKAGE_MAX_ITEMS {
+                return Err("packages must contain between 1 and 32 items");
+            }
+            packages
+                .iter()
+                .map(|package| {
+                    normalize_cargo_value(package)?
+                        .ok_or("packages cannot contain an empty package name")
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        (None, None) => return Ok(None),
+        (Some(_), Some(_)) => unreachable!("selector conflict handled above"),
+    };
+    normalized.sort_unstable();
+    normalized.dedup();
+    Ok(Some(normalized))
 }
 
 /// Normalize the optional package scope of the first-class `go_test` tool.
@@ -410,20 +453,26 @@ fn is_canonical_go_test_json_args(args: &[&str]) -> bool {
 }
 
 /// Validate the read-only Cargo flag tail shared by `cargo check` and
-/// `cargo test` validation steps. Each single flag and each value-taking flag
-/// appears at most once. A value-taking flag's value must already satisfy the
-/// shared [`normalize_cargo_value`] contract: non-empty after trimming, not a
-/// `-`-prefixed option, NUL/control-free, bounded to `CARGO_VALUE_MAX_BYTES`,
+/// `cargo test` validation steps. Each single flag and `--features` appears at
+/// most once. Cargo check may repeat `-p` for distinct packages; Cargo test
+/// retains its legacy single-package shape. Every value must already satisfy
+/// the shared [`normalize_cargo_value`] contract: non-empty after trimming, not
+/// a `-`-prefixed option, NUL/control-free, bounded to `CARGO_VALUE_MAX_BYTES`,
 /// and already normalized (no leading/trailing whitespace). `--lib` and
 /// `--no-run` are accepted only for `cargo test`.
-fn is_canonical_cargo_flags(args: &[&str], cargo_test: bool) -> bool {
+fn is_canonical_cargo_flags(
+    args: &[&str],
+    cargo_test: bool,
+    allow_multiple_packages: bool,
+) -> bool {
     let mut seen = HashSet::new();
+    let mut seen_packages = HashSet::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let key = match *arg {
             "--all-targets" | "--all-features" | "--no-default-features" => *arg,
             "--lib" | "--no-run" if cargo_test => *arg,
-            "--features" | "-p" => {
+            "--features" => {
                 if !seen.insert(*arg) {
                     return false;
                 }
@@ -435,6 +484,22 @@ fn is_canonical_cargo_flags(args: &[&str], cargo_test: bool) -> bool {
                 // over-long value is not a canonical cargo value.
                 match normalize_cargo_value(value) {
                     Ok(Some(normalized)) if normalized == *value => continue,
+                    _ => return false,
+                }
+            }
+            "-p" => {
+                if !allow_multiple_packages && !seen.insert(*arg) {
+                    return false;
+                }
+                let Some(value) = iter.next() else {
+                    return false;
+                };
+                match normalize_cargo_value(value) {
+                    Ok(Some(normalized))
+                        if normalized == *value && seen_packages.insert(*value) =>
+                    {
+                        continue
+                    }
                     _ => return false,
                 }
             }
@@ -611,6 +676,9 @@ pub struct ShellJobValidationMetadata {
     pub adapter: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub validation_target_id: Option<String>,
+    /// Launch observation in the existing Control Project epoch. Not a source snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_fence: Option<crate::validation_source::ValidationSourceFence>,
     /// Effective caller-requested minimum Cargo test count. This is an
     /// observation postcondition, not part of the executable argv.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -641,6 +709,10 @@ impl ShellJobValidationMetadata {
                 };
                 suffix.len() != 24 || !suffix.as_bytes().iter().all(u8::is_ascii_hexdigit)
             })
+            || self
+                .source_fence
+                .as_ref()
+                .is_some_and(|fence| !fence.is_valid())
             || self
                 .minimum_tests
                 .is_some_and(|minimum| !(1..=CARGO_TEST_MIN_TESTS_MAX).contains(&minimum))
@@ -683,6 +755,9 @@ pub const VALIDATION_ASSERTION_NAME_MAX_CHARS: usize = 120;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellJobStructuredExecutionMetadata {
     pub execution_source: String,
+    /// Admission proved pytest from native Process argv; previews never set this.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub pytest: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<ShellScriptLanguage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -741,6 +816,7 @@ impl ShellJobStructuredExecutionMetadata {
                 && matches!(self.execution_source.as_str(), "run_process" | "run_script")
         });
         if !identity_valid
+            || (self.pytest && self.execution_source != "run_process")
             || !assertion_identity_source_valid
             || !validation_tool_valid
             || !assertion_name_valid

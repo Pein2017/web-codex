@@ -63,20 +63,6 @@ fn skill(index: usize, description: &str) -> StartupSkillEntry {
         }
         .to_string(),
         name_conflict: index % 3 == 0,
-        suggested_call: json!({
-            "tool": "skill_read_file",
-            "arguments": {
-                "project": "agent:test:demo",
-                "skill_id": format!(
-                    "wc_skill_{}",
-                    webcodex_core::compact::encode(&(index as u128).to_be_bytes()[0..])
-                ),
-                "path": "SKILL.md",
-                "start_line": 1,
-                "limit": 200,
-                "expected_definition_revision": format!("{index:064x}"),
-            },
-        }),
     }
 }
 
@@ -88,15 +74,6 @@ fn plugin(index: usize, description: &str) -> StartupPluginEntry {
         title: (index % 2 == 0).then(|| format!("Tool {index}")),
         description: (index % 3 != 0).then(|| description.to_string()),
         annotations: Default::default(),
-        suggested_call: json!({
-            "tool": "plugin_tool",
-            "arguments": {
-                "action": "describe",
-                "runner": "test-runner",
-                "plugin": format!("provider-{index}"),
-                "tool": format!("tool-{index}"),
-            },
-        }),
     }
 }
 

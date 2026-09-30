@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real full-operator Server + Runner smoke for the current Web workflow."""
+"""Disposable native MCP Server + Runner smoke for the current Web workflow."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shutil
 import signal
 import socket
 import subprocess
@@ -21,7 +22,7 @@ from urllib.request import Request, urlopen
 
 
 MAX_TIMEOUT_SECS = 300
-RUNTIME_EXPOSURE = "full_operator_runtime"
+SERVER_VERSION = "0.4.3"
 RUNTIME_PROJECT = "agent:web-workflow-e2e:isolated"
 STATELESS_MCP_VERSION = "2026-07-28"
 REQUIRED_TOOLS = {
@@ -42,6 +43,8 @@ REQUIRED_TOOLS = {
     "skill_read_file",
     "session_handoff_summary",
     "workspace_hygiene_check",
+    "git_diff_hunks",
+    "plugin_tool",
 }
 
 
@@ -79,6 +82,20 @@ def bounded(value: Any, limit: int = 1600) -> str:
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise Failure(message)
+
+
+def require_native_context(value: Any) -> None:
+    retired = {
+        "context_revision", "session_context_revision", "ack_session_context_revision",
+        "session_continuity", "session_recovery",
+    }
+    if isinstance(value, dict):
+        require(not retired.intersection(value), "retired Session context fields were emitted")
+        for nested in value.values():
+            require_native_context(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            require_native_context(nested)
 
 
 def sha256_file(path: Path) -> str:
@@ -190,13 +207,19 @@ def main() -> int:
         try:
             server_bin = binary_identity("server", args.server_bin)
             runner_bin = binary_identity("runner", args.runner_bin)
+            node = shutil.which("node")
+            plugin_entry = Path(__file__).resolve().parent.parent / "plugins/web-workflow/plugin.mjs"
+            require(node is not None and plugin_entry.is_file(), "Node/plugin fixture unavailable")
             temp = tempfile.TemporaryDirectory(prefix="webcodex-e2e-web-workflow-")
             root = Path(temp.name)
             data = root / "data"
             registry = root / "project-registry"
             project = root / "project"
-            for directory in (data, registry, project):
+            memory = root / "memory"
+            for directory in (data, registry, project, memory):
                 directory.mkdir()
+            memory_body = "DISPOSABLE_MEMORY_SENTINEL: isolated provider content only.\n"
+            (memory / "MEMORY.md").write_text(memory_body, encoding="utf-8")
 
             original = "# Isolated Web Workflow\n\nstate: original"
             edited = "# Isolated Web Workflow\n\nstate: edited-and-validated"
@@ -283,7 +306,19 @@ def main() -> int:
                 "allow_cwd_anywhere = false\n"
                 f"allowed_roots = [{json.dumps(str(project))}]\n"
                 "max_timeout_secs = 60\n"
-                "max_output_bytes = 262144\n",
+                "max_output_bytes = 262144\n\n"
+                "[shell.profiles.web-workflow]\n"
+                'program = "sh"\nargs = ["-c"]\n\n'
+                "[shell.profiles.web-workflow.env]\n"
+                f"WEBCODEX_WEB_WORKFLOW_PROJECTS_JSON = {json.dumps(json.dumps({'isolated': str(project)}))}\n"
+                f"WEBCODEX_WEB_WORKFLOW_MEMORY_ROOT = {json.dumps(str(memory))}\n\n"
+                "[plugins]\nrequest_timeout_secs = 20\n\n"
+                "[[plugins.providers]]\n"
+                'id = "web-workflow"\nname = "Disposable Web Workflow"\n'
+                f"command = {json.dumps(node)}\n"
+                f"args = [{json.dumps(str(plugin_entry))}]\n"
+                f"cwd = {json.dumps(str(project))}\n"
+                'profile = "web-workflow"\ntimeout_secs = 20\n',
                 encoding="utf-8",
             )
 
@@ -293,8 +328,6 @@ def main() -> int:
                     "WEBCODEX_ADDR": f"127.0.0.1:{port}",
                     "WEBCODEX_DATA": str(data),
                     "WEBCODEX_TOKEN": token,
-                    "WEBCODEX_MCP_MODEL_SURFACE": "full-operator-v1",
-                    "WEBCODEX_MCP_COMPACT_SCHEMAS": "false",
                     "WEBCODEX_MCP_INSTRUCTIONS_FILE": str(guidance_path),
                 }
             )
@@ -391,6 +424,8 @@ def main() -> int:
                 return body["result"]
 
             recording_session_id: str | None = None
+            by_name: dict[str, dict[str, Any]] = {}
+            contracts: dict[str, dict[str, Any]] = {}
 
             def recorded_arguments(arguments: Any) -> Any:
                 if recording_session_id is None:
@@ -398,11 +433,37 @@ def main() -> int:
                 require(isinstance(arguments, dict), "recorded call needs object arguments")
                 return {**arguments, "recording_session_id": recording_session_id}
 
+            def tool_request(name: str, arguments: Any) -> dict[str, Any]:
+                arguments = recorded_arguments(arguments)
+                if name in by_name:
+                    request = {"name": name, "arguments": arguments}
+                else:
+                    require(name in contracts, f"undiscovered tool: {name}")
+                    route = contracts[name].get("route", {})
+                    selected = route.get("primary", {})
+                    if selected.get("mode") == "direct":
+                        selected = route.get("fallback") or {}
+                    require(
+                        selected.get("mode") == "gateway"
+                        and selected.get("tool") == "call_runtime_tool"
+                        and selected.get("target") == name
+                        and selected.get("blocked_when_mcp_apps_enabled") is not True
+                        and "call_runtime_tool" in by_name,
+                        f"no admitted callable route for {name}: {bounded(route)}",
+                    )
+                    request = {
+                        "name": "call_runtime_tool",
+                        "arguments": {"tool": name, "arguments": arguments},
+                    }
+                return request
+
+            def tool_rpc(
+                name: str, arguments: Any, *, expect_error: bool = False,
+            ) -> dict[str, Any]:
+                return rpc("tools/call", tool_request(name, arguments), expect_error=expect_error)
+
             def call(name: str, arguments: Any) -> Any:
-                result = rpc(
-                    "tools/call",
-                    {"name": name, "arguments": recorded_arguments(arguments)},
-                )
+                result = tool_rpc(name, arguments)
                 structured = result.get("structuredContent")
                 require(
                     result.get("isError") is not True
@@ -411,13 +472,11 @@ def main() -> int:
                     and "output" in structured,
                     f"{name} failed: {bounded(result)}",
                 )
+                require_native_context(structured["output"])
                 return structured["output"]
 
             def call_failure(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-                result = rpc(
-                    "tools/call",
-                    {"name": name, "arguments": recorded_arguments(arguments)},
-                )
+                result = tool_rpc(name, arguments)
                 structured = result.get("structuredContent")
                 require(
                     result.get("isError") is True
@@ -426,7 +485,19 @@ def main() -> int:
                     and isinstance(structured.get("output"), dict),
                     f"{name} did not return a structured tool failure: {bounded(result)}",
                 )
+                require_native_context(structured["output"])
                 return structured["output"]
+
+            def plugin(arguments: dict[str, Any]) -> dict[str, Any]:
+                result = tool_rpc("plugin_tool", arguments)
+                require(
+                    result.get("isError") is not True
+                    and isinstance(result.get("structuredContent"), dict)
+                    and isinstance(result.get("content"), list),
+                    f"Plugin gateway failed: {bounded(result)}",
+                )
+                require_native_context(result)
+                return result
 
             initialized = rpc(
                 "initialize",
@@ -434,37 +505,52 @@ def main() -> int:
                 legacy_initialize=True,
             )
             require(
-                initialized.get("serverInfo", {}).get("runtimeExposure")
-                == RUNTIME_EXPOSURE
+                initialized.get("serverInfo", {}).get("name") == "webcodex"
+                and initialized.get("serverInfo", {}).get("version") == SERVER_VERSION
+                and "runtimeExposure" not in initialized.get("serverInfo", {})
                 and initialized.get("instructions") == guidance,
                 f"initialize contract mismatch: {bounded(initialized)}",
             )
-            ok("initialize returns configured guidance and full_operator_runtime identity")
+            ok(f"initialize returns configured guidance and exact native Server {SERVER_VERSION}")
 
-            tools = rpc("tools/list", {}).get("tools")
-            require(isinstance(tools, list), "tools/list omitted tools")
-            by_name = {tool.get("name"): tool for tool in tools if isinstance(tool, dict)}
-            require(not (REQUIRED_TOOLS - by_name.keys()), "required tools missing")
+            page = rpc("tools/list", {})
+            seen_cursors: set[str] = set()
+            while True:
+                tools = page.get("tools")
+                require(isinstance(tools, list), "tools/list omitted tools")
+                by_name.update({tool["name"]: tool for tool in tools if isinstance(tool, dict)})
+                cursor = page.get("nextCursor")
+                if cursor is None:
+                    break
+                require(isinstance(cursor, str) and cursor not in seen_cursors,
+                        "tools/list returned an invalid/non-progressing cursor")
+                seen_cursors.add(cursor)
+                page = rpc("tools/list", {"cursor": cursor})
+            require("tool_manifest" in by_name, "native tool_manifest unavailable")
             require("job_tail" not in by_name, "ModelHidden job_tail was exposed")
-            work = by_name["work_on_project"]
-            work_props = work.get("inputSchema", {}).get("properties", {})
+            for name in sorted(REQUIRED_TOOLS):
+                contract = call("tool_manifest", {"tool_name": name})
+                require(contract.get("name") == name
+                        and isinstance(contract.get("input_schema"), dict),
+                        f"exact manifest omitted {name}: {bounded(contract)}")
+                contracts[name] = contract
+                tool_request(name, {})  # Check admission without dispatching an operation.
+            work_props = contracts["work_on_project"]["input_schema"].get("properties", {})
             require(
-                work_props.get("include_project_instructions", {}).get("default") is False
-                and work_props.get("include_workflow_guidance", {}).get("default") is False
+                work_props.get("guidance_profile", {}).get("default") == "direct"
                 and work_props.get("include_extension_catalog", {}).get("default") is True
-                and isinstance(work.get("outputSchema"), dict),
+                and "include_project_instructions" not in work_props
+                and "include_workflow_guidance" not in work_props,
                 "work_on_project schema defaults drifted",
             )
-            observe = by_name["observe_jobs"]
-            observe_input = observe.get("inputSchema", {})
+            observe_input = contracts["observe_jobs"]["input_schema"]
             require(
                 "items" in observe_input.get("required", [])
                 and observe_input.get("properties", {}).get("wake_on", {}).get("enum")
-                == ["change", "terminal"]
-                and isinstance(observe.get("outputSchema"), dict),
+                == ["change", "terminal", "all_terminal"],
                 "observe_jobs schema drifted",
             )
-            languages = by_name["run_script"].get("inputSchema", {}).get(
+            languages = contracts["run_script"]["input_schema"].get(
                 "properties", {}
             ).get("language", {}).get("enum")
             require(
@@ -472,19 +558,14 @@ def main() -> int:
                 "run_script did not advertise JavaScript",
             )
             ok(
-                f"stateless MCP tools/list exposes the full-operator contract "
-                f"({len(by_name)} tools)"
+                f"native tools/list plus exact manifests admit every smoke tool "
+                f"({len(by_name)} direct tools)"
             )
 
-            compact_error = rpc(
-                "tools/call",
-                {
-                    "name": "git_diff_hunks",
-                    "arguments": {
-                        "project": RUNTIME_PROJECT,
-                        "mode": "worktree",
-                        "max_lines_per_hunk": 80,
-                    },
+            compact_error = tool_rpc(
+                "git_diff_hunks", {
+                    "project": RUNTIME_PROJECT,
+                    "max_lines_per_hunk": 80,
                 },
                 expect_error=True,
             )
@@ -492,18 +573,15 @@ def main() -> int:
             require(
                 compact_error.get("code") == -32602
                 and isinstance(error_message, str)
-                and "unknown field(s)" in error_message
+                and "unknown field" in error_message
                 and "properties" not in error_message
                 and "additionalProperties" not in error_message
                 and len(error_message) < 800,
                 f"invalid arguments leaked a schema: {bounded(compact_error)}",
             )
             ok("a server-side invalid argument returns a compact MCP error")
-            skill_error = rpc("tools/call", {
-                "name": "skill_read_file",
-                "arguments": {
-                    "project": RUNTIME_PROJECT,
-                },
+            skill_error = tool_rpc("skill_read_file", {
+                "project": RUNTIME_PROJECT,
             }, expect_error=True)
             require(
                 skill_error.get("code") == -32602
@@ -602,22 +680,20 @@ def main() -> int:
             startup_skills = bootstrap.get("extensions", {}).get("skills", {}).get("entries", [])
             startup_skill = next((s for s in startup_skills if s.get("name") == "workflow-smoke"), None)
             require(startup_skill is not None, "startup omitted fixture Skill")
-            skill_suggestion = startup_skill.get("suggested_call", {})
             require(
-                skill_suggestion.get("tool") == "skill_read_file"
-                and skill_suggestion.get("arguments", {}).get("project") == RUNTIME_PROJECT
-                and bool(skill_suggestion.get("arguments", {}).get("expected_definition_revision")),
-                "startup Skill follow-up omitted exact project/revision",
+                isinstance(startup_skill.get("skill_id"), str)
+                and "suggested_call" not in startup_skill
+                and "definition_revision" not in startup_skill,
+                "startup Skill catalog must remain selection-only",
             )
-            startup_skill_text = call(skill_suggestion["tool"], skill_suggestion["arguments"])
-            require("SKILL_READ_SENTINEL" in startup_skill_text.get("text", ""),
-                    "startup Skill follow-up could not read the selected definition")
-            ok("startup Skill suggested_call executes with its exact definition revision")
 
             catalog = call("skill_list", {"project": RUNTIME_PROJECT, "query": "workflow-smoke"})
             skills = catalog.get("skills", [])
             require(len(skills) == 1, f"Skill fixture was not discovered: {bounded(catalog)}")
             skill = skills[0]
+            require(skill.get("skill_id") == startup_skill["skill_id"]
+                    and isinstance(skill.get("definition_revision"), str),
+                    "skill_list did not resolve the selected Skill definition revision")
             skill_text = call("skill_read_file", {
                 "project": RUNTIME_PROJECT,
                 "skill_id": skill["skill_id"],
@@ -627,59 +703,86 @@ def main() -> int:
                 "SKILL_READ_SENTINEL" in skill_text.get("text", ""),
                 f"discovered opaque Skill ID cannot be read: {bounded(skill_text)}",
             )
-            ok("actual Skill discovery returns an opaque ID usable by direct skill_read_file")
+            ok("selection-only startup Skill resolves through skill_list to guarded skill_read_file")
 
-            unacknowledged = call("run_process", {
-                "project": RUNTIME_PROJECT,
-                "session_id": recording_session_id,
-                "executable": "python3",
-                "args": ["-c", "print('recovery-hint-source')"],
-                "purpose": "diagnostic", "sync_wait_secs": 20, "timeout_secs": 20,
+            startup_plugins = bootstrap.get("extensions", {}).get("plugins", {}).get("entries", [])
+            require(any(entry.get("plugin") == "web-workflow"
+                        and entry.get("tool") == "memory_read" for entry in startup_plugins),
+                    "startup omitted the disposable project-scoped Plugin")
+            providers = plugin({"action": "list", "runner": "web-workflow-e2e"})
+            require(any(entry.get("plugin") == "web-workflow"
+                        for entry in providers["structuredContent"].get("plugins", [])),
+                    "Runner did not list the configured disposable Plugin")
+            plugin_catalog = plugin({
+                "action": "list", "runner": "web-workflow-e2e", "plugin": "web-workflow",
+            })["structuredContent"]
+            plugin_names = {entry.get("name") for entry in plugin_catalog.get("tools", [])}
+            require({"memory_read", "memory_search", "pytest_report_summary"}.issubset(plugin_names)
+                    and "public_history_read" not in plugin_names
+                    and "codegraph_scoped_query" not in plugin_names,
+                    "disposable Plugin advertised an unconfigured capability")
+            described = plugin({
+                "action": "describe", "runner": "web-workflow-e2e",
+                "plugin": "web-workflow", "tool": "memory_read",
+            })["structuredContent"]
+            provider_schema = described.get("tool", {}).get("inputSchema", {})
+            require(isinstance(described.get("binding"), str)
+                    and described.get("tool", {}).get("name") == "memory_read"
+                    and provider_schema.get("required") == ["path"]
+                    and provider_schema.get("additionalProperties") is False,
+                    f"Plugin describe omitted its exact schema/binding: {bounded(described)}")
+            memory_result = plugin({
+                "action": "call", "binding": described["binding"],
+                "arguments": {"path": "MEMORY.md", "offset": 0, "maxBytes": 64},
             })
-            recovery = unacknowledged.get("session_continuity", {}).get("suggested_call", {})
-            recovery_args = recovery.get("arguments", {})
-            require(
-                recovery.get("tool") == "session_handoff_summary"
-                and recovery_args.get("session_id") == recording_session_id
-                and all(recovery_args.get(k) is True for k in
-                        ("include_workspace", "include_checkpoints", "include_validation"))
-                and recovery_args.get("summary_only") is False
-                and recovery_args.get("limit", 0) >= 20
-                and "ack_session_context_revision" not in recovery_args
-                and "recording_session_id" not in recovery_args,
-                "context recovery hint must explicitly request the complete view without inferred ACK/recorder",
+            memory_output = memory_result["structuredContent"]
+            expected_provider_text = (
+                f"Read {len(memory_body.encode())} UTF-8 source bytes from MEMORY.md at byte 0. End of file."
             )
-            partial = call(recovery["tool"], {**recovery_args, "include_validation": False})
-            require("session_context_revision" not in partial,
-                    "partial handoff falsely certified a recovered baseline")
-            handoff = call(recovery["tool"], recovery_args)
-            retained_revision = handoff.get("session_context_revision")
             require(
-                retained_revision is not None
-                and handoff.get("session_continuity", {}).get("status") == "recovered",
-                f"complete explicit handoff did not recover context: {bounded(handoff)}",
+                memory_output.get("text") == memory_body
+                and memory_output.get("source") == {"root": str(memory.resolve()), "path": "MEMORY.md"}
+                and memory_output.get("eof") is True
+                and memory_output.get("nextOffset") == len(memory_body.encode())
+                and "success" not in memory_output
+                and memory_result["content"] == [{"type": "text", "text": expected_provider_text}]
+                and (memory / "MEMORY.md").read_text(encoding="utf-8") == memory_body,
+                f"native Plugin call changed provider content/provenance: {bounded(memory_result)}",
             )
-            ok("emitted recovery call establishes a baseline while partial handoff cannot")
+            ok("real Plugin list/describe/bound memory read preserves provider content and fixture provenance")
+
+            handoff = call("session_handoff_summary", {
+                "session_id": recording_session_id,
+                "project": RUNTIME_PROJECT,
+                "include_workspace": True,
+                "include_checkpoints": True,
+                "include_validation": True,
+                "diagnostic": True,
+                "limit": 20,
+            })
+            require(
+                handoff.get("session_id") == recording_session_id
+                and isinstance(handoff.get("handoff_brief"), dict)
+                and handoff.get("diagnostic") is True,
+                f"explicit native handoff omitted the exact Session/evidence: {bounded(handoff)}",
+            )
+            ok("explicit Session handoff follows native recovery without retired context metadata")
             for _ in range(2):
                 checkpoint = call("run_process", {
                     "project": RUNTIME_PROJECT,
                     "session_id": recording_session_id,
-                    "ack_session_context_revision": retained_revision,
                     "executable": "python3",
-                    "args": ["-c", "print('explicit-recorder-ack-ok')"],
+                    "args": ["-c", "print('explicit-recorder-ok')"],
                     "purpose": "diagnostic",
                     "sync_wait_secs": 20,
                     "timeout_secs": 20,
                 })
                 require(
-                    "explicit-recorder-ack-ok" in checkpoint.get("stdout_tail", "")
-                    and checkpoint.get("session_context_revision") is not None
-                    and "session_continuity" not in checkpoint
+                    "explicit-recorder-ok" in checkpoint.get("stdout_tail", "")
                     and "workflow_recording_attention" not in checkpoint,
-                    f"explicit recorder/retained ACK was lost: {bounded(checkpoint)}",
+                    f"explicit recorder was lost: {bounded(checkpoint)}",
                 )
-                retained_revision = checkpoint["session_context_revision"]
-            ok("explicit recorder plus recovered retained ACK stays continuous across two effects")
+            ok("explicit recorder stays bound across two effects without a context ACK handshake")
 
             js = call(
                 "run_script",
@@ -1078,16 +1181,26 @@ def main() -> int:
             )
             ok("explicit Session finish persists the async typed pytest counts")
             require(
-                validation_result.get("current_evidence", {}).get("status") == "passed"
+                validation_result.get("latest_status") == "passed"
                 and validation_result.get("resolved_failures", {}).get("count") == 1
                 and validation_result.get("unresolved_failures", {}).get("count") == 0
+                and validation_result.get("evidence_gaps", {}).get("count") == 0
+                and validation_result.get("current_evidence", {}).get("status") == "unproven"
+                and validation_result.get("current_evidence", {}).get("reason")
+                == "validation_source_unproven"
+                and validation_result.get("current_evidence", {}).get("successes") == 0
+                and validation_result.get("current_evidence", {}).get("latest_status")
+                == "inconclusive"
+                and all(event.get("source_state", {}).get("freshness") == "unproven"
+                        for event in pytest_events + async_events)
                 and finish.get("task_outcome", {}).get("blocking") is False
+                and "validation_inconclusive" in finish.get("advisories", [])
                 and finish.get("tool_failures", {}).get(
                     "actionable_unexpected_count"
                 ) == 0,
-                f"finish lost recorded validation recovery: {bounded(finish)}",
+                f"finish lost pytest history or changed the current-source boundary: {bounded(finish)}",
             )
-            ok("explicit Session finish keeps the historical failure non-actionable")
+            ok("finish preserves pytest fail/pass history without claiming current source proof")
             outcome = "passed"
             log(f"PASS: {len(checks)} checks in {time.monotonic() - started:.2f}s")
         except (Failure, OSError, subprocess.SubprocessError) as exc:
@@ -1102,7 +1215,7 @@ def main() -> int:
     receipt: dict[str, Any] = {
         "schema_version": 1,
         "result": outcome,
-        "runtime_exposure": RUNTIME_EXPOSURE,
+        "server_version": SERVER_VERSION,
         "runtime_project_id": RUNTIME_PROJECT,
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "timeout_seconds": args.timeout_secs,

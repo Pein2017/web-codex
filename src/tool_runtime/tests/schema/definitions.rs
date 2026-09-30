@@ -28,9 +28,12 @@ fn git_diff_hunks_rejects_unknown_legacy_fields_compactly() {
         }),
     )
     .unwrap_err();
-    assert!(error.contains("unknown field(s)"), "{error}");
-    assert!(error.contains("mode"), "{error}");
-    assert!(error.contains("max_lines_per_hunk"), "{error}");
+    assert!(error.contains("unknown field"), "{error}");
+    assert!(
+        error.contains("mode") || error.contains("max_lines_per_hunk"),
+        "{error}"
+    );
+    assert!(error.contains("max_hunk_lines"), "{error}");
     assert!(
         !error.contains("properties"),
         "must not dump JSON Schema: {error}"
@@ -86,8 +89,12 @@ fn tool_call_parser_name_gate_matches_tool_definitions() {
     let expected_hidden: BTreeSet<&str> = [
         "start_session",
         "job_tail",
-        "goal_plan_state",
+        "goal_plan_sync",
         "work_result_state",
+        "work_result_send_message",
+        "changes_file_diff",
+        "record_external_observation",
+        "session_handoff_state",
         "agent_continuation_bind",
         "agent_continuation_recover_endpoint",
         "agent_continuation_state",
@@ -96,6 +103,11 @@ fn tool_call_parser_name_gate_matches_tool_definitions() {
         "agent_continuation_wake_finish",
         "agent_continuation_unbind",
         "agent_wait_state",
+        "job_terminal_continuation_bind",
+        "job_terminal_continuation_state",
+        "job_terminal_continuation_prepare",
+        "job_terminal_continuation_finish",
+        "job_terminal_continuation_unbind",
         "read_tool_trace",
         "skill_list",
         "skill_read_file",
@@ -115,7 +127,7 @@ fn tool_call_parser_name_gate_matches_tool_definitions() {
     assert_eq!(
         model_hidden_tool_names().collect::<BTreeSet<_>>(),
         expected_hidden,
-        "hidden ToolDefinitions must match the documented compatibility batch"
+        "hidden ToolDefinitions must match the documented App-only and compatibility inventory"
     );
 }
 

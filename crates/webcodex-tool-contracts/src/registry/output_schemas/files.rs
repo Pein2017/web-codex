@@ -155,6 +155,11 @@ fn search_project_texts_output_schema() -> Value {
         "count_complete": {"type": "boolean"},
         "total_matches": nullable_schema("integer", "Complete total in count mode; null when incomplete."),
         "truncated": {"type": "boolean"},
+        "zero_match_hint": {
+            "type": "string",
+            "const": "include_globs_excluded_matches",
+            "description": "Present only after a successful complete zero-result query when a bounded diagnostic proves that removing caller include_globs reveals at least one otherwise eligible match. Diagnostic paths/content are never exposed."
+        },
         "truncation_reason": {
             "anyOf": [
                 {"type": "string", "enum": ["limit", "output_bytes", "timeout", "transport"]},
@@ -180,7 +185,8 @@ fn search_project_texts_output_schema() -> Value {
             "effective_timeout_secs": search_success_properties["effective_timeout_secs"].clone(),
             "context_before": search_success_properties["context_before"].clone(),
             "context_after": search_success_properties["context_after"].clone(),
-            "matches": search_success_properties["matches"].clone()
+            "matches": search_success_properties["matches"].clone(),
+            "zero_match_hint": search_success_properties["zero_match_hint"].clone()
         },
         "required": ["matches"],
         "description": "Sparse model-facing form for complete rg matches-mode success. Literal mode, custom timeout, non-root path, and requested context counts remain explicit; boring defaults are omitted."
@@ -195,7 +201,8 @@ fn search_project_texts_output_schema() -> Value {
             "effective_timeout_secs": search_success_properties["effective_timeout_secs"].clone(),
             "context_before": search_success_properties["context_before"].clone(),
             "context_after": search_success_properties["context_after"].clone(),
-            "files": search_success_properties["files"].clone()
+            "files": search_success_properties["files"].clone(),
+            "zero_match_hint": search_success_properties["zero_match_hint"].clone()
         },
         "required": ["result_mode", "files"],
         "description": "Sparse model-facing form for complete rg files_with_matches success; files are the primary result and redundant returned-file counts are omitted."
@@ -211,7 +218,8 @@ fn search_project_texts_output_schema() -> Value {
             "context_before": search_success_properties["context_before"].clone(),
             "context_after": search_success_properties["context_after"].clone(),
             "files": search_success_properties["files"].clone(),
-            "total_matches": {"type": "integer", "minimum": 0}
+            "total_matches": {"type": "integer", "minimum": 0},
+            "zero_match_hint": search_success_properties["zero_match_hint"].clone()
         },
         "required": ["result_mode", "total_matches"],
         "description": "Sparse model-facing form for complete rg count success. total_matches is authoritative; optional files retain bounded per-path grouping and redundant count bookkeeping is omitted."
@@ -276,6 +284,29 @@ fn search_project_texts_output_schema() -> Value {
             "error_kind", "reason_code", "failure_stage", "detail_code", "state_changed"
         ]
     });
+    let omitted_summary_schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Bounded machine-only facts for an already-completed query omitted from the returned full-item suffix. Informational only: it is not a substitute for the query body and does not consume the query from the parser-ready continuation, which still starts at next_index.",
+        "properties": {
+            "index": {"type": "integer", "minimum": 0, "maximum": 7},
+            "success": {"type": "boolean"},
+            "result_mode": {"type": "string", "enum": ["matches", "files_with_matches", "count"]},
+            "returned_match_count": {"type": "integer", "minimum": 0},
+            "returned_file_count": {"type": "integer", "minimum": 0},
+            "total_matches": {"type": "integer", "minimum": 0},
+            "truncated": {"type": "boolean"},
+            "reason_code": search_failure["properties"]["reason_code"].clone(),
+            "failure_stage": search_failure["properties"]["failure_stage"].clone(),
+            "detail_code": search_failure["properties"]["detail_code"].clone()
+        },
+        "required": ["index", "success"],
+        "allOf": [{
+            "if": {"properties": {"success": {"const": true}}, "required": ["success"]},
+            "then": {"required": ["result_mode", "truncated"]},
+            "else": {"required": ["reason_code", "failure_stage", "detail_code"]}
+        }]
+    });
     let item_schema = json!({
         "type": "object",
         "additionalProperties": false,
@@ -304,9 +335,15 @@ fn search_project_texts_output_schema() -> Value {
             "items": {"type": "array", "maxItems": 8, "items": item_schema.clone()},
             "output_truncated": {"type": "boolean"},
             "truncation_reason": {"type": "string", "enum": ["batch_response_budget", "hard_result_cap"]},
+            "remaining_summaries": {
+                "type": "array",
+                "maxItems": 8,
+                "items": omitted_summary_schema,
+                "description": "Optional bounded summaries for completed queries at or after the omitted suffix boundary. These facts are supplementary UX only; suggested_call remains the canonical whole-query continuation and starts from the same omitted query."
+            },
             "suggested_call": suggested_tool_call_schema(
                 "search_project_texts",
-                crate::registry::input_schemas::search_project_texts_input_schema(),
+                crate::input_schema_for_tool("search_project_texts"),
                 "Parser-ready whole-query suffix rerun when the complete call itself fits the bounded model result. If it cannot fit, Runtime keeps truncation truthful and exposes no raw cursor or oversized fake call. Zero-progress soft-budget results may raise max_result_bytes; hard-cap zero progress exposes no fake next call."
             ),
             "session_hint": session_hint_schema(),

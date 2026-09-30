@@ -13,10 +13,27 @@ export function app(filename, { deliverToolMeta = true, deliverToolStructuredCon
   const timers = new Map();
   const sent = [];
   let nextTimer = 1;
+  let nowMs = 2_000_000_000_000;
+  const HostDate = class extends Date {
+    static now() { return nowMs; }
+  };
   const parent = { postMessage(message) { sent.push(message); } };
+  function element(tagName = "div") {
+    const attributes = new Map();
+    return {
+      tagName: String(tagName).toUpperCase(),
+      textContent: "", hidden: false, children: [], className: "", type: "", onclick: null,
+      append(...children) { this.children.push(...children); },
+      appendChild(child) { this.children.push(child); return child; },
+      replaceChildren(...children) { this.children = [...children]; this.textContent = ""; },
+      setAttribute(name, value) { attributes.set(name, String(value)); },
+      getAttribute(name) { return attributes.get(name); },
+    };
+  }
   const document = {
     hidden: false,
-    getElementById: id => nodes[id] ||= { textContent: "", hidden: false },
+    getElementById: id => nodes[id] ||= element(),
+    createElement: tagName => element(tagName),
   };
   function addEventListener(name, listener) {
     if (!listeners.has(name)) listeners.set(name, []);
@@ -31,7 +48,7 @@ export function app(filename, { deliverToolMeta = true, deliverToolStructuredCon
     return id;
   }
   runInNewContext(script, {
-    document, parent, addEventListener, TextEncoder, crypto, btoa,
+    document, parent, addEventListener, TextEncoder, crypto, btoa, Date: HostDate,
     setTimeout: setTimer,
     clearTimeout: id => timers.delete(id),
     setInterval: (callback, delay) => setTimer(callback, delay, true),
@@ -76,12 +93,16 @@ export function app(filename, { deliverToolMeta = true, deliverToolStructuredCon
       }
     },
     async fireTimers(delay) {
+      nowMs += delay;
       for (const [id, timer] of [...timers]) {
         if (timer.delay !== delay) continue;
         if (!timer.interval) timers.delete(id);
         timer.callback();
       }
       await flush();
+    },
+    advanceTime(ms) {
+      nowMs += ms;
     },
     async visibility(hidden) {
       document.hidden = hidden;

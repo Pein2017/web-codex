@@ -10,27 +10,24 @@ fn tool_specs_describe_default_coding_loop_preferences() {
     for phrase in [
         "canonical bootstrap",
         "ordinary coding/review",
+        "project_ref",
         "omit session_id",
         "fresh workflow session",
         "does not imply a fresh model context",
-        "configured mcp initialization guidance",
-        "dedicated default guidance body",
-        "revision without copying",
-        "defaults suppress",
-        "repository-instruction",
-        "built-in workflow",
-        "include_* flag true",
+        "fresh or uncertain model context",
         "re-observes instruction files",
         "exact resume",
         "active accessible session",
         "never guesses prior session",
-        "skills",
-        "plugin",
-        "selection metadata",
-        "current model context",
-        "does not require git",
-        "skill_read_file",
-        "plugin_tool describe",
+        "context_request",
+        "project.instructions",
+        "webcodex.workflow",
+        "guidance_profile",
+        "no authority",
+        "principal-scoped",
+        "reauthorizes",
+        "include_extension_catalog",
+        "skills/plugins",
         "mode=worktree",
         "exact git base",
         "project authority",
@@ -84,23 +81,18 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "bounded structured results",
         "protected-path policy",
         "isolated failures",
-        "portable runtime search semantics",
         "broad discovery",
         "files_with_matches/count",
-        "small bounded match set with little context",
-        "target read_files/native reads",
+        "matched source will be read immediately",
+        "search_and_read",
         "small known-scope search",
-        "native rg via run_process or a shell command is first-class",
-        "batch only queries already known to be needed",
+        "native rg is first-class",
+        "batch only independent queries",
         "result-dependent follow-ups sequential",
         "pattern_mode=literal",
-        "request context explicitly",
-        "whole-query",
-        "parser-ready suggested_call",
-        "fits the model result budget",
-        "without a raw cursor or fake call",
-        "no safe match cursor",
-        "refined",
+        "returned suggested_call",
+        "whole-query continuation",
+        "truncated individual queries must be narrowed",
     ] {
         assert!(
             batch_search_desc.contains(phrase),
@@ -117,6 +109,26 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         );
     }
 
+    let search_and_read_desc = desc("search_and_read");
+    for phrase in [
+        "one bounded project-text query or 1..8 predetermined independent queries",
+        "query xor queries",
+        "max_reads is one global read budget",
+        "shared fairly across the batch",
+        "preserving per-query batch failures",
+        "batch only independent queries",
+        "result-dependent follow-ups sequential",
+    ] {
+        assert!(
+            search_and_read_desc.contains(phrase),
+            "search_and_read description should mention {phrase}: {search_and_read_desc}"
+        );
+    }
+    assert!(
+        !search_and_read_desc.contains("run one bounded project-text search"),
+        "obsolete single-query search_and_read description returned: {search_and_read_desc}"
+    );
+
     let save_artifact_desc = desc("save_project_artifact");
     for phrase in [
         "already holds the bounded binary/base64 content",
@@ -132,23 +144,43 @@ fn tool_specs_describe_default_coding_loop_preferences() {
     for phrase in [
         "preferred host-native attachment-to-project transfer path",
         "do not base64-transfer files",
-        "trusted mcp host/oauth client",
+        "active authenticated oauth client",
+        "openai file hosts",
+        "arbitrary public https",
+        "up to 256 mib per file",
+        "batch is not atomic",
+        "partial_success=true",
     ] {
         assert!(
             import_artifact_desc.contains(phrase),
             "import_conversation_files_to_project: {phrase}"
         );
     }
-    let export_artifact_desc = desc("export_project_artifact");
+    let project_artifact_desc = desc("project_artifact");
+    let transfer_artifact_desc = desc("transfer_project_artifact");
     for phrase in [
-        "resourcelink",
-        "without routing base64 through model output",
-        "preferred project-to-host/user transfer path",
-        "stateless/operator-capable mcp surfaces",
+        "source project:read",
+        "destination project:write",
+        "independently resolved and authorized",
+        "exact source bytes/sha-256/mime snapshot",
+        "do not pass through host attachments or model text",
     ] {
         assert!(
-            export_artifact_desc.contains(phrase),
-            "export_project_artifact: {phrase}"
+            transfer_artifact_desc.contains(phrase),
+            "transfer_project_artifact: {phrase}"
+        );
+    }
+    for phrase in [
+        "metadata=facts",
+        "inspect=fenced segment",
+        "image=mcp image",
+        "export=mcp resourcelink",
+        "not repeated inspect calls",
+        "import_conversation_files_to_project",
+    ] {
+        assert!(
+            project_artifact_desc.contains(phrase),
+            "project_artifact: {phrase}"
         );
     }
     let read_artifact_desc = desc("read_project_artifact");
@@ -159,7 +191,7 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "snapshot_changed",
         "do not manually translate",
         "do not loop over base64 chunks",
-        "export_project_artifact",
+        "project_artifact(action=export)",
     ] {
         assert!(
             read_artifact_desc.contains(phrase),
@@ -338,13 +370,11 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         "may omit expected_read_revision",
         "occurrence or line_scope",
         "requires expected_read_revision",
-        "stronger whole-file stale-context fence",
+        "revisions fence whole-file snapshots",
         "model input never needs a digest",
         "preflighted transactionally",
         "conflicts fail closed",
-        "rechecks planned source content before mutation",
-        "expected correctness and reliability",
-        "minimal error facts",
+        "rechecks source before mutation",
         "one parser-ready read_files recovery call",
         "inspect the resulting diff",
         "validate the final source",
@@ -441,7 +471,9 @@ fn tool_specs_describe_default_coding_loop_preferences() {
     assert!(!go_test_desc.contains("preferred structured"));
     let cargo_fmt_desc = desc("cargo_fmt");
     for phrase in [
-        "ensure rust formatting",
+        "final formatting after relevant rust source stabilizes",
+        "do not use cargo_fmt as a per-edit ritual",
+        "read-only formatting validation",
         "precheck",
         "changed/state_changed",
     ] {
@@ -457,7 +489,7 @@ fn tool_specs_describe_default_coding_loop_preferences() {
     }
 
     let handoff_desc = desc("session_handoff_summary");
-    for phrase in ["handoff", "multi-step tasks", "read-only"] {
+    for phrase in ["handoff", "missing task context", "read-only"] {
         assert!(
             handoff_desc.contains(phrase),
             "session_handoff_summary description should mention {phrase}: {handoff_desc}"
@@ -466,26 +498,21 @@ fn tool_specs_describe_default_coding_loop_preferences() {
 
     let run_shell_desc = desc("run_shell");
     for phrase in [
-        "bounded shell command or short tightly related chain",
-        "shell semantics",
-        "model/tool round trips",
-        "predetermined related observations may share one call",
-        "adaptive/result-dependent follow-ups stay sequential",
-        "prefer run_process for one native executable with literal argv",
-        "bounded deterministic python heredoc",
-        "one small program expresses a coherent transformation more reliably",
-        "project/path/permission policy",
-        "avoid unauthorized network",
-        "inspect diff",
-        "validate final source",
-        "run_script handles supported program-like languages",
-        "does not imply python",
-        "failure/permission/validation boundaries",
-        "commit, push, deploy, restart",
-        "same-process state",
-        "one named ssh resource",
-        "runner-owned",
-        "run_detached_process",
+        "bounded shell grammar or a short related command chain",
+        "prefer run_process for literal argv",
+        "run_script for program-like scripts",
+        "predetermined related observations may share one command",
+        "result-dependent follow-ups stay sequential",
+        "project-source mutation should normally use canonical structured editors",
+        "runner-owned execution",
+        "timeout_secs is total lifetime",
+        "sync_wait_secs is only job-handoff grace",
+        "retain exact job_id/continuation",
+        "continue independent work",
+        "passive job attention",
+        "observe_jobs only for logs/details/recovery",
+        "wait_for_job_terminal only when terminal outcome is a true dependency",
+        "duration alone does not select a detached primitive",
     ] {
         assert!(
             run_shell_desc.contains(phrase),
@@ -495,19 +522,20 @@ fn tool_specs_describe_default_coding_loop_preferences() {
 
     let run_process_desc = desc("run_process");
     for phrase in [
-        "one-shot executable with structured argv",
-        "preferred route for one native executable with literal argv",
+        "native executable with structured literal argv",
+        "prefer this over run_shell unless shell grammar or a short related command chain is required",
         "windows batch shims",
         "bounded runner-owned quoting contract",
-        "run_shell only when shell semantics or a short tightly related command chain",
-        "do not open a persistent shell merely to run several commands",
-        "same-process cwd/env/exports/functions/umask state",
-        "one named ssh resource",
-        "ssh_resource onboarding",
-        "one-shot/no-persistence ssh",
-        "runner-owned",
-        "outlive the runner",
+        "persistent shell is only for retained same-process or named-ssh state, not command count",
+        "same execution and remains runner-owned",
+        "retain exact job_id/continuation",
+        "continue independent work",
+        "passive job attention",
+        "observe_jobs only for logs/details/recovery",
+        "wait_for_job_terminal only when terminal outcome is a true dependency",
         "run_detached_process",
+        "survive runner restart/upgrade/stop/replacement",
+        "duration alone is not a reason to detach",
     ] {
         assert!(
             run_process_desc.contains(phrase),
@@ -515,30 +543,23 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         );
     }
 
+    // Interpreter/runtime details stay locked by run_script input-schema tests;
+    // this model-facing description test keeps selection and lifecycle decisions dense.
     let run_script_desc = desc("run_script");
     for phrase in [
-        "sh, bash, powershell, javascript, or typescript",
-        "node.js-backed",
-        ".mjs",
-        "native erasable type stripping",
-        ".mts",
-        "node.js 22.6+",
-        "does not type-check",
-        "enum",
-        "runner owns runtime selection/flags",
-        "does not install npm dependencies",
-        "relative esm imports resolve from the runner-owned temporary module",
-        "bun",
-        "deno",
-        "tsx",
-        "run tsc",
+        "sh, bash, powershell, python, javascript, or typescript",
         "run_process for native argv",
-        "run_script for program-like scripts",
-        "run_shell when shell grammar is required",
-        "same execution / same job",
-        "never restarted",
-        "outlive the runner",
-        "run_detached_process",
+        "computation/inspection/generation/non-source transforms",
+        "run_shell for shell grammar",
+        "project-source mutation should normally use canonical structured editors",
+        "same execution and remains runner-owned",
+        "retain exact job_id/continuation",
+        "continue independent work",
+        "passive job attention",
+        "observe_jobs only for logs/details/recovery",
+        "wait_for_job_terminal only when terminal outcome is a true dependency",
+        "script bodies never become shell command text",
+        "survive runner restart/upgrade/stop/replacement",
     ] {
         assert!(
             run_script_desc.contains(phrase),
@@ -717,11 +738,6 @@ fn model_preference_upper_bounds_are_clamped_by_runtime_not_rejected_by_schema()
         ("goto_definition", &["limit"]),
         ("find_references", &["limit"]),
         ("call_hierarchy", &["limit"]),
-        ("computer_list_windows", &["limit"]),
-        ("computer_list_displays", &["limit"]),
-        ("computer_list_applications", &["limit"]),
-        ("computer_accessibility_tree", &["max_depth", "max_nodes"]),
-        ("computer_find_elements", &["limit"]),
         ("coding_agent_observe", &["wait_secs"]),
         ("list_agent_tasks", &["limit"]),
         ("list_agent_identities", &["limit"]),
@@ -805,6 +821,14 @@ fn edit_tool_surface_keeps_mutation_options_visible_and_schemas_stable() {
             "apply_text_edits must keep field {field}"
         );
     }
+    let text_edit_output =
+        &spec_named(&specs, "apply_text_edits").output_schema["properties"]["output"]["properties"];
+    let text_edit_file_properties = text_edit_output["files"]["items"]["properties"]
+        .as_object()
+        .expect("apply_text_edits file summary properties");
+    assert!(text_edit_file_properties.contains_key("read_revision"));
+    assert!(!text_edit_file_properties.contains_key("old_sha256"));
+    assert!(!text_edit_file_properties.contains_key("new_sha256"));
     let codex_patch = &spec_named(&specs, "apply_patch").input_schema["properties"];
     for field in ["project", "patch", "dry_run", "matching_mode"] {
         assert!(
@@ -979,7 +1003,7 @@ fn session_tool_specs_describe_explicit_targeting() {
         .as_str()
         .expect("work_on_project session_id description")
         .to_lowercase();
-    for phrase in ["does not change", "caller-explicit"] {
+    for phrase in ["does not prove", "fresh model context", "context_request"] {
         assert!(
             session_id_description.contains(phrase),
             "work_on_project session_id description should mention {phrase}: {session_id_description}"
@@ -1004,12 +1028,11 @@ fn session_tool_specs_describe_explicit_targeting() {
 
     let handoff_desc = desc("session_handoff_summary");
     for phrase in [
-        "session ledger",
-        "explicit session_id",
-        "ledger-derived validation",
-        "bounded tails",
-        "safe result metadata",
-        "validation.parser.available",
+        "exact session_id",
+        "handoff_brief",
+        "8 kib",
+        "diagnostic=true",
+        "basis incomplete",
     ] {
         assert!(
             handoff_desc.contains(phrase),
@@ -1042,7 +1065,10 @@ fn observe_jobs_wake_policy_schema_is_closed_and_compatible() {
         webcodex_core::runtime_contract::MAX_JOB_OBSERVATION_WAIT_SECS,
         100
     );
-    assert_eq!(wake["enum"], serde_json::json!(["change", "terminal"]));
+    assert_eq!(
+        wake["enum"],
+        serde_json::json!(["change", "terminal", "all_terminal"])
+    );
     assert_eq!(wake["default"], "change");
     assert!(!spec.input_schema["required"]
         .as_array()
@@ -1053,7 +1079,6 @@ fn observe_jobs_wake_policy_schema_is_closed_and_compatible() {
         "no wait_secs",
         "wake_on=change",
         "wake_on=terminal",
-        "wait_secs=100",
         "useful progress is blocked on terminal outcome",
         "independent work remains",
         "do not poll for visibility",
@@ -1061,14 +1086,34 @@ fn observe_jobs_wake_policy_schema_is_closed_and_compatible() {
     ] {
         assert!(spec.description.contains(phrase), "missing {phrase}");
     }
+    let recommended_wait = format!(
+        "wait_secs={}",
+        webcodex_core::runtime_contract::MODEL_JOB_CONTINUATION_WAIT_SECS
+    );
+    assert!(
+        spec.description.contains(&recommended_wait),
+        "missing {recommended_wait}"
+    );
     let wait_description = spec.input_schema["properties"]["wait_secs"]["description"]
         .as_str()
         .unwrap();
     assert!(wait_description.contains("above 100 seconds"));
     assert!(wait_description.contains("clamped to 100"));
+    let recommended_wait_description = format!(
+        "recommend {} seconds",
+        webcodex_core::runtime_contract::MODEL_JOB_CONTINUATION_WAIT_SECS
+    );
+    assert!(wait_description.contains(&recommended_wait_description));
     assert!(wait_description.contains("further useful progress depends on terminal outcome"));
     assert!(wait_description.contains("independent work continues"));
     let wake_description = wake["description"].as_str().unwrap();
-    assert!(wake_description.contains("dependent progress is blocked"));
-    assert!(wake_description.contains("not as an unconditional next call"));
+    assert!(wake_description.contains("any terminal result unblocks progress"));
+    assert!(wake_description.contains("predetermined set"));
+    for policy in ["change", "terminal", "all_terminal"] {
+        test_support::validate_schema_instance(
+            &json!({"items": [{"job_id": "job"}], "wake_on": policy}),
+            &spec.input_schema,
+        )
+        .unwrap();
+    }
 }

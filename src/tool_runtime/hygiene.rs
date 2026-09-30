@@ -79,8 +79,11 @@ pub(crate) fn is_secret_like_path(path: &str) -> bool {
     }
     let last = parts.last().copied().unwrap_or("");
 
-    // .env or .env.*
-    if last == ".env" || last.starts_with(".env.") {
+    // `.env` and credential-bearing variants, excluding the small conventional
+    // public template allowlist shared with direct project-file policy.
+    if !webcodex_core::sensitive_paths::is_public_dotenv_template_component(last)
+        && (last == ".env" || last.starts_with(".env."))
+    {
         return true;
     }
     // Exact SSH key filenames.
@@ -125,8 +128,8 @@ pub(crate) fn is_strong_tracked_secret_path(path: &str) -> bool {
     let Some(last) = parts.last().copied() else {
         return false;
     };
-    if last == ".env"
-        || last.starts_with(".env.")
+    if (!webcodex_core::sensitive_paths::is_public_dotenv_template_component(last)
+        && (last == ".env" || last.starts_with(".env.")))
         || matches!(
             last,
             "id_rsa" | "id_dsa" | "id_ed25519" | "passwd" | ".password"
@@ -417,7 +420,7 @@ pub(crate) fn build_hygiene_summary(
     }
 
     let truncated = findings_truncated || diagnostic_output_truncated || diagnostic_scan_incomplete;
-    let clean = git_available && findings.is_empty() && !truncated;
+    let clean = git_available.then_some(findings.is_empty() && !truncated);
 
     let findings_json: Vec<Value> = findings
         .iter()
@@ -651,17 +654,25 @@ fn parse_hygiene_diagnostic_stdout(
                 let path = decode_hygiene_porcelain_path(path);
                 if !path.is_empty() {
                     tracked_paths.push(path);
+                } else {
+                    scan_incomplete = true;
                 }
             } else {
                 scan_incomplete = true;
             }
             continue;
         }
-        if status_entries.len() >= HYGIENE_MAX_SCRIPT_ENTRIES {
-            scan_incomplete = true;
+        if line.is_empty() {
             continue;
         }
-        if line.len() < 4 {
+        let bytes = line.as_bytes();
+        if bytes.len() < 4
+            || bytes[2] != b' '
+            || !b" MADRCUT?!".contains(&bytes[0])
+            || !b" MADRCUT?!".contains(&bytes[1])
+            || status_entries.len() >= HYGIENE_MAX_SCRIPT_ENTRIES
+        {
+            scan_incomplete = true;
             continue;
         }
         let x = &line[0..1];
@@ -672,6 +683,7 @@ fn parse_hygiene_diagnostic_stdout(
             .unwrap_or(&line[3..]);
         let path = decode_hygiene_porcelain_path(path_part);
         if path.is_empty() {
+            scan_incomplete = true;
             continue;
         }
         let tracked_status = if x == "?" && y == "?" {
@@ -946,10 +958,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn malformed_diagnostic_records_cannot_claim_clean() {
+        for record in ["bad", "é broken", " M ", HYGIENE_TRACKED_PATH_SENTINEL] {
+            let stdout = format!("{record}\n{HYGIENE_DIAGNOSTIC_SENTINEL}0\n");
+            let (git_available, entries, scan_incomplete) =
+                parse_hygiene_diagnostic_stdout(&stdout, false);
+            assert!(git_available);
+            assert!(entries.is_empty());
+            assert!(scan_incomplete, "malformed record: {record:?}");
+            let summary = build_hygiene_summary(
+                "demo",
+                None,
+                git_available,
+                &[],
+                false,
+                false,
+                scan_incomplete,
+                &[],
+            );
+            assert_eq!(summary["clean"], false);
+            assert_eq!(summary["truncated"], true);
+        }
+    }
+
+    #[test]
+    fn diagnostic_status_scan_limit_counts_records_not_blank_lines() {
+        for count in [HYGIENE_MAX_SCRIPT_ENTRIES, HYGIENE_MAX_SCRIPT_ENTRIES + 1] {
+            let mut stdout = " M README.md\n".repeat(count);
+            stdout.push_str(&format!("\n{HYGIENE_DIAGNOSTIC_SENTINEL}0\n"));
+            let (git_available, entries, scan_incomplete) =
+                parse_hygiene_diagnostic_stdout(&stdout, false);
+            assert!(git_available);
+            assert_eq!(entries.len(), HYGIENE_MAX_SCRIPT_ENTRIES);
+            assert_eq!(scan_incomplete, count > HYGIENE_MAX_SCRIPT_ENTRIES);
+        }
+    }
+
+    #[test]
     fn secret_like_path_detection() {
         assert!(is_secret_like_path(".env"));
         assert!(is_secret_like_path(".env.local"));
         assert!(is_secret_like_path(".env.production"));
+        assert!(!is_secret_like_path(".env.example"));
+        assert!(!is_secret_like_path(".ENV.SAMPLE"));
+        assert!(is_secret_like_path(".env.example.local"));
+        assert!(is_secret_like_path("secrets/.env.example"));
         assert!(is_secret_like_path("secrets/api.key"));
         assert!(is_secret_like_path("config/token.json"));
         assert!(is_secret_like_path("id_rsa"));
@@ -976,6 +1029,7 @@ mod tests {
             "config/token.json",
             "credentials/service.yaml",
             "private.pem",
+            "secrets/.env.example",
         ] {
             assert!(
                 is_strong_tracked_secret_path(path),
@@ -988,6 +1042,8 @@ mod tests {
             "src/runner_tokens_http.rs",
             "docs/token-design.md",
             "tests/credential_parser.ts",
+            ".env.example",
+            ".ENV.DIST",
         ] {
             assert!(
                 !is_strong_tracked_secret_path(path),
@@ -1162,7 +1218,7 @@ mod tests {
             &["non_git_project".to_string()],
         );
         assert_eq!(summary["git_available"], false);
-        assert_eq!(summary["clean"], false);
+        assert!(summary["clean"].is_null());
         assert!(!summary["warnings"].as_array().unwrap().is_empty());
         for omitted in ["counts", "findings", "truncated", "suggested_next_actions"] {
             assert!(

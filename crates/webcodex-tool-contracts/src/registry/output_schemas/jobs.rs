@@ -22,8 +22,38 @@ fn validation_job_projection_schema() -> Value {
                 ]
             },
             "truncated": {"type": "boolean"},
+            "source_state": super::common::validation_source_state_schema(),
             "test_count_assertion": cargo_test_count_assertion_schema()
         }
+    })
+}
+
+fn job_terminal_continuation_projection_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "version": {"type": "integer", "const": 1},
+            "wait_id": {"type": "string", "pattern": "^wc_job_wait_[A-Za-z0-9_-]{16}$"},
+            "job_id": {"type": "string", "minLength": 1, "maxLength": 128},
+            "state": {"type": "string", "enum": ["waiting", "triggered"]},
+            "delivery_state": {"type": "string", "enum": ["not_ready", "pending", "prepared", "delivered", "delivery_unknown"]},
+            "terminal_status": nullable_schema("string", "Sparse canonical terminal Job status."),
+            "terminal_outcome": nullable_schema("string", "Sparse canonical terminal Job outcome."),
+            "automatic_resume_available": {"type": "boolean"},
+            "expires_at": {"type": "integer"},
+            "fallback_tool": {"type": "string", "const": "observe_jobs"}
+        },
+        "required": ["version", "wait_id", "job_id", "state", "delivery_state", "terminal_status", "terminal_outcome", "automatic_resume_available", "expires_at", "fallback_tool"]
+    })
+}
+
+fn job_terminal_host_binding_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {"bound": {"type": "boolean"}},
+        "required": ["bound"]
     })
 }
 
@@ -32,6 +62,18 @@ fn process_execution_state_schema() -> Value {
         "type": "string",
         "enum": ["not_started", "outcome_unknown", "completed", "timed_out", "queued", "running"],
         "description": "Canonical lifecycle when explicit: not_started means no command dispatch; outcome_unknown means effects may have occurred and must be reconciled before retry; timed_out is terminal; queued/running appear only for durable Job handoff. Ordinary synchronous success omits this field because outer success already implies completed. Only explicit not_started is structurally safe to retry without first inspecting target state."
+    })
+}
+
+fn input_normalization_schema() -> Value {
+    json!({
+        "type": "object", "additionalProperties": false,
+        "description": "Present only after a successful, explicitly known lossless model-input normalization. No raw payload is repeated.",
+        "properties": {
+            "code": {"type": "string", "enum": ["argv_to_args", "run_process_sh_c_to_run_shell", "run_process_bash_c_to_run_shell", "run_process_bash_lc_to_login_run_shell"]},
+            "hint": {"type": "string", "maxLength": 80}
+        },
+        "required": ["code", "hint"]
     })
 }
 
@@ -232,7 +274,7 @@ fn structured_execution_lifecycle_constraints(execution_source: &str) -> Value {
                 "properties": {
                     "job_id": {"type": "string", "minLength": 1},
                     "job_status": {"type": "string", "minLength": 1},
-                    "continuation": continuation,
+                    "continuation": observe_job_continuation_schema(),
                     "observation_token": {"type": "string", "minLength": 1},
                     "terminal": {"const": false},
                     "command_completed": {"const": false},
@@ -246,7 +288,14 @@ fn structured_execution_lifecycle_constraints(execution_source: &str) -> Value {
                     "job_status",
                     "terminal",
                     "command_completed",
-                ]
+                ],
+                "allOf": [{
+                    "if": {
+                        "properties": {"execution_state": {"enum": ["queued", "running"]}},
+                        "required": ["execution_state"]
+                    },
+                    "then": {"properties": {"continuation": continuation}}
+                }]
             }
         },
         {
@@ -325,6 +374,7 @@ fn structured_continuation_properties() -> Vec<(&'static str, Value)> {
             ),
         ),
         ("continuation", observe_job_continuation_schema()),
+        ("suggested_call", list_jobs_recovery_call_schema(true)),
         ("activity", job_activity_schema()),
         (
             "effective_timeout_secs",
@@ -398,7 +448,7 @@ fn job_structured_execution_metadata_schema() -> Value {
     })
 }
 
-fn list_jobs_recovery_call_schema(project: bool) -> Value {
+pub(super) fn list_jobs_recovery_call_schema(project: bool) -> Value {
     let arguments = if project {
         json!({
             "type": "object",
@@ -417,7 +467,7 @@ fn list_jobs_recovery_call_schema(project: bool) -> Value {
 }
 
 fn observe_jobs_batch_followup_arguments_schema() -> Value {
-    let mut schema = crate::registry::input_schemas::observe_jobs_input_schema();
+    let mut schema = crate::input_schema_for_tool("observe_jobs");
     if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
         properties.remove("wait_secs");
         properties.remove("wake_on");
@@ -426,7 +476,7 @@ fn observe_jobs_batch_followup_arguments_schema() -> Value {
 }
 
 fn observe_jobs_output_schema() -> Value {
-    let job_observation = json!({
+    let mut job_observation = json!({
         "type": "object",
         "additionalProperties": true,
         "properties": {
@@ -505,7 +555,7 @@ fn observe_jobs_output_schema() -> Value {
             "activity", "detected_summary", "validation"
         ]
     });
-    let sparse_job_observation = json!({
+    let mut sparse_job_observation = json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
@@ -523,6 +573,13 @@ fn observe_jobs_output_schema() -> Value {
                 "minLength": 1,
                 "maxLength": webcodex_core::job_observation::MAX_JOB_OBSERVATION_TOKEN_LEN,
                 "description": "Opaque authoritative token copied unchanged from the canonical Job observation for the next after_observation_token."
+            },
+            "observation_ref": {
+                "type": "string",
+                "pattern": "^~j[0-9]+$",
+                "minLength": 3,
+                "maxLength": webcodex_core::job_observation::MAX_OBSERVATION_REF_LEN,
+                "description": "Compact server-issued selector retained on the model-facing sparse item for the next ordinary observe_jobs follow-up."
             },
             "exit_code": schema_type("integer", "Terminal process exit code when available and meaningful."),
             "command_execution_state": job_command_execution_state_schema(),
@@ -566,24 +623,79 @@ fn observe_jobs_output_schema() -> Value {
             "observation_token"
         ]
     });
+    let summary_detail_call = suggested_tool_call_schema(
+        "observe_jobs",
+        json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {
+                "items": {
+                    "type": "array", "minItems": 1, "maxItems": 1,
+                    "items": {
+                        "oneOf": [
+                            {
+                                "type": "object", "additionalProperties": false,
+                                "properties": {
+                                    "job_id": {"type": "string", "minLength": 1},
+                                    "after_observation_token": {"type": "string", "maxLength": webcodex_core::job_observation::MAX_JOB_OBSERVATION_TOKEN_LEN}
+                                },
+                                "required": ["job_id"]
+                            },
+                            {
+                                "type": "object", "additionalProperties": false,
+                                "properties": {
+                                    "observation_ref": {
+                                        "type": "string",
+                                        "pattern": "^~j[0-9]+$",
+                                        "minLength": 3,
+                                        "maxLength": webcodex_core::job_observation::MAX_OBSERVATION_REF_LEN
+                                    }
+                                },
+                                "required": ["observation_ref"]
+                            }
+                        ]
+                    }
+                },
+                "tail_lines": {"type": "integer", "minimum": 1, "maximum": 200},
+                "summary_only": {"type": "boolean", "const": false}
+            },
+            "required": ["items", "tail_lines", "summary_only"]
+        }),
+        "Expand retained logs with the original observation cursor. Logs may have expired; retention/reset evidence remains authoritative. Never re-executes the Job.",
+    );
+    for observation in [&mut job_observation, &mut sparse_job_observation] {
+        observation["properties"]["logs_omitted"] = json!({
+            "type": "array", "minItems": 1, "maxItems": 2, "uniqueItems": true,
+            "items": {"type": "string", "enum": ["stdout", "stderr"]},
+            "description": "Streams with routine successful validation lines omitted by explicit summary_only. Other log text and all diagnostic/state evidence remain unchanged."
+        });
+        observation["properties"]["suggested_call"] = summary_detail_call.clone();
+    }
     let mut item = json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
             "index": {"type": "integer", "minimum": 0, "maximum": 7},
-            "job_id": {"type": "string", "minLength": 1},
+            "job_id": {"anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]},
             "success": {"type": "boolean"},
             "output": {"anyOf": [job_observation.clone(), {"type": "null"}]},
             "error_kind": {"anyOf": [{"type": "string"}, {"type": "null"}]},
             "recovery_kind": recovery_kind_schema(),
             "suggested_call": list_jobs_recovery_call_schema(false),
-            "error": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+            "error": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "observation_ref": {
+                "type": "string",
+                "pattern": "^~j[0-9]+$",
+                "minLength": 3,
+                "maxLength": webcodex_core::job_observation::MAX_OBSERVATION_REF_LEN,
+                "description": "Compact server-issued continuation selector for this item. Echo it verbatim in the next ordinary observe_jobs call instead of copying job_id + after_observation_token."
+            }
         },
         "required": ["index", "job_id", "success", "output", "error_kind", "error"],
         "allOf": [{
             "if": {"properties": {"success": {"const": true}}, "required": ["success"]},
             "then": {
                 "properties": {
+                    "job_id": {"type": "string", "minLength": 1},
                     "output": job_observation,
                     "error_kind": {"type": "null"},
                     "recovery_kind": {"type": "null", "const": "__forbidden_on_success__"},
@@ -608,6 +720,17 @@ fn observe_jobs_output_schema() -> Value {
         "then": {
             "required": ["suggested_call"],
             "not": {"required": ["recovery_kind"]}
+        }
+    }));
+    item["allOf"].as_array_mut().unwrap().push(json!({
+        "if": {
+            "properties": {"error_kind": {"const": "unknown_observation_ref"}},
+            "required": ["error_kind"]
+        },
+        "then": {
+            "required": ["observation_ref", "recovery_kind"],
+            "properties": {"job_id": {"type": "null"}},
+            "not": {"required": ["suggested_call"]}
         }
     }));
     item["allOf"].as_array_mut().unwrap().push(json!({
@@ -728,6 +851,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ("status", schema_type("string", "Current detached Job status at admission.")),
                 ("project", schema_type("string", "Configured project id.")),
                 ("execution_source", schema_type("string", "Always run_detached_process on successful admission.")),
+                ("input_normalization", input_normalization_schema()),
                 ("purpose", schema_type("string", "Declared execution purpose.")),
                 ("process_summary", schema_type("string", "Bounded body-free detached process summary.")),
                 ("cwd", schema_type("string", "Resolved project-relative cwd.")),
@@ -741,7 +865,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ("failure_kind", nullable_schema("string", "Structured detached initiation failure kind.")),
                 ("tool_failure", schema_type("boolean", "True for WebCodex initiation/runtime failures.")),
                 ("terminal", schema_type("boolean", "False after successful detached Job admission.")),
-                ("effective_timeout_secs", schema_type("integer", "Total detached process runtime budget in seconds.")),
+                ("effective_timeout_secs", schema_type("integer", "Total detached process execution lifetime in seconds.")),
                 ("created_at", schema_type("integer", "Durable Job creation timestamp.")),
                 ("continuation", observe_job_continuation_schema()),
                 ("last_update_seq", nullable_schema("integer", "Latest agent update sequence when available.")),
@@ -752,8 +876,51 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             require_success_output_field(&mut schema, "continuation");
             Some(schema)
         }
+        "run_skill_resource" => {
+            let mut schema = output_schema_for_tool("run_process")
+                .expect("run_process output schema must exist");
+            let properties = schema["properties"]["output"]["properties"]
+                .as_object_mut()
+                .expect("run_process output properties");
+            properties.remove("suggested_call");
+            properties.insert("skill_id".to_string(), schema_type("string", "Opaque Runner Skill identity that supplied the executed script."));
+            properties.insert("skill_name".to_string(), schema_type("string", "Selected trusted Runner Skill name."));
+            properties.insert("skill_path".to_string(), schema_type("string", "Executed package-relative scripts/ resource path."));
+            properties.insert("skill_sha256".to_string(), schema_type("string", "SHA-256 of the actual script bytes executed."));
+            properties.insert("skill_trust".to_string(), json!({"type":"string","enum":["operator_configured_guidance","operator_installed_guidance"]}));
+            properties.insert("skill_definition_revision".to_string(), schema_type("string", "Validated SKILL.md definition revision for this execution; configured script resource bytes remain live until execution."));
+            properties.insert("skill_package_revision".to_string(), nullable_schema("string", "Immutable package revision for installed Skills; null for configured live Skills."));
+            properties.insert("state_changed".to_string(), schema_type("boolean", "False on pre-start Skill validation failures."));
+            if let Some(execution_source) = properties.get_mut("execution_source") {
+                execution_source["const"] = json!("run_skill_resource");
+                execution_source["description"] = json!("Canonical source is run_skill_resource. Diagnostic telemetry may be omitted on ordinary synchronous terminal success.");
+            }
+            schema["allOf"]
+                .as_array_mut()
+                .expect("run_skill_resource inherits structured execution constraints")
+                .push(json!({
+                    "if": {"properties": {"success": {"const": true}}, "required": ["success"]},
+                    "then": {"properties": {"output": {"not": {"required": ["suggested_call"]}}}}
+                }));
+            for field in [
+                "skill_id",
+                "skill_path",
+                "skill_sha256",
+                "skill_trust",
+                "skill_definition_revision",
+                "skill_package_revision",
+            ] {
+                require_success_output_field(&mut schema, field);
+            }
+            Some(schema)
+        }
         "run_process" => {
             let mut properties = vec![
+                ("tests_detected", schema_type("boolean", "Trusted typed pytest invocation with an untruncated terminal summary.")),
+                ("tests_run_count", json!({"type": "integer", "minimum": 0, "description": "Passed plus failed tests; skips, deselections and collection errors are not test runs."})),
+                ("tests_passed", json!({"type": "integer", "minimum": 0})),
+                ("tests_failed", json!({"type": "integer", "minimum": 0})),
+                ("zero_tests_run", schema_type("boolean", "True only for a trusted terminal pytest summary with zero passed and failed tests.")),
                 (
                     "duration_ms",
                     schema_type("integer", "Process duration in milliseconds. Diagnostic telemetry: omitted on ordinary synchronous terminal success and from the default model-facing failure projection."),
@@ -820,30 +987,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ),
                 ("purpose", schema_type("string", "Declared execution purpose. Audit metadata: omitted on ordinary synchronous terminal success and from the default model-facing failure projection.")),
                 (
-                    "tests_detected",
-                    schema_type("boolean", "Present only when typed run_process directly executed pytest and a complete, untruncated supported terminal summary was observed."),
-                ),
-                (
-                    "tests_run_count",
-                    schema_type("integer", "Pytest reported passed + failed count; skipped, deselected and collection/fixture errors are not reclassified as successes or failures. Omitted when not proven."),
-                ),
-                (
-                    "tests_passed",
-                    schema_type("integer", "Pytest terminal-summary passed count; omitted when not proven."),
-                ),
-                (
-                    "tests_failed",
-                    schema_type("integer", "Pytest terminal-summary failed count; the actual process exit code remains authoritative. Omitted when not proven."),
-                ),
-                (
-                    "zero_tests_run",
-                    schema_type("boolean", "True only when a supported pytest summary proves zero reported passed+failed tests and no skip/error category leaves execution uncertain; absent otherwise."),
-                ),
-                (
                     "process_summary",
                     schema_type(
                         "string",
-                        "Bounded human-readable executable/argv summary; never execution input. Omitted on ordinary synchronous terminal success and from the default model-facing failure projection; full operator trace diagnostics can retain the canonical execution payload when enabled.",
+                        "Bounded human-readable executable/argv summary; never execution input. Omitted on ordinary synchronous terminal success and from the default model-facing failure projection; protocol-admitted trace diagnostics can retain the canonical execution payload when enabled.",
                     ),
                 ),
                 (
@@ -857,8 +1004,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 })),
                 (
                     "execution_source",
-                    schema_type("string", "Canonical source is run_process. Diagnostic telemetry: omitted on ordinary synchronous terminal success when canonical and from the default model-facing failure projection."),
+                    schema_type("string", "Canonical executed surface; may differ from the requested surface after proven exact shell-input recovery."),
                 ),
+                ("requested_surface", schema_type("string", "Original requested tool name when an exact shell form was normalized.")),
+                ("input_normalization", input_normalization_schema()),
                 (
                     "execution_state",
                     process_execution_state_schema(),
@@ -873,10 +1022,16 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ];
             properties.extend(structured_continuation_properties());
             let mut schema = wrapped_output_schema(properties);
-            schema["properties"]["output"]["properties"]["execution_source"]["const"] =
-                json!("run_process");
+            schema["properties"]["output"]["properties"]["suggested_call"] =
+                list_jobs_recovery_call_schema(true);
+            schema["properties"]["output"]["properties"]["execution_source"]["enum"] =
+                json!(["run_process", "run_shell"]);
             schema["properties"]["output"]["allOf"] =
                 structured_execution_lifecycle_constraints("run_process");
+            schema["allOf"] = json!([{
+                "if": {"properties": {"success": {"const": true}}, "required": ["success"]},
+                "then": {"properties": {"output": {"not": {"required": ["suggested_call"]}}}}
+            }]);
             Some(schema)
         }
         "run_script" => {
@@ -953,7 +1108,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                     "script_summary",
                     schema_type(
                         "string",
-                        "Bounded body-free language/byte/argument summary; never execution input. Omitted on ordinary synchronous terminal success and from the default model-facing failure projection; full operator trace diagnostics can retain the canonical execution payload when enabled.",
+                        "Bounded body-free language/byte/argument summary; never execution input. Omitted on ordinary synchronous terminal success and from the default model-facing failure projection; protocol-admitted trace diagnostics can retain the canonical execution payload when enabled.",
                     ),
                 ),
                 (
@@ -981,7 +1136,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             properties.extend(structured_continuation_properties());
             let mut schema = wrapped_output_schema(properties);
             schema["properties"]["output"]["properties"]["language"]["enum"] =
-                json!(["sh", "bash", "powershell", "javascript", "typescript"]);
+                json!(["sh", "bash", "powershell", "python", "javascript", "typescript"]);
             schema["properties"]["output"]["properties"]["execution_source"]["const"] =
                 json!("run_script");
             schema["properties"]["output"]["allOf"] =
@@ -1070,7 +1225,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                     "shell",
                     schema_type(
                         "string",
-                        "Actual selected shell, configured executor shell, or remote SSH executor.",
+                        "Actual selected shell (bash_login for explicit login mode), configured executor shell, or remote SSH executor.",
                     ),
                 ),
                 ("executor", json!({
@@ -1224,6 +1379,61 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "ownership_basis",
                 schema_type("string", "Ownership basis: project_and_session or unknown_session_project_only."),
             ),
+        ])),
+        "wait_for_job_terminal" => Some(wrapped_output_schema(vec![
+            ("wait_id", schema_type("string", "Durable caller-owned one-shot terminal wait identity.")),
+            ("job_id", schema_type("string", "Exact existing Job execution identity.")),
+            ("state", schema_type("string", "Wait lifecycle: waiting or triggered.")),
+            ("delivery_state", schema_type("string", "Host delivery lifecycle: not_ready, pending, prepared, delivered, or delivery_unknown. pending means durable terminal truth exists but no accepted Host delivery has been proved. delivery_unknown means dispatch crossed its durable fence but acknowledgement is unknown and is never silently retried.")),
+            ("terminal_status", nullable_schema("string", "Canonical terminal Job status when triggered; null while waiting.")),
+            ("terminal_outcome", nullable_schema("string", "Bounded terminal outcome classification when triggered; null while waiting.")),
+            ("replayed", schema_type("boolean", "Whether this was exact keyed registration replay.")),
+            ("state_changed", schema_type("boolean", "Whether this call durably created, matched, or advanced delivery state for this wait.")),
+            ("automatic_resume_available", schema_type("boolean", "True only when a real current production Host continuation carrier is installed.")),
+            ("expires_at", schema_type("integer", "Bounded wait/event expiry as Unix seconds.")),
+            ("fallback_tool", schema_type("string", "Explicit logs/details and recovery fallback; currently observe_jobs.")),
+        ])),
+        "present_job_terminal_continuation" => Some(wrapped_output_schema(vec![
+            ("job_terminal_continuation", job_terminal_continuation_projection_schema()),
+        ])),
+        "job_terminal_continuation_bind" | "job_terminal_continuation_unbind" => Some(wrapped_output_schema(vec![
+            ("job_terminal_continuation", job_terminal_continuation_projection_schema()),
+            ("host_binding", job_terminal_host_binding_schema()),
+            ("state_changed", schema_type("boolean", "Whether the process-local Host binding changed.")),
+        ])),
+        "job_terminal_continuation_state" => Some(wrapped_output_schema(vec![
+            ("job_terminal_continuation", job_terminal_continuation_projection_schema()),
+            ("host_binding", job_terminal_host_binding_schema()),
+            ("app_protocol", json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "prepared_attempt_id": nullable_schema("string", "App-private exact prepared attempt identity, present only after the durable dispatch fence.")
+                },
+                "required": ["prepared_attempt_id"]
+            })),
+        ])),
+        "job_terminal_continuation_prepare" => Some(wrapped_output_schema(vec![
+            ("wait_id", schema_type("string", "Exact Job terminal wait identity.")),
+            ("job_id", schema_type("string", "Exact Job execution identity.")),
+            ("delivery_state", schema_type("string", "Prepared delivery state.")),
+            ("attempt_id", schema_type("string", "Exact durable Job terminal delivery attempt identity.")),
+            ("dispatch_observation", schema_type("string", "dispatch_prepared after the durable prepare fence.")),
+            ("state_changed", schema_type("boolean", "True when this call crosses pending to prepared.")),
+            ("app_protocol", json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {"automatic_message": {"type": "string", "maxLength": 1024}},
+                "required": ["automatic_message"]
+            })),
+        ])),
+        "job_terminal_continuation_finish" => Some(wrapped_output_schema(vec![
+            ("wait_id", schema_type("string", "Exact Job terminal wait identity.")),
+            ("job_id", schema_type("string", "Exact Job execution identity.")),
+            ("attempt_id", schema_type("string", "Exact durable delivery attempt identity.")),
+            ("delivery_state", schema_type("string", "delivered or delivery_unknown.")),
+            ("dispatch_observation", schema_type("string", "dispatch_accepted or delivery_unknown.")),
+            ("state_changed", schema_type("boolean", "True when prepared delivery is finalized.")),
         ])),
         "observe_jobs" => Some(observe_jobs_output_schema()),
         "job_tail" => {

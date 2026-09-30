@@ -7,6 +7,7 @@ use webcodex_core::skill_metadata::{MAX_SKILL_DESCRIPTION_CHARS, MAX_SKILL_NAME_
 use webcodex_core::skill_store::MAX_OPERATOR_SKILL_KEY_CHARS;
 
 fn descriptor_schema() -> Value {
+    // Skill descriptors intentionally never expose native Runner Skill root paths.
     json!({
         "type": "object",
         "properties": {
@@ -20,6 +21,52 @@ fn descriptor_schema() -> Value {
             "name_conflict": {"type": "boolean"}
         },
         "required": ["skill_id", "name", "description", "definition_revision", "source_scope", "trust", "package_revision", "name_conflict"],
+        "additionalProperties": false
+    })
+}
+
+fn skill_source_summary_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["project", "configured_runner_roots", "managed_runner_store"]
+            },
+            "status": {
+                "type": "string",
+                "enum": ["available", "unavailable"]
+            },
+            "root_hint": {
+                "type": "string",
+                "const": ".agents/skills",
+                "description": "Logical Project-relative root hint. Native Runner Skill root paths are never exposed."
+            },
+            "skill_count": {"type": "integer", "minimum": 0},
+            "invalid_count": {"type": "integer", "minimum": 0},
+            "discovery_truncated": {"type": "boolean"},
+            "reason_code": {
+                "type": "string",
+                "enum": ["runner_skill_sources_unavailable"]
+            }
+        },
+        "required": ["kind", "status", "skill_count", "invalid_count", "discovery_truncated"],
+        "additionalProperties": false
+    })
+}
+
+fn skill_load_candidate_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "skill_id": {"type": "string", "pattern": "^wc_skill_[A-Za-z0-9_-]{21}[AQgw]$"},
+            "name": {"type": "string", "maxLength": MAX_SKILL_NAME_CHARS},
+            "source_scope": {"type": "string", "enum": ["project", "runner"]},
+            "trust": {"type": "string", "enum": ["project_content", "operator_configured_guidance", "operator_installed_guidance"]},
+            "package_revision": {"anyOf": [{"type":"string","pattern":"^wc_skillpkg_[A-Za-z0-9_-]{43}$"},{"type":"null"}]},
+            "definition_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        },
+        "required": ["skill_id", "name", "source_scope", "trust", "package_revision", "definition_revision"],
         "additionalProperties": false
     })
 }
@@ -120,29 +167,6 @@ mod tests {
     }
 
     #[test]
-    fn skill_read_schema_declares_guarded_parser_ready_continuation() {
-        let schema = output_schema_for_tool("skill_read_file").unwrap();
-        let call = &schema["properties"]["output"]["properties"]["suggested_call"];
-        assert_eq!(call["properties"]["tool"]["const"], "skill_read_file");
-        assert_eq!(call["required"], json!(["tool", "arguments"]));
-        assert_eq!(
-            call["properties"]["arguments"]["additionalProperties"],
-            false
-        );
-        assert_eq!(
-            call["properties"]["arguments"]["required"],
-            json!([
-                "project",
-                "skill_id",
-                "path",
-                "start_line",
-                "limit",
-                "expected_definition_revision"
-            ])
-        );
-    }
-
-    #[test]
     fn skill_recovery_schemas_use_exact_call_or_family_only_without_legacy_alias() {
         for tool in [
             "skill_list",
@@ -190,6 +214,47 @@ mod tests {
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     let mut schema = match name {
+        "skill_load" => Some(wrapped_output_schema(vec![
+            ("project", schema_type("string", "Resolved Project id.")),
+            (
+                "catalog_revision",
+                schema_type("string", "Digest of the freshly observed bounded Skill catalog used for exact-name selection."),
+            ),
+            ("skill_id", schema_type("string", "Opaque project-scoped Skill identity.")),
+            ("name", schema_type("string", "Selected Skill metadata name.")),
+            ("source_scope", schema_type("string", "Selected Skill source: project or runner.")),
+            ("trust", schema_type("string", "Guidance trust label for the selected source; never execution authority.")),
+            (
+                "package_revision",
+                nullable_schema("string", "Active immutable whole-package revision for runner-installed Skills; null for project/configured Skills."),
+            ),
+            ("definition_revision", schema_type("string", "Current SKILL.md content digest.")),
+            ("path", schema_type("string", "Package-relative SKILL.md path.")),
+            ("sha256", schema_type("string", "Full current SKILL.md SHA-256.")),
+            ("text", schema_type("string", "Bounded UTF-8 SKILL.md text.")),
+            ("start_line", schema_type("integer", "Effective 1-based selected start line.")),
+            ("end_line", nullable_schema("integer", "Last returned line, or null when none.")),
+            ("returned_lines", schema_type("integer", "Returned SKILL.md source lines.")),
+            ("has_more", schema_type("boolean", "Whether SKILL.md lines remain.")),
+            ("next_start_line", nullable_schema("integer", "Continuation line when has_more.")),
+            ("descriptor", descriptor_schema()),
+            ("candidate_count", json!({"type":"integer","minimum":2,"description":"Total case-fold-equivalent exact-name candidates when selection is ambiguous."})),
+            (
+                "candidates",
+                {
+                    let mut schema = array_schema(
+                        skill_load_candidate_schema(),
+                        "At most eight bounded exact-name ambiguity candidates.",
+                    );
+                    schema["maxItems"] = json!(8);
+                    schema
+                },
+            ),
+            ("candidates_truncated", schema_type("boolean", "Whether more than eight ambiguity candidates exist.")),
+            ("discovery_truncated", schema_type("boolean", "True when bounded catalog discovery was incomplete and exact-name uniqueness could not be proven.")),
+            ("error_kind", schema_type("string", "Stable guard/error code on failure.")),
+            ("state_changed", schema_type("boolean", "Always false for Skill loading failures.")),
+        ])),
         "skill_list" => Some(wrapped_output_schema(vec![
             ("project", schema_type("string", "Resolved Project id.")),
             (
@@ -233,17 +298,29 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ),
             ),
             (
+                "sources",
+                {
+                    let mut schema = array_schema(
+                        skill_source_summary_schema(),
+                        "Fixed three-source discovery participation summary: Project .agents/skills, configured Runner roots, and the managed Runner store. Empty available sources mean discovery succeeded and found zero Skills; unavailable Runner sources carry only a stable reason code. Native Runner paths are never exposed.",
+                    );
+                    schema["minItems"] = json!(3);
+                    schema["maxItems"] = json!(3);
+                    schema
+                },
+            ),
+            (
                 "invalid_count",
                 schema_type(
                     "integer",
-                    "Malformed/invalid packages or rejected Skill sources isolated from the valid catalog.",
+                    "Malformed/invalid packages isolated from the valid catalog.",
                 ),
             ),
             (
                 "diagnostics",
                 array_schema(
                     json!({"type":"object","additionalProperties":true}),
-                    "Bounded invalid package or rejected-source reason codes with safe candidate_name and source_scope where available; no native paths or callable Skill identity.",
+                    "Bounded reason-code-only invalid package diagnostics.",
                 ),
             ),
             (
@@ -263,22 +340,6 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
         ])),
         "skill_read_file" => Some(wrapped_output_schema(vec![
-            (
-                "suggested_call",
-                suggested_tool_call_schema("skill_read_file", json!({
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "project": {"type": "string", "minLength": 1},
-                        "skill_id": {"type": "string", "pattern": "^wc_skill_[A-Za-z0-9_-]{21}[AQgw]$"},
-                        "path": {"type": "string", "minLength": 1},
-                        "start_line": {"type": "integer", "minimum": 1},
-                        "limit": {"type": "integer", "minimum": 1},
-                        "expected_definition_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
-                    },
-                    "required": ["project", "skill_id", "path", "start_line", "limit", "expected_definition_revision"]
-                }), "Parser-ready advisory next page, guarded by the observed Skill definition revision. Absent at EOF; does not execute automatically or grant authority."),
-            ),
             ("project", schema_type("string", "Resolved Project id.")),
             (
                 "skill_id",

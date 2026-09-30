@@ -5,7 +5,6 @@ use super::super::kernel::{
 };
 use super::super::permissions::{AuthorityMode, PermissionEvaluator};
 use super::super::project_resolution::ResolvedProject;
-use super::super::sessions::SessionContextRevisionAck;
 use super::super::{ToolResult, ToolRuntime};
 use super::support::*;
 use crate::db::{memory_catalog_revision, MemoryPriority, MAX_MEMORY_BOOTSTRAP_BYTES};
@@ -45,15 +44,11 @@ async fn list_files_with_session_context(
     client_id: &str,
     project: &str,
     session_id: &str,
-    ack_revision: Option<u64>,
     context_request: Vec<&str>,
 ) -> ToolResult {
     let arguments = json!({"project": project, "path": ".", "limit": 20});
     let invocation_metadata = ToolInvocationMetadata {
         context_request: context_request.into_iter().map(str::to_string).collect(),
-        ack_session_context_revision: ack_revision
-            .map(SessionContextRevisionAck::Revision)
-            .unwrap_or(SessionContextRevisionAck::Unacknowledged),
         ..Default::default()
     };
     let task = tokio::spawn({
@@ -77,7 +72,6 @@ async fn list_files_with_session_context(
                     },
                     invocation_metadata,
                     ToolProtocolCapabilities {
-                        context_continuity: true,
                         context_sidecar: true,
                         memory_surface: true,
                         ..Default::default()
@@ -769,10 +763,10 @@ async fn context_material_registry_enforces_scope_and_surface_before_provider() 
         .to_string()
         .contains("PRIVATE_MEMORY_BODY_MUST_NOT_LEAK_ON_DENIAL"));
 
-    let mut skill_surface_denied = ToolResult::ok(json!({"main": true}));
+    let mut skill_capability_denied = ToolResult::ok(json!({"main": true}));
     runtime
         .add_requested_context_projection(
-            &mut skill_surface_denied,
+            &mut skill_capability_denied,
             &["skills.catalog".to_string()],
             Some(&project),
             Some(&full),
@@ -783,14 +777,14 @@ async fn context_material_registry_enforces_scope_and_surface_before_provider() 
         )
         .await;
     assert_eq!(
-        skill_surface_denied.output["context_projection"]["materials"][0]["reason_code"],
+        skill_capability_denied.output["context_projection"]["materials"][0]["reason_code"],
         "context_material_surface_unavailable"
     );
 
-    let mut memory_surface_denied = ToolResult::ok(json!({"main": true}));
+    let mut memory_capability_denied = ToolResult::ok(json!({"main": true}));
     runtime
         .add_requested_context_projection(
-            &mut memory_surface_denied,
+            &mut memory_capability_denied,
             &["memory.bootstrap".to_string()],
             Some(&project),
             Some(&read_memory),
@@ -798,7 +792,7 @@ async fn context_material_registry_enforces_scope_and_surface_before_provider() 
         )
         .await;
     assert_eq!(
-        memory_surface_denied.output["context_projection"]["materials"][0]["reason_code"],
+        memory_capability_denied.output["context_projection"]["materials"][0]["reason_code"],
         "context_material_surface_unavailable"
     );
 
@@ -845,47 +839,29 @@ async fn memory_bootstrap_is_explicit_and_never_inferred_from_session_ack_recove
     );
     let session = runtime.sessions.start_session(
         Some(project_id.clone()),
-        Some("memory ACK separation".to_string()),
+        Some("memory sidecar isolation".to_string()),
     );
 
-    let missing_ack = list_files_with_session_context(
+    let ordinary = list_files_with_session_context(
         &runtime,
         "memory-ack",
         &project_id,
         &session.session_id,
-        None,
         Vec::new(),
     )
     .await;
-    assert!(missing_ack.success);
-    assert!(missing_ack.output.get("session_context_revision").is_none());
-    assert!(missing_ack.output.get("session_continuity").is_none());
-    assert!(missing_ack.output.get("session_recovery").is_none());
-    assert!(missing_ack.output.get("context_projection").is_none());
-    assert!(!missing_ack.output.to_string().contains(private_summary));
-
-    let exact = list_files_with_session_context(
-        &runtime,
-        "memory-ack",
-        &project_id,
-        &session.session_id,
-        Some(0),
-        Vec::new(),
-    )
-    .await;
-    assert!(exact.success);
-    assert!(exact.output.get("session_context_revision").is_none());
-    assert!(exact.output.get("session_continuity").is_none());
-    assert!(exact.output.get("session_recovery").is_none());
-    assert!(exact.output.get("context_projection").is_none());
-    assert!(!exact.output.to_string().contains(private_summary));
+    assert!(ordinary.success);
+    assert!(ordinary.output.get("session_context_revision").is_none());
+    assert!(ordinary.output.get("session_continuity").is_none());
+    assert!(ordinary.output.get("session_recovery").is_none());
+    assert!(ordinary.output.get("context_projection").is_none());
+    assert!(!ordinary.output.to_string().contains(private_summary));
 
     let explicit = list_files_with_session_context(
         &runtime,
         "memory-ack",
         &project_id,
         &session.session_id,
-        Some(0),
         vec!["memory.bootstrap"],
     )
     .await;
@@ -898,8 +874,12 @@ async fn memory_bootstrap_is_explicit_and_never_inferred_from_session_ack_recove
         .unwrap();
     assert_eq!(material["status"], "available");
     assert!(material.to_string().contains(private_summary));
-    assert!(!explicit.output["session_recovery"]
-        .to_string()
+    let ledger = runtime
+        .sessions
+        .summary(&session.session_id, Some(100))
+        .unwrap();
+    assert!(!serde_json::to_string(&ledger)
+        .unwrap()
         .contains(private_summary));
 }
 

@@ -26,7 +26,13 @@ pub const DEFAULT_OBSERVE_JOBS_TAIL_LINES: usize = 40;
 /// This is intentionally separate from execution timeouts and initial
 /// synchronous handoff grace budgets.
 pub const MAX_JOB_OBSERVATION_WAIT_SECS: u64 = 100;
-pub const STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS: u64 = 60;
+/// Model-facing continuation wait kept below common MCP Host call deadlines.
+/// Runtime still accepts waits up to MAX_JOB_OBSERVATION_WAIT_SECS.
+pub const MODEL_JOB_CONTINUATION_WAIT_SECS: u64 = 55;
+/// Keep initial structured-execution handoff grace under the same Host-safe
+/// model-facing wait budget. This does not shorten the execution timeout; work
+/// past this grace continues as the same durable Job.
+pub const STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS: u64 = MODEL_JOB_CONTINUATION_WAIT_SECS;
 
 pub const MAX_SKILL_LIST_LIMIT: usize = 64;
 pub const MAX_SKILL_QUERY_CHARS: usize = 200;
@@ -131,7 +137,7 @@ impl ContinuationSemantics {
 }
 
 pub const BUILTIN_CODING_WORKFLOW_CONTRACT: &str = "webcodex.coding_workflow";
-pub const BUILTIN_CODING_WORKFLOW_VERSION: u64 = 11;
+pub const BUILTIN_CODING_WORKFLOW_VERSION: u64 = 20;
 pub const BUILTIN_CODING_WORKFLOW_MAX_GUIDANCE_ITEMS: usize = 8;
 
 /// Validate a Runner project path without applying host-local filesystem semantics.

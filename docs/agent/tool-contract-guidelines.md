@@ -19,6 +19,32 @@ belongs so those boundaries do not leak into unrelated mechanical friction.
 
 ## 1. Spend turns on meaning, not syntax
 
+### Bounded bulk exact edits
+
+For repetitive mechanical changes in an explicit file, `apply_text_edits` accepts
+`replace_exact` with `expected_match_count=N` (1..=1024) and a current
+`expected_read_revision`. The Runner replaces every fully contained exact match
+only when the observed count equals N. `occurrence` selects one match and cannot
+be combined with this field; `line_scope` may narrow the counted matches. The
+Runner plans every source range against one original snapshot, checks overlaps
+across the whole file change, and applies the transaction only after every file
+has passed preflight. A count mismatch writes nothing.
+The additive Runner capability is `apply_text_edit_expected_match_count`.
+Servers reject bulk requests before dispatch to an older Runner that lacks it;
+requests without the field keep their existing admission and unique-match behavior.
+
+For nontrivial bulk changes, read the file and revision, optionally call
+`apply_text_edits(dry_run=true)`, inspect the bounded `match_count` and
+`match_ranges`, then send an independent actual request with the still-valid
+guard. The actual request resolves all matches and fences again. A simple,
+obvious bulk edit may be applied directly. Dry-run creates no future mutation
+authority. The compact success `change_summary` reports counts; use
+`show_changes`, `git_diff_hunks`, or `git_review_summary` for semantic review.
+
+Use this exact cardinality contract for known repeated fixtures or struct
+literals instead of an ad-hoc Python or sed global rewrite. It does not infer
+the count, choose an occurrence, use regex, or expand across a glob.
+
 A tool should reject an input when the model must make a new semantic decision.
 If WebCodex already knows the only safe interpretation, prefer deterministic
 normalization and continue the requested work.
@@ -68,7 +94,12 @@ to be needed, tightly related, and an existing primitive naturally supports the
 batch. Examples include several related `read_files` ranges, independent search
 queries, or a short bounded `run_shell` chain of predetermined observations.
 Result-dependent follow-ups stay sequential so the next call can incorporate the
-new evidence. Do not preload unrelated data or combine permission, mutation,
+new evidence. In direct strategy the model chooses each follow-up across calls;
+with explicitly selected Code Mode guidance, an admitted read-only cell can inspect
+results and perform dependent follow-ups sequentially inside the same cell. Only
+independent observations run concurrently. Keep intermediate child results inside
+the cell and project compact decision evidence before `text(...)`; batching raw
+results into one output does not save model context. Do not preload unrelated data or combine permission, mutation,
 validation, commit, publish, deploy, or restart boundaries merely to reduce call
 count.
 
@@ -77,11 +108,24 @@ bounded targeted reads and related-range batching. Broad discovery should prefer
 files/count/small low-context search projections followed by targeted reads.
 `run_process` remains the natural path for one native executable with literal
 argv; `run_shell` is first-class for shell grammar or a short tightly related
-chain, and a bounded deterministic Python heredoc is appropriate when one small
-program expresses one coherent transformation more reliably than many mechanical
-edits. None of these rules means “shell first” or weakens specialized semantics.
+chain, while `run_script(language=python)` carries a program-like Python body as
+typed data. A bounded Python heredoc remains possible for special shell
+composition. None of these rules means “shell first” or weakens specialized semantics.
 
 ## 2. Mechanical repair should be server-owned
+
+Current execution-input compatibility is deliberately narrow:
+
+| Model input | Canonical interpretation | Condition |
+|---|---|---|
+| `run_process.argv`, `run_detached_process.argv` | `args` | If `args` is also present, values must be identical. |
+| `run_process` with exact `sh -c` or `bash -c` argv | `run_shell` with explicit `shell` | Runtime proves the request is lossless and the canonical shell path passes authority, policy, and capability gates. |
+| `run_process` with exact `bash -lc` argv | `run_shell(shell=bash, login=true)` | Same proof and Bash-login capability gate. |
+
+`run_script(language=python)` is canonical; `python3` is not a language alias.
+Unknown spellings such as `timeout`, `workdir`, `command_args`, and
+`command` for `script` still fail closed. Successful normalization returns a
+short `input_normalization` code and hint without replaying the raw payload.
 
 Do not spend a model turn on a repair WebCodex can prove locally.
 
@@ -130,6 +174,12 @@ During active development, a cleaner canonical tool shape is preferred over
 preserving an unused historical shape. Durable persisted truth, mixed-version
 Server/Runner protocol, published artifacts, and named external consumers are
 separate compatibility domains and must be handled explicitly.
+
+### Project selectors: canonical identity, short model reference
+
+Runtime Project identity remains canonical as `agent:<client_id>:<project_id>`. Keep that form for authorization, persistence, audit, Runner routing, diagnostics and explicit API/CLI addressing. A Server-issued `project_ref` is a model-facing selector only: the Server owns a durable mapping scoped to the authenticated caller and pins it to one canonical Project incarnation, including stable root identity. The model may reuse the short ref across windows for the same principal, but no Workflow Session, ClientWindow, MCP session, transport connection, recent activity or Host rewrite participates.
+
+Resolving a `project_ref` must always look up the pinned canonical identity and then run the ordinary current Project resolution/authorization path again. The ref is not a credential, bearer token or capability. If the canonical Project disappears, becomes invisible, loses stable identity, or the same canonical address is later registered for a different root, the old ref fails closed. Never recycle or silently retarget an issued ref. Discovery/bootstrap may expose both `project_ref` and canonical identity; ordinary hot-path results should not repeat them when no model decision depends on that duplication.
 
 ### Model-projection deletion test
 
@@ -218,8 +268,8 @@ secondary to the tool result.
 This is a presentation/projection rule, not permission to weaken the underlying
 protocol. In particular:
 
-- missing Context ACK may return explicit recovery guidance;
-- the Host must not invent or automatically inject an ACK on WebCodex's behalf;
+- missing task context is recovered explicitly with `session_handoff_summary`;
+- collaboration ACKs require request-scoped retained-message proof;
 - a ClientWindow must not select a Workflow Session;
 - support metadata must not become execution authority.
 
@@ -245,7 +295,7 @@ Keep these concepts distinct:
 - **refine** — issue a new observation with changed bounded parameters, such as a
   larger result or hunk limit;
 - **recovery** — repair a failed/lost/invalid state using domain-proven evidence;
-- **checkpoint/ACK** — model-context coherence; not a cursor and not authority.
+- **collaboration ACK** — request-scoped retained-message proof; not a cursor or authority.
 
 Do not advertise a continuation that cannot recover the omitted information. Do
 not turn `outcome_unknown` into retry permission. Do not create a universal cursor

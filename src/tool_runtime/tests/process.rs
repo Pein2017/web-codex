@@ -1,5 +1,386 @@
 //! Model-facing structured process execution contract.
 
+#[tokio::test]
+async fn run_process_alias_binds_canonical_runtime_project_id_in_recovery_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let client_id = "process-alias-recovery-context";
+    let canonical = register_process_job_agent(&runtime, client_id, temp.path()).await;
+    let auth = auth_context(None, true);
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(process_call("demo".to_string(), None), Some(&auth))
+                .await
+        }
+    });
+    let request = wait_for_patch_agent_request(&runtime, client_id).await;
+    assert_eq!(
+        request
+            .job_context
+            .as_ref()
+            .and_then(|context| context.runtime_project_id.as_deref()),
+        Some(canonical.as_str()),
+        "execution recovery metadata must use the canonical runtime project id"
+    );
+    update_process_job(
+        &runtime,
+        client_id,
+        &request,
+        "completed",
+        Some(ShellCommandExecutionState::Completed),
+        Some(0),
+        Some("stdout"),
+        Some(""),
+        None,
+    )
+    .await;
+    let result = task.await.unwrap();
+    assert!(result.success, "{}", result.output);
+}
+
+#[tokio::test]
+async fn run_process_alias_and_canonical_share_session_fence_before_start() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let client_id = "process-alias-session-fence";
+    let canonical = register_process_agent(&runtime, client_id, temp.path(), true).await;
+    let session = runtime
+        .sessions
+        .start_session(Some(canonical.clone()), None);
+    let auth = auth_context(None, true);
+    for project in ["demo".to_string(), canonical.clone()] {
+        let task = tokio::spawn({
+            let runtime = runtime.clone();
+            let auth = auth.clone();
+            let session_id = session.session_id.clone();
+            async move {
+                runtime
+                    .dispatch_with_auth(process_sync_call(project, Some(session_id)), Some(&auth))
+                    .await
+            }
+        });
+        let request = wait_for_patch_agent_request(&runtime, client_id).await;
+        complete_process_lifecycle(
+            &runtime,
+            client_id,
+            request.request_id,
+            ShellCommandExecutionState::Completed,
+            Some(0),
+            "",
+            "",
+            None,
+        )
+        .await;
+        assert!(task.await.unwrap().success);
+    }
+    let other = runtime
+        .sessions
+        .start_session(Some("agent:other:demo".to_string()), None);
+    for (project, failure_kind) in [
+        ("demo".to_string(), "unknown_project"),
+        (canonical, "unknown_project"),
+    ] {
+        let denied = runtime
+            .dispatch_with_auth(
+                process_sync_call(project, Some(other.session_id.clone())),
+                Some(&auth),
+            )
+            .await;
+        assert!(!denied.success);
+        assert_eq!(denied.output["failure_kind"], failure_kind);
+        assert_eq!(denied.output["command_started"], false);
+        assert!(probe_patch_agent_request(&runtime, client_id)
+            .await
+            .is_none());
+    }
+}
+
+#[tokio::test]
+async fn kernel_records_completed_pytest_counts_before_compacting_public_success() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let client_id = "process-pytest-canonical-ledger";
+    let project = register_process_agent(&runtime, client_id, temp.path(), true).await;
+    let session = runtime.sessions.start_session(Some(project.clone()), None);
+    let session_id = session.session_id;
+    let auth = auth_context(None, true);
+
+    let request_task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let session_id = session_id.clone();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .call_tool_with_context(
+                    ToolCallRequest {
+                        tool_name: "run_process".to_string(),
+                        arguments: json!({
+                            "project": project,
+                            "executable": "python3",
+                            "args": ["-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests/test_workflow.py"],
+                            "purpose": "test",
+                            "timeout_secs": 30,
+                            "sync_wait_secs": 30,
+                            "assertion_name": "kernel-pytest-success"
+                        }),
+                    },
+                    ToolCallContext {
+                        transport: ToolTransport::Mcp,
+                        session_id: Some(&session_id),
+                        auth: Some(&auth),
+                        window: None,
+                        record_oauth_scope_denials: true,
+                        host_file_import_trust:
+                            crate::tool_runtime::kernel::HostFileImportTrust::Untrusted,
+                    },
+                )
+                .await
+        }
+    });
+    let request = wait_for_patch_agent_request(&runtime, client_id).await;
+    assert_eq!(request.kind, "run_process");
+    complete_process_lifecycle(
+        &runtime,
+        client_id,
+        request.request_id,
+        ShellCommandExecutionState::Completed,
+        Some(0),
+        &format!("{}\n. [100%]\n1 passed in 0.01s\n", "progress ".repeat(140)),
+        "",
+        None,
+    )
+    .await;
+    let outcome = request_task.await.unwrap();
+    assert!(outcome.success);
+    let result = outcome.result.expect("model-facing result");
+    assert_eq!(result.output["tests_detected"], true);
+    assert_eq!(result.output["tests_run_count"], 1);
+    assert_eq!(result.output["tests_passed"], 1);
+    assert_eq!(result.output["tests_failed"], 0);
+    assert!(result.output.get("execution_state").is_none());
+    assert!(result.output.get("exit_code").is_none());
+
+    let validation = runtime
+        .validation_summary_tool(project, session_id, Some(20), Some(&auth))
+        .await;
+    assert!(validation.success, "{}", validation.output);
+    let event = validation.output["validation"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["assertion_name"] == "kernel-pytest-success")
+        .expect("correlated pytest validation event");
+    assert_eq!(event["success"], true);
+    assert_eq!(event["validation_passed"], true);
+    assert_eq!(
+        event["tests_detected"], true,
+        "selected fixture event: {event}"
+    );
+    assert_eq!(event["tests_run_count"], 1);
+    assert_eq!(event["tests_passed"], 1);
+    assert_eq!(event["tests_failed"], 0);
+    assert_eq!(event["zero_tests_run"], false);
+    assert_eq!(
+        validation.output["validation"]["status"], "passed",
+        "{}",
+        validation.output
+    );
+}
+
+#[tokio::test]
+async fn pytest_typed_process_counts_preserve_failure_and_reject_spoofed_or_truncated_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let client_id = "pytest-process-count-boundary";
+    let project = register_process_agent(&runtime, client_id, temp.path(), true).await;
+    for (pytest, exit_code, truncated, stdout, expected_count) in [
+        (
+            true,
+            1,
+            false,
+            "2 passed, 1 failed, 1 skipped, 1 error in 0.12s",
+            Some(3),
+        ),
+        (true, 0, true, "2 passed in 0.12s", None),
+        (true, 0, false, "2 passed in bad", None),
+        (true, 0, false, "2 xpassed, 1 failed in 0.12s", None),
+        (true, 0, false, "2 skipped in 0.12s", None),
+        (false, 0, false, "2 passed in 0.12s", None),
+    ] {
+        let mut call = process_sync_call(project.clone(), None);
+        let ToolCall::RunProcess {
+            executable,
+            args,
+            stdin,
+            purpose,
+            ..
+        } = &mut call
+        else {
+            unreachable!()
+        };
+        *executable = "python3".to_string();
+        *args = if pytest {
+            vec!["-m".to_string(), "pytest".to_string(), "-q".to_string()]
+        } else {
+            vec!["-c".to_string(), "print('2 passed in 0.12s')".to_string()]
+        };
+        *stdin = None;
+        *purpose = Some(ExecutionPurpose::Test);
+        let (task, request) =
+            dispatch_process_until_request(&runtime, client_id, call, auth_context(None, true))
+                .await;
+        runtime
+            .runner_registry
+            .complete(RunnerResultPayload {
+                result: RunnerResultRequest {
+                    client_id: client_id.to_string(),
+                    runner_instance_id: "inst".to_string(),
+                    request_id: request.request_id,
+                    exit_code: Some(exit_code),
+                    stdout: Some(stdout.to_string()),
+                    stderr: Some(String::new()),
+                    stdout_truncated: truncated,
+                    stderr_truncated: false,
+                    duration_ms: Some(7),
+                    error: None,
+                },
+                command_execution_state: Some(ShellCommandExecutionState::Completed),
+                mcp_gateway: None,
+                plugin_gateway: None,
+                coding_agent: None,
+            })
+            .await
+            .unwrap();
+        let result = task.await.unwrap();
+        assert_eq!(result.success, exit_code == 0, "{}", result.output);
+        assert_eq!(
+            result.output["tests_run_count"].as_u64(),
+            expected_count,
+            "{}",
+            result.output
+        );
+        if exit_code != 0 {
+            assert_eq!(result.output["exit_code"], exit_code);
+            assert_eq!(result.output["execution_state"], "completed");
+            assert_eq!(result.output["tests_passed"], 2);
+            assert_eq!(result.output["tests_failed"], 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn admitted_pytest_job_keeps_counts_in_native_assertion_terminal_ledger() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime().with_structured_execution_sync_wait(Duration::from_millis(40));
+    let client_id = "pytest-native-job-ledger";
+    let project = register_process_job_agent(&runtime, client_id, temp.path()).await;
+    let session = runtime.sessions.start_session(Some(project.clone()), None);
+    let auth = auth_context(None, true);
+    let (call, metadata) = crate::tool_runtime::parse_tool_call_with_recorder_metadata(
+        "run_process",
+        json!({
+            "project": "demo", "executable": "python3", "args": ["-B", "-m", "pytest", "-q"],
+            "purpose": "test", "session_id": session.session_id, "timeout_secs": 30,
+            "assertion_name": "async pytest check"
+        }),
+    )
+    .unwrap();
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .dispatch_with_auth_transport_options_and_metadata(
+                    call,
+                    Some(&auth),
+                    sessions::SessionTransport::Mcp,
+                    metadata,
+                )
+                .await
+        }
+    });
+    let request = wait_for_patch_agent_request(&runtime, client_id).await;
+    let context = request.job_context.as_ref().unwrap();
+    assert_eq!(
+        context.runtime_project_id.as_deref(),
+        Some(project.as_str())
+    );
+    assert!(context.structured_execution.as_ref().unwrap().pytest);
+    let restored: crate::runner_protocol::RunnerRequest =
+        serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+    assert!(
+        restored
+            .job_context
+            .as_ref()
+            .unwrap()
+            .structured_execution
+            .as_ref()
+            .unwrap()
+            .pytest
+    );
+    restored.decode_operation().unwrap();
+    update_process_job(
+        &runtime,
+        client_id,
+        &request,
+        "running",
+        None,
+        None,
+        Some("... [100%]\n"),
+        None,
+        None,
+    )
+    .await;
+    let handoff = task.await.unwrap();
+    assert!(handoff.success, "{}", handoff.output);
+    assert!(handoff.output.get("job_id").is_some());
+    update_process_job(
+        &runtime,
+        client_id,
+        &request,
+        "completed",
+        Some(ShellCommandExecutionState::Completed),
+        Some(0),
+        Some("2 passed, 1 skipped in 0.12s\n"),
+        None,
+        None,
+    )
+    .await;
+    let log = runtime
+        .job_log_for_auth(
+            request.job_id.clone().unwrap(),
+            None,
+            Some(200),
+            Some(&auth),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(
+        log.output["detected_summary"]["tests_run_count"], 2,
+        "{}",
+        log.output
+    );
+    let validation = runtime
+        .validation_summary_tool(project, session.session_id, Some(20), Some(&auth))
+        .await;
+    assert!(validation.success, "{}", validation.output);
+    let event = validation.output["validation"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["assertion_name"] == "async pytest check")
+        .unwrap();
+    assert_eq!(event["tests_run_count"], 2, "{event}");
+    assert_eq!(event["tests_passed"], 2);
+    assert_eq!(event["tests_failed"], 0);
+    assert_eq!(event["validation_passed"], true);
+}
+
 use super::super::*;
 use super::support::*;
 use crate::runner_protocol::{
@@ -174,8 +555,6 @@ async fn update_process_job(
             status: status.to_string(),
             stdout_chunk: stdout.map(str::to_string),
             stderr_chunk: stderr.map(str::to_string),
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code,
             duration_ms: state.map(|_| 25),
@@ -251,7 +630,8 @@ async fn dispatch_typed_process_until_request(
     crate::runner_protocol::RunnerRequest,
 ) {
     let (call, metadata) =
-        ToolCall::from_tool_name_with_recorder_metadata("run_process", arguments).unwrap();
+        crate::tool_runtime::parse_tool_call_with_recorder_metadata("run_process", arguments)
+            .unwrap();
     let task = tokio::spawn({
         let runtime = runtime.clone();
         async move {
@@ -278,6 +658,63 @@ fn typed_process_arguments(project: &str) -> serde_json::Value {
         "sync_wait_secs": 30,
         "purpose": "diagnostic"
     })
+}
+
+#[tokio::test]
+async fn model_argv_alias_executes_canonical_process_and_returns_success_hint() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let project = register_process_agent(&runtime, "process-alias", temp.path(), true).await;
+    let auth = auth_context(None, true);
+    let runtime_copy = runtime.clone();
+    let task = tokio::spawn(async move {
+        runtime_copy
+            .call_tool_with_context(
+                ToolCallRequest {
+                    tool_name: "run_process".to_string(),
+                    arguments: json!({
+                        "project":project, "executable":"argv-helper", "argv":["status"],
+                        "timeout_secs":30, "sync_wait_secs":30
+                    }),
+                },
+                ToolCallContext {
+                    transport: ToolTransport::Api,
+                    session_id: None,
+                    auth: Some(&auth),
+                    window: None,
+                    record_oauth_scope_denials: true,
+                    host_file_import_trust:
+                        crate::tool_runtime::kernel::HostFileImportTrust::Untrusted,
+                },
+            )
+            .await
+    });
+    let request = wait_for_patch_agent_request(&runtime, "process-alias").await;
+    assert_eq!(request.kind, "run_process");
+    assert_eq!(request.process.as_ref().unwrap().args, ["status"]);
+    let wire = serde_json::to_value(&request).unwrap();
+    assert!(wire.get("argv").is_none());
+    assert!(wire["process"].get("argv").is_none());
+    complete_process_lifecycle(
+        &runtime,
+        "process-alias",
+        request.request_id,
+        ShellCommandExecutionState::Completed,
+        Some(0),
+        "ok",
+        "",
+        None,
+    )
+    .await;
+    let outcome = task.await.unwrap();
+    let result = outcome.result.unwrap();
+    assert!(result.success, "{result:?}");
+    assert_eq!(
+        result.output["input_normalization"],
+        json!({
+            "code":"argv_to_args", "hint":"normalized argv→args"
+        })
+    );
 }
 
 #[tokio::test]
@@ -515,132 +952,6 @@ async fn run_process_enqueues_only_typed_argv_and_reports_completed_exit_codes()
             assert_eq!(result.output["purpose"], "diagnostic");
         }
     }
-}
-
-#[tokio::test]
-async fn run_process_alias_binds_canonical_runtime_project_id_in_recovery_context() {
-    let temp = tempfile::tempdir().unwrap();
-    let runtime = test_runtime();
-    let client_id = "process-alias-recovery-context";
-    let canonical = register_process_job_agent(&runtime, client_id, temp.path()).await;
-    let auth = auth_context(None, true);
-
-    let task = tokio::spawn({
-        let runtime = runtime.clone();
-        async move {
-            runtime
-                .dispatch_with_auth(process_call("demo".to_string(), None), Some(&auth))
-                .await
-        }
-    });
-    let request = wait_for_patch_agent_request(&runtime, client_id).await;
-    assert_eq!(
-        request
-            .job_context
-            .as_ref()
-            .and_then(|context| context.runtime_project_id.as_deref()),
-        Some(canonical.as_str()),
-        "execution recovery metadata must use the canonical runtime project id"
-    );
-    update_process_job(
-        &runtime,
-        client_id,
-        &request,
-        "completed",
-        Some(ShellCommandExecutionState::Completed),
-        Some(0),
-        Some("stdout"),
-        Some(""),
-        None,
-    )
-    .await;
-    let result = task.await.unwrap();
-    assert!(result.success, "{}", result.output);
-}
-
-#[tokio::test]
-async fn kernel_records_completed_pytest_counts_before_compacting_public_success() {
-    let temp = tempfile::tempdir().unwrap();
-    let runtime = test_runtime();
-    let client_id = "process-pytest-canonical-ledger";
-    let project = register_process_agent(&runtime, client_id, temp.path(), true).await;
-    let session = runtime.sessions.start_session(Some(project.clone()), None);
-    let session_id = session.session_id;
-    let auth = auth_context(None, true);
-
-    let request_task = tokio::spawn({
-        let runtime = runtime.clone();
-        let project = project.clone();
-        let session_id = session_id.clone();
-        let auth = auth.clone();
-        async move {
-            runtime
-                .call_tool_with_context(
-                    ToolCallRequest {
-                        tool_name: "run_process".to_string(),
-                        arguments: json!({
-                            "project": project,
-                            "executable": "python3",
-                            "args": ["-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests/test_workflow.py"],
-                            "purpose": "test",
-                            "timeout_secs": 30,
-                            "sync_wait_secs": 30,
-                            "assertion_name": "kernel-pytest-success"
-                        }),
-                    },
-                    ToolCallContext {
-                        transport: ToolTransport::Mcp,
-                        session_id: Some(&session_id),
-                        auth: Some(&auth),
-                        window: None,
-                        record_oauth_scope_denials: true,
-                        host_file_import_trust:
-                            crate::tool_runtime::kernel::HostFileImportTrust::Untrusted,
-                    },
-                )
-                .await
-        }
-    });
-    let request = wait_for_patch_agent_request(&runtime, client_id).await;
-    assert_eq!(request.kind, "run_process");
-    complete_process_lifecycle(
-        &runtime,
-        client_id,
-        request.request_id,
-        ShellCommandExecutionState::Completed,
-        Some(0),
-        ". [100%]\n1 passed in 0.01s\n",
-        "",
-        None,
-    )
-    .await;
-    let outcome = request_task.await.unwrap();
-    assert!(outcome.success);
-    let result = outcome.result.expect("model-facing result");
-    assert_eq!(result.output["tests_detected"], true);
-    assert_eq!(result.output["tests_run_count"], 1);
-    assert_eq!(result.output["tests_passed"], 1);
-    assert_eq!(result.output["tests_failed"], 0);
-    assert!(result.output.get("execution_state").is_none());
-    assert!(result.output.get("exit_code").is_none());
-
-    let validation = runtime
-        .validation_summary_tool(project, session_id, Some(20), Some(&auth))
-        .await;
-    assert!(validation.success, "{}", validation.output);
-    let event = validation.output["validation"]["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|event| event["assertion_name"] == "kernel-pytest-success")
-        .expect("correlated pytest validation event");
-    assert_eq!(event["success"], true);
-    assert_eq!(event["validation_passed"], true);
-    assert_eq!(event["tests_detected"], true);
-    assert_eq!(event["tests_run_count"], 1);
-    assert_eq!(event["tests_passed"], 1);
-    assert_eq!(event["tests_failed"], 0);
-    assert_eq!(event["zero_tests_run"], false);
 }
 
 #[tokio::test]
@@ -1481,7 +1792,7 @@ async fn run_process_fast_prestart_rejection_retains_not_started_through_the_hid
 }
 
 #[tokio::test]
-async fn run_process_slow_handoff_is_queryable_once_and_keeps_the_original_budget() {
+async fn run_process_six_hour_handoff_is_queryable_once_and_keeps_the_original_budget() {
     let temp = tempfile::tempdir().unwrap();
     let runtime = test_runtime().with_structured_execution_sync_wait(Duration::from_millis(40));
     let project = register_process_job_agent(&runtime, "process-slow-job", temp.path()).await;
@@ -1500,7 +1811,7 @@ async fn run_process_slow_handoff_is_queryable_once_and_keeps_the_original_budge
             ],
             stdin: Some("input\n".to_string()),
             session_id: None,
-            timeout_secs: Some(121),
+            timeout_secs: Some(21_600),
             sync_wait_secs: Some(45),
             cwd: None,
             purpose: Some(ExecutionPurpose::Diagnostic),
@@ -1512,7 +1823,7 @@ async fn run_process_slow_handoff_is_queryable_once_and_keeps_the_original_budge
     assert_eq!(request.command, "");
     assert!(request.process.is_some());
     assert!(request.script.is_none());
-    assert_eq!(request.timeout_secs, 121);
+    assert_eq!(request.timeout_secs, 21_600);
     update_process_job(
         &runtime,
         "process-slow-job",
@@ -1534,7 +1845,7 @@ async fn run_process_slow_handoff_is_queryable_once_and_keeps_the_original_budge
     assert_eq!(handoff.output["execution_state"], "running");
     assert_eq!(handoff.output["command_started"], true);
     assert_eq!(handoff.output["command_completed"], false);
-    assert_eq!(handoff.output["effective_timeout_secs"], 121);
+    assert_eq!(handoff.output["effective_timeout_secs"], 21_600);
     assert_eq!(handoff.output["sync_wait_secs"], 45);
     assert_eq!(
         handoff.output["stdout_tail"],
@@ -2138,7 +2449,7 @@ async fn run_process_named_ssh_resource_fails_before_enqueue() {
 
     let result = runtime
         .dispatch_with_auth(
-            process_call(project, Some(session.session_id)),
+            process_call(project, Some(session.session_id.clone())),
             Some(&auth_context(None, true)),
         )
         .await;
@@ -2151,6 +2462,26 @@ async fn run_process_named_ssh_resource_fails_before_enqueue() {
     assert_eq!(result.output["error_kind"], "unsupported_resource");
     assert_eq!(result.output["recovery_kind"], "fix_input");
     assert!(result.output.get("recovery_tool").is_none());
+    assert!(probe_patch_agent_request(&runtime, "process-ssh")
+        .await
+        .is_none());
+
+    let shell_form = ToolCall::RunProcess {
+        project: runner_project_runtime_id("process-ssh", "demo"),
+        executable: "bash".to_string(),
+        args: vec!["-c".to_string(), "printf unsafe".to_string()],
+        stdin: None,
+        session_id: Some(session.session_id),
+        timeout_secs: Some(30),
+        sync_wait_secs: Some(30),
+        cwd: None,
+        purpose: None,
+    };
+    let denied = runtime
+        .dispatch_with_auth(shell_form, Some(&auth_context(None, true)))
+        .await;
+    assert!(!denied.success);
+    assert_eq!(denied.output["execution_state"], "not_started");
     assert!(probe_patch_agent_request(&runtime, "process-ssh")
         .await
         .is_none());
@@ -2377,4 +2708,268 @@ async fn model_facing_session_denials_keep_run_process_prestart_lifecycle() {
             .is_none(),
         "model-facing Session denials must happen before Runner enqueue"
     );
+}
+
+#[tokio::test]
+async fn run_process_shell_command_mode_recovery_is_lossless_parser_ready_and_prestart() {
+    use crate::runner_protocol::{RunnerPolicySummary, ShellProfilesSummary};
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let client = "shell-recovery";
+    let project = runner_project_runtime_id(client, "demo");
+    let auth = bootstrap_auth_context();
+    for (dialect, available_dialects) in [
+        (
+            Some("powershell"),
+            Some(vec!["sh".to_string(), "bash".to_string()]),
+        ),
+        (Some("custom"), Some(vec!["sh".to_string()])),
+        (Some("bash"), None),
+    ] {
+        let expected_available_dialects = available_dialects.clone();
+        register_agent_with_shell_profiles(
+            &runtime,
+            client,
+            Some(RunnerPolicySummary {
+                shell_profiles: Some(ShellProfilesSummary {
+                    default_profile: None,
+                    configured_count: 0,
+                    prepared_cache_count: 0,
+                    profiles: vec![],
+                    default_dialect: dialect.map(str::to_string),
+                    available_dialects,
+                }),
+                ..Default::default()
+            }),
+            vec![registered_project("demo", &temp.path().to_string_lossy())],
+        )
+        .await;
+        for (shell, args, extra, convertible) in [
+            (
+                "sh",
+                json!(["-c", "printf '%s' '雪 $HOME'\nprintf done"]),
+                json!({}),
+                true,
+            ),
+            (
+                "bash",
+                json!(["-c", "printf '%s' 'a b'"]),
+                json!({"result_expectation":"success"}),
+                true,
+            ),
+            ("bash", json!(["-lc", "echo login"]), json!({}), true),
+            (
+                "bash",
+                json!(["-c", "echo $0", "custom-zero"]),
+                json!({}),
+                false,
+            ),
+            ("bash", json!(["-c", "cat"]), json!({"stdin":""}), false),
+            (
+                "bash",
+                json!(["-c", "echo hello"]),
+                json!({"cwd":"bad\0cwd"}),
+                false,
+            ),
+            (
+                "bash",
+                json!(["-c", "exit 1"]),
+                json!({"accepted_exit_codes":[0,1]}),
+                false,
+            ),
+            (
+                "bash",
+                json!(["-c", "exit 1"]),
+                json!({"result_expectation":"failure"}),
+                false,
+            ),
+            (
+                "bash",
+                json!(["-c", "exit 1"]),
+                json!({"result_expectation":"observe"}),
+                false,
+            ),
+            (
+                "powershell",
+                json!(["-Command", "echo hello"]),
+                json!({}),
+                false,
+            ),
+            ("cmd", json!(["/c", "echo hello"]), json!({}), false),
+            ("/bin/bash", json!(["-c", "echo hello"]), json!({}), false),
+            (
+                "bash",
+                json!([
+                    "-c",
+                    "x".repeat(crate::runner_protocol::RAW_SHELL_COMMAND_MAX_BYTES + 1)
+                ]),
+                json!({}),
+                false,
+            ),
+        ] {
+            let session = runtime.sessions.start_session(Some(project.clone()), None);
+            let mut arguments = json!({"project":project, "executable":shell, "args":args,
+                "session_id":session.session_id, "cwd":".", "timeout_secs":30, "sync_wait_secs":30,
+                "purpose":"test", "assertion_name":"shell recovery"});
+            arguments
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let (call, metadata) = crate::tool_runtime::parse_tool_call_with_recorder_metadata(
+                "run_process",
+                arguments.clone(),
+            )
+            .unwrap();
+            let recovery_available = convertible
+                && expected_available_dialects
+                    .as_ref()
+                    .is_some_and(|dialects| dialects.iter().any(|dialect| dialect == shell));
+            let runtime_copy = runtime.clone();
+            let auth_copy = auth.clone();
+            let task = tokio::spawn(async move {
+                runtime_copy
+                    .dispatch_with_auth_transport_options_and_metadata(
+                        call,
+                        Some(&auth_copy),
+                        sessions::SessionTransport::Mcp,
+                        metadata,
+                    )
+                    .await
+            });
+            if recovery_available {
+                let request = wait_for_patch_agent_request(&runtime, client).await;
+                assert_eq!(request.kind, "run_shell");
+                assert!(
+                    request.process.is_none(),
+                    "native RunProcess must not start"
+                );
+                assert_eq!(request.shell.unwrap().as_str(), shell);
+                assert_eq!(request.login, args[0] == "-lc");
+                assert_eq!(request.command, args[1]);
+                complete_process_lifecycle(
+                    &runtime,
+                    client,
+                    request.request_id,
+                    ShellCommandExecutionState::Completed,
+                    Some(0),
+                    "ok",
+                    "",
+                    None,
+                )
+                .await;
+            }
+            let result = task.await.unwrap();
+            if recovery_available {
+                assert!(result.success, "{result:?}");
+                assert_eq!(result.output["requested_surface"], "run_process");
+                assert_eq!(result.output["execution_source"], "run_shell");
+                if args[0] == "-lc" {
+                    assert_eq!(result.output["shell"], "bash_login");
+                }
+                assert!(result.output["input_normalization"]["hint"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("normalized run_process"));
+            } else {
+                assert!(!result.success, "{result:?}");
+                assert_eq!(result.output["command_started"], false, "{result:?}");
+                assert_eq!(result.output["execution_state"], "not_started");
+                assert_eq!(result.output["failure_kind"], "invalid_arguments");
+            }
+            assert!(result.output.get("suggested_call").is_none());
+            let schema = crate::tool_runtime::registry::output_schema_for_tool("run_process");
+            crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+                &json!({
+                "success":result.success, "output":result.output, "error":result.error}),
+                &schema,
+            )
+            .unwrap();
+            assert!(probe_patch_agent_request(&runtime, client).await.is_none());
+            assert!(
+                runtime.runner_registry.list_jobs(None).await.is_empty(),
+                "no Job admitted"
+            );
+            assert_eq!(
+                std::fs::read_dir(temp.path()).unwrap().count(),
+                0,
+                "workspace state unchanged"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn shell_recovery_requires_raw_shell_policy_and_explicit_selection_capability() {
+    use crate::runner_protocol::{RunnerPolicySummary, ShellProfilesSummary};
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let client = "shell-recovery-gates";
+    let policy = |allow_raw_shell| RunnerPolicySummary {
+        allow_raw_shell,
+        shell_profiles: Some(ShellProfilesSummary {
+            default_profile: None,
+            configured_count: 0,
+            prepared_cache_count: 0,
+            profiles: vec![],
+            default_dialect: Some("bash".to_string()),
+            available_dialects: Some(vec!["bash".to_string()]),
+        }),
+        ..Default::default()
+    };
+    for (allow_raw_shell, explicit_shell_selection) in [(false, true), (true, false)] {
+        runtime
+            .runner_registry
+            .register(crate::runner_protocol::RunnerRegisterRequest {
+                process_started_at: None,
+                build: None,
+                job_concurrency_limit: None,
+                job_inventory: None,
+                coding_agent_providers: None,
+                coding_agent_inventory: None,
+                client_id: client.to_string(),
+                runner_instance_id: "inst".to_string(),
+                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+                display_name: None,
+                owner: None,
+                hostname: None,
+                host_context: None,
+                capabilities: crate::test_support::current_runner_capabilities(
+                    RunnerCapabilities {
+                        shell: true,
+                        structured_process_argv: true,
+                        explicit_shell_selection,
+                        bash_login_shell: true,
+                        ..Default::default()
+                    },
+                ),
+                policy: Some(policy(allow_raw_shell)),
+            })
+            .await
+            .unwrap();
+        crate::test_support::apply_project_inventory_snapshot(
+            &runtime.runner_registry,
+            client,
+            "inst",
+            vec![registered_project("demo", &temp.path().to_string_lossy())],
+        )
+        .await;
+        let call = ToolCall::RunProcess {
+            project: runner_project_runtime_id(client, "demo"),
+            executable: "bash".to_string(),
+            args: vec!["-c".to_string(), "printf unsafe".to_string()],
+            stdin: None,
+            session_id: None,
+            timeout_secs: Some(30),
+            sync_wait_secs: Some(30),
+            cwd: None,
+            purpose: None,
+        };
+        let result = runtime
+            .dispatch_with_auth(call, Some(&bootstrap_auth_context()))
+            .await;
+        assert!(!result.success, "{result:?}");
+        assert_eq!(result.output["execution_state"], "not_started");
+        assert!(result.output.get("input_normalization").is_none());
+        assert!(probe_patch_agent_request(&runtime, client).await.is_none());
+    }
 }

@@ -4,10 +4,10 @@
 
 Use GPT Actions when a Custom GPT needs the Server's OpenAPI compatibility integration. Use [MCP](MCP.md) when the client supports MCP directly; MCP remains the primary ChatGPT integration.
 
-The schema at `/openapi.json` depends on the Server mode:
+The schema at `/openapi.json` follows one canonical Adaptive Runtime routing policy:
 
-- a generic runtime Server projects the canonical Adaptive Runtime model surface;
-- a project-bound Connector Server projects its separate fourteen-capability Connector surface.
+- every runtime Server projects the canonical Adaptive Runtime model contract;
+- project-scoped `share` / `run` credentials restrict authority and visibility without defining another Action surface.
 
 ## Import the schema
 
@@ -35,7 +35,7 @@ ToolDefinition
 
 A tool marked Adaptive Direct is automatically a direct GPT Action unless its canonical definition explicitly declares that GPT Actions cannot represent its protocol semantics. Adding, removing, or re-ranking Adaptive Direct tools therefore updates GPT Actions automatically; there is no separate GPT Action rank or operation list.
 
-Direct operations use canonical snake_case names and canonical input contracts. Examples include `work_on_project`, `runtime_status`, `tool_manifest`, `search_project_texts`, `read_files`, `apply_text_edits`, `run_process`, `run_detached_process`, `run_shell`, `observe_jobs`, `list_jobs`, `cargo_check`, `cargo_test`, `git_review_summary`, `git_diff_hunks`, `show_changes`, `workspace_hygiene_check`, and `finish_coding_task` when those tools are currently Adaptive Direct.
+Direct operations use canonical snake_case names and canonical input contracts. Examples include `work_on_project`, `runtime_status`, `tool_manifest`, `search_project_texts`, `read_files`, `apply_text_edits`, `run_process`, `run_script`, `run_detached_process`, `run_shell`, `observe_jobs`, `list_jobs`, `cargo_check`, `cargo_test`, `git_review_summary`, `git_diff_hunks`, and `show_changes` when those tools are currently Adaptive Direct; the closeout helpers `workspace_hygiene_check` and `finish_coding_task` are model-visible gateway tools.
 
 Long-tail model-visible tools use the single gateway:
 
@@ -67,58 +67,24 @@ The Custom GPT importer also rejects OpenAPI schemas at 1 MB. WebCodex therefore
 
 `import_conversation_files_to_project` remains a direct generic Action when it is Adaptive Direct. ChatGPT supplies `openaiFileIdRefs`; the HTTP adapter converts the host's Action file-reference shape to the canonical internal shape and attaches private GPT Action host provenance. The model cannot set that provenance itself.
 
-MCP host-file import remains a separate trusted provenance path and still requires the configured trusted OAuth MCP client. The two provenance modes share canonical authorization but are not interchangeable.
+MCP host-file import remains a separate trusted provenance path. Normal network-accessible Servers require the configured trusted OAuth MCP client; an explicitly opted-in loopback-only OpenAI Secure Tunnel deployment may instead trust an allowed local tunnel credential (a normal user API token or the configured Server bootstrap credential used by the regular Desktop Tunnel). The Action and MCP provenance modes share canonical authorization but are not interchangeable.
 
-## Project-bound Connector Server
+## Project-scoped local `share` / `run`
 
-When the Server runs with project-bound Connector configuration, OpenAPI continues to be generated from the same fourteen capabilities as the canonical MCP Connector:
+A Server launched by `webcodex share` or `webcodex run` uses the same generic Adaptive Runtime OpenAPI projection as an ordinary Server. Project-scoped authentication limits the caller to its ProjectGrant; it does not switch schema generation to a separate Connector capability registry.
 
-```text
-task_start
-task_list
-task_resume
-files_list
-files_read
-files_search
-code_navigate
-edits_apply
-checks_run
-commands_run
-task_review
-task_cancel
-task_finish
-code_impact
-```
-
-The Connector already owns the project binding. Start with the Connector actions directly; do not perform broader runtime/project discovery first, and do not put Runner client IDs or runtime project IDs in the prompt.
-
-`task_start` accepts only `normal` (default) and `read_only`. `normal` performs writable work in a managed isolated Git worktree and fails closed if that workspace cannot be prepared; the model never writes the target checkout or accepts its own result. `read_only` permits analysis but rejects edits, commands, and checks.
-
-## Suggested Connector GPT instructions
+Suggested Custom GPT instructions can therefore use the canonical runtime workflow:
 
 ```text
-Use the configured WebCodex project.
-Start or continue each user instruction with task_start.
-Let task_start reuse the current project context; do not ask the user for IDs.
-Use task_list and task_resume only when WebCodex explicitly asks you to recover
-or continue an existing task.
-Use files_list to see what the project contains before guessing paths.
-Use files_read/files_search before edits_apply.
-Use code_navigate for read-only semantic status, symbols, definitions,
-references, diagnostics, and hover; provide only project-relative paths.
-Use code_impact for bounded incoming/outgoing call hierarchy and change-impact
-inspection; provide only a project-relative path and source position.
-Run checks_run before task_finish.
-Use task_review for execution progress and result review.
-Use commands_run only when structured capabilities are insufficient and
-approval is available.
-Never ask the user for internal WebCodex identifiers; use values returned by
-the tools when a later call needs one.
+Use work_on_project to establish the exact Project and Workflow Session.
+Read/search before editing; use the canonical runtime tool names returned by discovery.
+Use work_on_project(mode=worktree) only when an isolated managed worktree is wanted.
+Use focused validation and observe the same Job when work continues asynchronously.
+Review with show_changes and close with finish_coding_task.
+Do not infer Project or Session authority from chat, credential, or guessed ids.
 ```
 
-`checks_run` is the Connector's structured validation Action. It accepts an optional `recipe` enum (`rust`, `node`, `python`, `go`); omit it for deterministic nearest-manifest resolution. See [MCP](MCP.md#validation-recipes) for the recipe table.
-
-`task_finish` creates a stable result; it does not silently apply changes to the target checkout. The host user reviews and decides locally with `webcodex task show`, `webcodex task accept`, or `webcodex task reject`.
+The retired ProjectConnector Action names and host-side `webcodex task` review workflow are not projected as compatibility aliases.
 
 ## Management and safety
 

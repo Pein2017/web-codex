@@ -2,6 +2,7 @@
 
 use super::super::*;
 use super::support::*;
+use crate::tool_runtime::tool_audit::ToolCallAuditProjection;
 use serde_json::json;
 use std::fs;
 use std::path::Path;
@@ -221,18 +222,22 @@ fn workspace_hygiene_check_is_known_and_in_specs() {
         .is_some_and(|description| description.contains("diagnostic output")));
 
     let openapi_spec = crate::openapi::build_openapi_spec();
-    let action = &openapi_spec["paths"]["/api/actions/workspace_hygiene_check"]["post"];
-    assert_eq!(action["operationId"], "workspace_hygiene_check");
+    assert!(
+        openapi_spec["paths"]
+            .get("/api/actions/workspace_hygiene_check")
+            .is_none(),
+        "workspace_hygiene_check is model-visible but intentionally gateway-only"
+    );
 
     // tool_manifest category: cleanup.
     assert_eq!(tool_manifest_category("workspace_hygiene_check"), "cleanup");
 }
 
 #[test]
-fn workspace_hygiene_check_is_direct_on_the_derived_action_surface() {
-    assert!(
-        webcodex_tool_contracts::runtime_tool_adaptive_direct_rank("workspace_hygiene_check")
-            .is_some()
+fn workspace_hygiene_check_is_gateway_only_on_the_derived_action_surface() {
+    assert_eq!(
+        webcodex_tool_contracts::runtime_tool_adaptive_direct_rank("workspace_hygiene_check"),
+        None
     );
     assert!(webcodex_tool_contracts::gpt_action_tool_supported(
         "workspace_hygiene_check"

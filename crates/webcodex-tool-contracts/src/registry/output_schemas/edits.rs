@@ -207,6 +207,72 @@ fn apply_patch_file_summary_schema() -> Value {
     })
 }
 
+fn apply_text_edit_summary_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "index": {"type":"integer","minimum":0,"maximum":19},
+            "kind": {"type":"string","enum":["replace_exact","insert_before","insert_after","delete_exact"]},
+            "old_start_line": {"type":"integer","minimum":1},
+            "old_end_line": {"type":"integer","minimum":1},
+            "new_line_count": {"type":"integer","minimum":0},
+            "would_change": {"type":"boolean"},
+            "match_count": {"type":"integer","minimum":1},
+            "expected_match_count": {"type":"integer","minimum":1,"maximum":1024},
+            "match_ranges": {"type":"array","maxItems":webcodex_core::apply_edits_shared::MAX_APPLY_TEXT_MATCH_RANGES_PER_EDIT,"items":edit_success_match_range_schema()},
+            "match_ranges_truncated": {"type":"boolean"},
+            "warning": {
+                "type": "string",
+                "enum": [webcodex_core::apply_edits_shared::APPLY_TEXT_EDIT_DUPLICATE_ANCHOR_WARNING],
+                "description": "Optional non-blocking duplicate-anchor advisory. The Server preserves only this canonical fixed text when it maps to the original insert edit."
+            }
+        }
+    })
+}
+
+fn apply_text_edits_file_summary_schema() -> Value {
+    json!({
+        "type": "array",
+        "maxItems": webcodex_core::apply_edits_shared::MAX_APPLY_FILE_CHANGES,
+        "description": "Server-validated per-file apply_text_edits success summaries. Final snapshots use read_revision; Runner SHA-256 values are internal and are not model-facing.",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "index": {"type": "integer", "minimum": 0},
+                "kind": {"type": "string", "enum": ["create", "edit", "delete", "rename"]},
+                "path": {"type": "string", "minLength": 1},
+                "to_path": {"anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]},
+                "changed": {"type": "boolean"},
+                "would_change": {"type": "boolean"},
+                "read_revision": {
+                    "description": "Fresh model-facing snapshot revision for the final file after confirmed non-dry-run success; null for delete and dry-run results.",
+                    "anyOf": [
+                        {"type": "integer", "minimum": 1, "maximum": 9007199254740991_u64},
+                        {"type": "null"}
+                    ]
+                },
+                "edits": {
+                    "type": "array",
+                    "maxItems": webcodex_core::apply_edits_shared::MAX_APPLY_TEXT_EDITS,
+                    "items": apply_text_edit_summary_schema(),
+                    "description": "Bounded source-free per-edit summaries. The optional duplicate-anchor warning is Server-sanitized to one fixed non-blocking advisory; existing structural metadata remains additive."
+                }
+            },
+            "required": [
+                "index", "kind", "path", "to_path", "changed", "would_change",
+                "read_revision", "edits"
+            ]
+        }
+    })
+}
+
+fn edit_success_match_range_schema() -> Value {
+    let mut schema = edit_candidate_range_schema();
+    schema["required"] = json!(["occurrence", "start_line", "end_line"]);
+    schema
+}
+
 fn edit_candidate_range_schema() -> Value {
     json!({
         "type": "object",
@@ -218,6 +284,24 @@ fn edit_candidate_range_schema() -> Value {
         },
         "required": ["start_line", "end_line"]
     })
+}
+
+fn conflicting_edit_ranges_schema() -> Value {
+    let mut schema = array_schema(
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "edit_index": {"type": "integer", "minimum": 0},
+                "start_line": {"type": "integer", "minimum": 1},
+                "end_line": {"type": "integer", "minimum": 1}
+            },
+            "required": ["edit_index", "start_line", "end_line"]
+        }),
+        "At most the resolved source-line ranges for conflicting edits; derived from the authoritative transactional edit plan and contains no source or replacement text.",
+    );
+    schema["maxItems"] = json!(2);
+    schema
 }
 
 fn read_files_recovery_call_schema() -> Value {
@@ -345,8 +429,16 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "applied_count",
-                schema_type("integer", "Number of file changes applied in the batch."),
+                schema_type("integer", "Number of confirmed applied file changes; zero for dry_run."),
             ),
+            ("planned_count", schema_type("integer", "Number of fully planned file changes, including dry_run.")),
+            ("change_summary", json!({"type":"object","additionalProperties":false,"properties":{
+                "requested_changes":{"type":"integer","minimum":1,"maximum":16},
+                "changed_files":{"type":"integer","minimum":0,"maximum":16},
+                "logical_edits":{"type":"integer","minimum":0},
+                "resolved_matches":{"type":"integer","minimum":0},
+                "warnings":{"type":"integer","minimum":0}
+            },"required":["requested_changes","changed_files","logical_edits","resolved_matches","warnings"]})),
             (
                 "ignored_noop_count",
                 schema_type("integer", "Number of provable empty insert operations ignored without invalidating the transactional batch."),
@@ -359,13 +451,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "would_change",
                 schema_type("boolean", "Whether the batch plan changes the worktree."),
             ),
-            (
-                "files",
-                schema_type(
-                    "array",
-                    "Per-file summaries with kind, paths, changed state, and old/new sha256 values.",
-                ),
-            ),
+            ("files", apply_text_edits_file_summary_schema()),
             (
                 "changed_paths",
                 schema_type("array", "Paths touched by the edit batch."),
@@ -395,6 +481,16 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 nullable_schema("integer", "Zero-based failed file-change index when known; null or absent for batch-global failures."),
             ),
             (
+                "path_conflict_change_indices",
+                json!({
+                    "type": "array",
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "items": {"type": "integer", "minimum": 0, "maximum": 15},
+                    "description": "Server-preflight indices [first occupant, conflicting change] for a repeated source/destination path. May be equal for a self-conflict. Identifies the conflict, not permission to merge sequential edits."
+                }),
+            ),
+            (
                 "edit_index",
                 nullable_schema("integer", "Zero-based failed text-edit index when known; null or absent when not edit-specific."),
             ),
@@ -410,9 +506,14 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "match_count",
                 schema_type("integer", "Exact-match count reported for a deterministic text conflict when useful."),
             ),
+            ("expected_match_count", schema_type("integer", "Caller-required exact count for match_count_mismatch.")),
+            ("actual_match_count", schema_type("integer", "Observed exact count in the requested scope for match_count_mismatch.")),
+            ("line_scope", json!({"anyOf":[{"type":"object","properties":{"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1}}},{"type":"null"}]})),
+            ("direct_retry_safe", schema_type("boolean", "Whether the failed exact edit can be retried without a new read.")),
+            ("reread_required", schema_type("boolean", "Whether a fresh read is required before correction.")),
             (
                 "candidate_ranges",
-                array_schema(edit_candidate_range_schema(), "Bounded candidate source ranges. occurrence is included only when the current read revision makes positional retry safe."),
+                json!({"type":"array","maxItems":webcodex_core::apply_edits_shared::MAX_APPLY_TEXT_CONFLICT_CANDIDATES,"items":edit_candidate_range_schema(),"description":"Bounded candidate source ranges. occurrence is included only when the current read revision makes positional retry safe."}),
             ),
             (
                 "candidates_truncated",
@@ -421,6 +522,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             (
                 "conflicting_edit_indices",
                 array_schema(schema_type("integer", "Zero-based edit index participating in an overlap conflict."), "The edit indices whose planned ranges overlap."),
+            ),
+            (
+                "conflicting_edit_ranges",
+                conflicting_edit_ranges_schema(),
             ),
             (
                 "recovery",

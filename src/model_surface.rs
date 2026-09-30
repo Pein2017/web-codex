@@ -1,38 +1,33 @@
-//! Startup selection for model-facing runtime exposure.
+//! Canonical model-facing routing for Adaptive Runtime.
 //!
-//! WebCodex exposes exactly one top-level `RuntimeExposure` per process:
-//!
-//! - A complete Connector configuration (`WEBCODEX_CONNECTOR_SURFACE=task-v1`)
-//!   selects the separate `project_connector` contract.
-//! - Without Connector configuration, an unset `WEBCODEX_MCP_MODEL_SURFACE`
-//!   selects `Runtime(AdaptiveRuntime)`. Explicit `local-coding-v1`,
-//!   `adaptive-runtime-v1`, and `full-operator-v1` values select the corresponding
-//!   runtime `ModelSurface`.
-//! - Setting Connector configuration and `WEBCODEX_MCP_MODEL_SURFACE` together,
-//!   or using an unsupported value, is a startup configuration error and never
-//!   falls through to another exposure.
+//! WebCodex has one model-facing runtime contract. Canonical ToolDefinitions
+//! decide which model-visible tools are directly exposed; every other
+//! model-visible runtime tool is reached through `call_runtime_tool`. Hidden
+//! protocol extensions are reachable only after the adapter independently
+//! admits their protocol capability.
 
-use crate::connector_runtime::ConnectorContext;
 use crate::tool_runtime::tool_definition::{
     adaptive_runtime_direct_tool_definitions, is_adaptive_runtime_direct_tool,
-    is_model_visible_tool_name, LOCAL_CODING_TOOL_NAMES,
+    is_model_visible_tool_name,
 };
-use crate::tool_runtime::{registered_tool_specs, ToolSpec};
-
-pub(crate) const MODEL_SURFACE_LOCAL_CODING: &str = "local_coding";
-pub(crate) const MODEL_SURFACE_ADAPTIVE_RUNTIME: &str = "adaptive_runtime";
-pub(crate) const MODEL_SURFACE_FULL_OPERATOR_RUNTIME: &str = "full_operator_runtime";
-pub(crate) const RUNTIME_EXPOSURE_PROJECT_CONNECTOR: &str = "project_connector";
-
-pub(crate) const MCP_MODEL_SURFACE_ENV: &str = "WEBCODEX_MCP_MODEL_SURFACE";
-pub(crate) const MCP_MODEL_SURFACE_LOCAL_CODING_V1: &str = "local-coding-v1";
-pub(crate) const MCP_MODEL_SURFACE_ADAPTIVE_RUNTIME_V1: &str = "adaptive-runtime-v1";
-pub(crate) const MCP_MODEL_SURFACE_FULL_OPERATOR_V1: &str = "full-operator-v1";
+use crate::tool_runtime::{registered_tool_specs, ToolResult, ToolSpec};
+use serde_json::{json, Value};
+use std::collections::HashSet;
 
 pub(crate) const ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME: &str = "call_runtime_tool";
 pub(crate) const TOOL_SURFACE_AVAILABILITY_DIRECT: &str = "direct";
 pub(crate) const TOOL_SURFACE_AVAILABILITY_GATEWAY: &str = "gateway";
 pub(crate) const TOOL_SURFACE_AVAILABILITY_UNAVAILABLE: &str = "unavailable";
+
+pub(crate) fn tool_requires_direct_app_presentation(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "present_work_result"
+            | "present_goal_plan"
+            | "present_agent_continuation"
+            | "present_job_terminal_continuation"
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AdaptiveRuntimeGatewayTargetRoute {
@@ -42,17 +37,46 @@ pub(crate) enum AdaptiveRuntimeGatewayTargetRoute {
     Unknown,
 }
 
-/// Protocol-neutral routing for one ordinary canonical Adaptive Runtime tool.
-/// This classifies only model-surface availability: adapters may further reject
-/// transport-incompatible tools, while kernel scope/authority/permission checks
-/// remain final and unchanged.
+/// Canonical Adaptive Runtime routing for one ordinary registered tool.
+/// Routing changes model exposure only; canonical authority checks are unchanged.
+pub(crate) fn adaptive_runtime_tool_invocation_route(
+    tool_name: &str,
+) -> (&'static str, Option<&'static str>) {
+    adaptive_runtime_tool_invocation_route_with_operator_extension(tool_name, false)
+}
+
+/// Route a tool after a protocol adapter has independently admitted a hidden
+/// extension. This flag is server-owned request context, not caller authority.
+pub(crate) fn adaptive_runtime_tool_invocation_route_with_operator_extension(
+    tool_name: &str,
+    operator_extension_admitted: bool,
+) -> (&'static str, Option<&'static str>) {
+    if operator_extension_admitted {
+        return (
+            TOOL_SURFACE_AVAILABILITY_GATEWAY,
+            Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME),
+        );
+    }
+    if !is_model_visible_tool_name(tool_name) {
+        return (TOOL_SURFACE_AVAILABILITY_UNAVAILABLE, None);
+    }
+    if is_adaptive_runtime_direct_tool(tool_name) {
+        (TOOL_SURFACE_AVAILABILITY_DIRECT, None)
+    } else {
+        (
+            TOOL_SURFACE_AVAILABILITY_GATEWAY,
+            Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME),
+        )
+    }
+}
+
 pub(crate) fn adaptive_runtime_gateway_target_route(
     target: &str,
 ) -> AdaptiveRuntimeGatewayTargetRoute {
     if target == ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME {
         return AdaptiveRuntimeGatewayTargetRoute::Recursive;
     }
-    match ModelSurface::AdaptiveRuntime.runtime_tool_invocation_route(target) {
+    match adaptive_runtime_tool_invocation_route(target) {
         (TOOL_SURFACE_AVAILABILITY_DIRECT, None) => AdaptiveRuntimeGatewayTargetRoute::Direct,
         (TOOL_SURFACE_AVAILABILITY_GATEWAY, Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME)) => {
             AdaptiveRuntimeGatewayTargetRoute::Gateway
@@ -61,195 +85,333 @@ pub(crate) fn adaptive_runtime_gateway_target_route(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RuntimeExposure {
-    Runtime(ModelSurface),
-    ProjectConnector,
-}
-
-impl RuntimeExposure {
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::Runtime(surface) => surface.name(),
-            Self::ProjectConnector => RUNTIME_EXPOSURE_PROJECT_CONNECTOR,
-        }
-    }
-
-    pub(crate) fn model_surface(self) -> Option<ModelSurface> {
-        match self {
-            Self::Runtime(surface) => Some(surface),
-            Self::ProjectConnector => None,
-        }
-    }
-}
-
-/// Resolve the MCP `tools/list` schema projection after startup exposure is known.
-///
-/// An explicit operator override always wins. Without one, Adaptive Runtime uses
-/// compact discovery to reduce model schema/context cost; compatibility surfaces
-/// and ProjectConnector preserve their historical full-schema projection.
-pub(crate) fn effective_mcp_compact_schemas(
-    exposure: RuntimeExposure,
-    configured_override: Option<bool>,
-) -> bool {
-    configured_override.unwrap_or(matches!(
-        exposure,
-        RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime)
-    ))
-}
-
-/// The top-level exposure and Connector runtime slot are one coherent startup state.
-/// ProjectConnector requires Connector state; runtime ModelSurfaces forbid it.
-pub(crate) fn validate_connector_runtime_presence(
-    exposure: RuntimeExposure,
-    connector_present: bool,
-) -> Result<(), String> {
-    match (exposure, connector_present) {
-        (RuntimeExposure::ProjectConnector, true) | (RuntimeExposure::Runtime(_), false) => Ok(()),
-        (RuntimeExposure::ProjectConnector, false) => {
-            Err("runtime exposure 'project_connector' requires Connector runtime state".to_string())
-        }
-        (RuntimeExposure::Runtime(surface), true) => Err(format!(
-            "runtime exposure '{}' cannot coexist with Connector runtime state",
-            surface.name()
-        )),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ModelSurface {
-    LocalCoding,
-    AdaptiveRuntime,
-    FullOperatorRuntime,
-}
-
-impl ModelSurface {
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::LocalCoding => MODEL_SURFACE_LOCAL_CODING,
-            Self::AdaptiveRuntime => MODEL_SURFACE_ADAPTIVE_RUNTIME,
-            Self::FullOperatorRuntime => MODEL_SURFACE_FULL_OPERATOR_RUNTIME,
-        }
-    }
-
-    /// Operator-style stateless MCP extensions stay available on the adaptive
-    /// surface even though their individual schemas are hidden behind one gateway.
-    pub(crate) fn supports_operator_extensions(self) -> bool {
-        matches!(self, Self::AdaptiveRuntime | Self::FullOperatorRuntime)
-    }
-
-    /// Model-surface routing for one registered model-visible runtime tool.
-    /// This does not grant OAuth scope, project authority, feature availability,
-    /// or permission; those remain enforced by the selected tool at invocation.
-    pub(crate) fn runtime_tool_invocation_route(
-        self,
-        tool_name: &str,
-    ) -> (&'static str, Option<&'static str>) {
-        self.runtime_tool_invocation_route_with_operator_extension(tool_name, false)
-    }
-
-    /// Route one runtime tool when the protocol adapter has already admitted a
-    /// ModelHidden Stateless operator extension. `operator_extension_admitted`
-    /// is server-owned request context; callers cannot use this to make an
-    /// arbitrary hidden tool model-visible.
-    pub(crate) fn runtime_tool_invocation_route_with_operator_extension(
-        self,
-        tool_name: &str,
-        operator_extension_admitted: bool,
-    ) -> (&'static str, Option<&'static str>) {
-        if operator_extension_admitted {
-            return match self {
-                Self::LocalCoding => (TOOL_SURFACE_AVAILABILITY_UNAVAILABLE, None),
-                Self::AdaptiveRuntime => (
-                    TOOL_SURFACE_AVAILABILITY_GATEWAY,
-                    Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME),
-                ),
-                Self::FullOperatorRuntime => (TOOL_SURFACE_AVAILABILITY_DIRECT, None),
-            };
-        }
-        if !is_model_visible_tool_name(tool_name) {
-            return (TOOL_SURFACE_AVAILABILITY_UNAVAILABLE, None);
-        }
-        match self {
-            Self::LocalCoding => {
-                if LOCAL_CODING_TOOL_NAMES.contains(&tool_name) {
-                    (TOOL_SURFACE_AVAILABILITY_DIRECT, None)
-                } else {
-                    (TOOL_SURFACE_AVAILABILITY_UNAVAILABLE, None)
-                }
-            }
-            Self::AdaptiveRuntime => {
-                if is_adaptive_runtime_direct_tool(tool_name) {
-                    (TOOL_SURFACE_AVAILABILITY_DIRECT, None)
-                } else {
-                    (
-                        TOOL_SURFACE_AVAILABILITY_GATEWAY,
-                        Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME),
-                    )
-                }
-            }
-            Self::FullOperatorRuntime => (TOOL_SURFACE_AVAILABILITY_DIRECT, None),
-        }
-    }
-}
-
-/// Resolve the top-level runtime exposure from the process environment.
-///
-/// `connector_context` is present only after a complete Connector
-/// configuration has been parsed and validated. Returns an error for a
-/// conflict (Connector plus `WEBCODEX_MCP_MODEL_SURFACE`) or for an unsupported
-/// `WEBCODEX_MCP_MODEL_SURFACE` value; the server must fail startup rather
-/// than silently serving a different exposure.
-pub(crate) fn resolve_runtime_exposure(
-    connector_context: Option<&ConnectorContext>,
-) -> Result<RuntimeExposure, String> {
-    let configured = std::env::var(MCP_MODEL_SURFACE_ENV)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    match (connector_context, configured.as_deref()) {
-        (Some(_), Some(value)) => Err(format!(
-            "{MCP_MODEL_SURFACE_ENV}='{value}' cannot be combined with WEBCODEX_CONNECTOR_SURFACE; the Connector surface is authoritative"
-        )),
-        (Some(_), None) => Ok(RuntimeExposure::ProjectConnector),
-        (None, None) => Ok(RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime)),
-        (None, Some(MCP_MODEL_SURFACE_LOCAL_CODING_V1)) => {
-            Ok(RuntimeExposure::Runtime(ModelSurface::LocalCoding))
-        }
-        (None, Some(MCP_MODEL_SURFACE_ADAPTIVE_RUNTIME_V1)) => {
-            Ok(RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime))
-        }
-        (None, Some(MCP_MODEL_SURFACE_FULL_OPERATOR_V1)) => {
-            Ok(RuntimeExposure::Runtime(ModelSurface::FullOperatorRuntime))
-        }
-        (None, Some(value)) => Err(format!(
-            "unsupported {MCP_MODEL_SURFACE_ENV} '{value}'; expected {MCP_MODEL_SURFACE_LOCAL_CODING_V1}, {MCP_MODEL_SURFACE_ADAPTIVE_RUNTIME_V1}, or {MCP_MODEL_SURFACE_FULL_OPERATOR_V1}"
-        )),
-    }
-}
-
-/// Registered ToolSpecs for the local_coding surface, in
-/// `LOCAL_CODING_TOOL_NAMES` order. Every name must resolve to a registered
-/// model-visible ToolSpec; the MCP `tools/list` surface is built from this.
-pub(crate) fn local_coding_tool_specs() -> Vec<ToolSpec> {
-    let mut by_name: std::collections::HashMap<String, ToolSpec> = registered_tool_specs()
-        .into_iter()
-        .map(|spec| (spec.name.clone(), spec))
-        .collect();
-    LOCAL_CODING_TOOL_NAMES
-        .iter()
-        .map(|name| {
-            by_name.remove(*name).unwrap_or_else(|| {
-                panic!("{name} local_coding tool is missing a registered ToolSpec")
-            })
+/// GPT Actions derives its route from the same definition and Adaptive surface.
+/// GatewayOnly is a transport exposure exception, never an authority change.
+pub(crate) fn gpt_action_gateway_target_route(target: &str) -> AdaptiveRuntimeGatewayTargetRoute {
+    let route = adaptive_runtime_gateway_target_route(target);
+    if route == AdaptiveRuntimeGatewayTargetRoute::Direct
+        && webcodex_tool_contracts::lookup_tool_definition(target).is_some_and(|definition| {
+            definition.gpt_action_exposure()
+                == webcodex_tool_contracts::ToolGptActionExposure::GatewayOnly
         })
-        .collect()
+    {
+        AdaptiveRuntimeGatewayTargetRoute::Gateway
+    } else {
+        route
+    }
 }
 
-/// Registered direct ToolSpecs for the adaptive runtime surface, ordered by
-/// the rank statically declared on canonical ToolDefinitions. Ordinary
-/// model-visible runtime tools default to the long-tail gateway unless their
-/// ToolDefinition explicitly promotes them to direct.
+/// Presentation route for one canonical SuggestedToolCall target. This is not
+/// authority: adapters resolve the route from their already-admitted model
+/// surface and the canonical target still runs through ordinary ToolRuntime
+/// validation, authorization, permission, capability, and effect checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SuggestedToolCallRoute {
+    Direct,
+    Gateway(&'static str),
+    Unavailable,
+}
+
+pub(crate) fn suggested_tool_call_route(
+    target: &str,
+    operator_extension_admitted: bool,
+) -> SuggestedToolCallRoute {
+    match adaptive_runtime_tool_invocation_route_with_operator_extension(
+        target,
+        operator_extension_admitted,
+    ) {
+        (TOOL_SURFACE_AVAILABILITY_DIRECT, None) => SuggestedToolCallRoute::Direct,
+        (TOOL_SURFACE_AVAILABILITY_GATEWAY, Some(gateway)) => {
+            SuggestedToolCallRoute::Gateway(gateway)
+        }
+        _ => SuggestedToolCallRoute::Unavailable,
+    }
+}
+
+/// Project formally declared SuggestedToolCall schemas to the callable shape of
+/// one model surface. Domain ToolSpecs remain canonical; adapters apply this to
+/// response-schema copies only.
+pub(crate) fn project_suggested_tool_call_schema<F>(schema: &mut Value, route_for: &F)
+where
+    F: Fn(&str) -> SuggestedToolCallRoute,
+{
+    if project_suggested_tool_call_schema_node(schema, route_for) {
+        *schema = json!({"not": {}});
+    }
+}
+
+fn project_suggested_tool_call_schema_node<F>(schema: &mut Value, route_for: &F) -> bool
+where
+    F: Fn(&str) -> SuggestedToolCallRoute,
+{
+    if let Some(target) =
+        webcodex_tool_contracts::suggested_tool_call_schema_target(schema).map(str::to_string)
+    {
+        return match route_for(&target) {
+            SuggestedToolCallRoute::Direct => false,
+            SuggestedToolCallRoute::Gateway(gateway) => {
+                let mut canonical = std::mem::take(schema);
+                let description = canonical.get("description").cloned();
+                let properties = canonical
+                    .get_mut("properties")
+                    .and_then(Value::as_object_mut)
+                    .expect("recognized SuggestedToolCall schema has properties");
+                let canonical_tool = properties
+                    .remove("tool")
+                    .expect("recognized SuggestedToolCall schema has tool");
+                let canonical_arguments = properties
+                    .remove("arguments")
+                    .expect("recognized SuggestedToolCall schema has arguments");
+                *schema = json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "tool": {"type": "string", "const": gateway},
+                        "arguments": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "tool": canonical_tool,
+                                "arguments": canonical_arguments
+                            },
+                            "required": ["tool", "arguments"]
+                        }
+                    },
+                    "required": ["tool", "arguments"]
+                });
+                if let Some(description) = description {
+                    schema["description"] = description;
+                }
+                false
+            }
+            SuggestedToolCallRoute::Unavailable => true,
+        };
+    }
+
+    let mut removed_properties = Vec::new();
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        let names = properties.keys().cloned().collect::<Vec<_>>();
+        for name in names {
+            if properties
+                .get_mut(&name)
+                .is_some_and(|child| project_suggested_tool_call_schema_node(child, route_for))
+            {
+                removed_properties.push(name);
+            }
+        }
+        for name in &removed_properties {
+            properties.remove(name);
+        }
+    }
+    if !removed_properties.is_empty() {
+        if let Some(required) = schema.get_mut("required").and_then(Value::as_array_mut) {
+            required.retain(|field| {
+                field
+                    .as_str()
+                    .is_none_or(|field| !removed_properties.iter().any(|name| name == field))
+            });
+        }
+    }
+
+    let item_became_unavailable = schema
+        .get_mut("items")
+        .is_some_and(|items| project_suggested_tool_call_schema_node(items, route_for));
+    if item_became_unavailable {
+        if schema.get("minItems").and_then(Value::as_u64).unwrap_or(0) > 0 {
+            return true;
+        }
+        schema["items"] = json!({"not": {}});
+    }
+
+    for keyword in ["anyOf", "oneOf"] {
+        let Some(branches) = schema.get_mut(keyword).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let mut index = 0;
+        while index < branches.len() {
+            if project_suggested_tool_call_schema_node(&mut branches[index], route_for) {
+                branches.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        if branches.is_empty() {
+            return true;
+        }
+    }
+    if let Some(branches) = schema.get_mut("allOf").and_then(Value::as_array_mut) {
+        for branch in branches {
+            if project_suggested_tool_call_schema_node(branch, route_for) {
+                return true;
+            }
+        }
+    }
+    for keyword in ["then", "else"] {
+        if let Some(branch) = schema.get_mut(keyword) {
+            if project_suggested_tool_call_schema_node(branch, route_for) {
+                *branch = json!({"not": {}});
+            }
+        }
+    }
+    false
+}
+
+/// Project only values proven by the canonical output schema to be
+/// SuggestedToolCall edges. The visited JSON-pointer set prevents one runtime
+/// value from being rewritten twice when `oneOf`/`allOf` branches describe the
+/// same output location.
+pub(crate) fn project_suggested_tool_calls_in_value<F>(
+    value: &mut Value,
+    schema: &Value,
+    route_for: &F,
+) where
+    F: Fn(&str) -> SuggestedToolCallRoute,
+{
+    let mut visited = HashSet::new();
+    if project_suggested_tool_calls_in_value_node(value, schema, route_for, "", &mut visited) {
+        *value = Value::Null;
+    }
+}
+
+fn project_suggested_tool_calls_in_value_node<F>(
+    value: &mut Value,
+    schema: &Value,
+    route_for: &F,
+    path: &str,
+    visited: &mut HashSet<String>,
+) -> bool
+where
+    F: Fn(&str) -> SuggestedToolCallRoute,
+{
+    if let Some(target) = webcodex_tool_contracts::suggested_tool_call_schema_target(schema) {
+        if value.get("tool").and_then(Value::as_str) != Some(target)
+            || value.get("arguments").is_none()
+        {
+            return false;
+        }
+        if !visited.insert(path.to_string()) {
+            return false;
+        }
+        return match route_for(target) {
+            SuggestedToolCallRoute::Direct => false,
+            SuggestedToolCallRoute::Gateway(gateway) => {
+                let arguments = value
+                    .get_mut("arguments")
+                    .map(Value::take)
+                    .unwrap_or(Value::Null);
+                *value = json!({
+                    "tool": gateway,
+                    "arguments": {
+                        "tool": target,
+                        "arguments": arguments
+                    }
+                });
+                false
+            }
+            SuggestedToolCallRoute::Unavailable => true,
+        };
+    }
+
+    if let (Some(properties), Some(object)) = (
+        schema.get("properties").and_then(Value::as_object),
+        value.as_object_mut(),
+    ) {
+        let names = properties.keys().cloned().collect::<Vec<_>>();
+        let mut remove = Vec::new();
+        for name in names {
+            let Some(child_value) = object.get_mut(&name) else {
+                continue;
+            };
+            let Some(child_schema) = properties.get(&name) else {
+                continue;
+            };
+            let child_path = format!("{}/{}", path, json_pointer_segment(&name));
+            if project_suggested_tool_calls_in_value_node(
+                child_value,
+                child_schema,
+                route_for,
+                &child_path,
+                visited,
+            ) {
+                remove.push(name);
+            }
+        }
+        for name in remove {
+            object.remove(&name);
+        }
+    }
+
+    if let (Some(item_schema), Some(items)) = (schema.get("items"), value.as_array_mut()) {
+        let mut remove = Vec::new();
+        for (index, item) in items.iter_mut().enumerate() {
+            let child_path = format!("{path}/{index}");
+            if project_suggested_tool_calls_in_value_node(
+                item,
+                item_schema,
+                route_for,
+                &child_path,
+                visited,
+            ) {
+                remove.push(index);
+            }
+        }
+        for index in remove.into_iter().rev() {
+            items.remove(index);
+        }
+    }
+
+    for keyword in ["anyOf", "oneOf", "allOf"] {
+        if let Some(branches) = schema.get(keyword).and_then(Value::as_array) {
+            for branch in branches {
+                if project_suggested_tool_calls_in_value_node(
+                    value, branch, route_for, path, visited,
+                ) {
+                    return true;
+                }
+            }
+        }
+    }
+    for keyword in ["then", "else"] {
+        if let Some(branch) = schema.get(keyword) {
+            if project_suggested_tool_calls_in_value_node(value, branch, route_for, path, visited) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn json_pointer_segment(segment: &str) -> String {
+    segment.replace('~', "~0").replace('/', "~1")
+}
+
+pub(crate) fn project_tool_result_suggested_calls<F>(
+    tool_name: &str,
+    result: &mut ToolResult,
+    route_for: &F,
+) where
+    F: Fn(&str) -> SuggestedToolCallRoute,
+{
+    let output = result.output.take();
+    let mut envelope = json!({"success": result.success, "output": output});
+    if let Some(error) = result.error.as_ref() {
+        envelope["error"] = Value::String(error.clone());
+    }
+    let schema = webcodex_tool_contracts::output_schema_for_tool(tool_name);
+    project_suggested_tool_calls_in_value(&mut envelope, &schema, route_for);
+    result.output = envelope
+        .as_object_mut()
+        .and_then(|object| object.remove("output"))
+        .unwrap_or(Value::Null);
+}
+
+/// Compact MCP discovery is the Adaptive Runtime default. The explicit
+/// operator override changes schema projection only, never tool behavior.
+pub(crate) fn effective_mcp_compact_schemas(configured_override: Option<bool>) -> bool {
+    configured_override.unwrap_or(true)
+}
+
+/// Direct ToolSpecs ordered by rank declared on canonical ToolDefinitions.
 pub(crate) fn adaptive_runtime_direct_tool_specs() -> Vec<ToolSpec> {
     let mut by_name: std::collections::HashMap<String, ToolSpec> = registered_tool_specs()
         .into_iter()
@@ -272,218 +434,165 @@ pub(crate) fn adaptive_runtime_direct_tool_specs() -> Vec<ToolSpec> {
 mod tests {
     use super::*;
 
+    fn collect_suggested_call_targets(
+        schema: &Value,
+        targets: &mut std::collections::BTreeSet<String>,
+    ) {
+        if let Some(target) = webcodex_tool_contracts::suggested_tool_call_schema_target(schema) {
+            targets.insert(target.to_string());
+            return;
+        }
+        match schema {
+            Value::Object(object) => {
+                for child in object.values() {
+                    collect_suggested_call_targets(child, targets);
+                }
+            }
+            Value::Array(items) => {
+                for child in items {
+                    collect_suggested_call_targets(child, targets);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn test_suggested_call_route(target: &str) -> SuggestedToolCallRoute {
+        let operator_extension_admitted =
+            crate::tool_runtime::stateless_operator_extension_tool_specs()
+                .iter()
+                .any(|spec| spec.name == target);
+        suggested_tool_call_route(target, operator_extension_admitted)
+    }
+
     #[test]
-    fn local_coding_tool_names_are_ordered_and_unique() {
-        let mut seen = std::collections::HashSet::new();
-        for name in LOCAL_CODING_TOOL_NAMES {
+    fn direct_app_presentation_requirement_is_closed_and_explicit() {
+        for tool in [
+            "present_work_result",
+            "present_goal_plan",
+            "present_agent_continuation",
+            "present_job_terminal_continuation",
+        ] {
+            assert!(tool_requires_direct_app_presentation(tool), "{tool}");
+        }
+        for ordinary in ["run_shell", "run_script", "show_changes"] {
             assert!(
-                seen.insert(*name),
-                "{name} is duplicated in LOCAL_CODING_TOOL_NAMES"
+                !tool_requires_direct_app_presentation(ordinary),
+                "{ordinary}"
             );
         }
+    }
+
+    #[test]
+    fn direct_specs_are_definition_derived_and_model_visible() {
+        let specs = adaptive_runtime_direct_tool_specs();
+        let expected = adaptive_runtime_direct_tool_definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        let actual = specs
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        for spec in specs {
+            assert!(is_model_visible_tool_name(&spec.name), "{}", spec.name);
+            assert!(is_adaptive_runtime_direct_tool(&spec.name), "{}", spec.name);
+        }
+    }
+
+    #[test]
+    fn coding_intent_tools_are_reachable() {
+        for tool_name in crate::tool_runtime::tool_definition::CODING_INTENT_TOOL_NAMES {
+            let (availability, gateway) = adaptive_runtime_tool_invocation_route(tool_name);
+            assert_ne!(
+                availability, TOOL_SURFACE_AVAILABILITY_UNAVAILABLE,
+                "{tool_name}"
+            );
+            if availability == TOOL_SURFACE_AVAILABILITY_DIRECT {
+                assert_eq!(gateway, None, "{tool_name}");
+            } else {
+                assert_eq!(
+                    gateway,
+                    Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME),
+                    "{tool_name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn long_tail_and_direct_fallback_routes_are_canonical() {
         assert_eq!(
-            LOCAL_CODING_TOOL_NAMES.len(),
-            seen.len(),
-            "local_coding tool set must be unique"
+            adaptive_runtime_gateway_target_route("apply_patch"),
+            AdaptiveRuntimeGatewayTargetRoute::Gateway
+        );
+        for tool_name in ["read_files", "run_script"] {
+            assert_eq!(
+                adaptive_runtime_gateway_target_route(tool_name),
+                AdaptiveRuntimeGatewayTargetRoute::Direct
+            );
+        }
+    }
+
+    #[test]
+    fn job_stop_gateway_only_policy_changes_actions_not_adaptive_route() {
+        assert_eq!(
+            adaptive_runtime_gateway_target_route("stop_job"),
+            AdaptiveRuntimeGatewayTargetRoute::Direct
+        );
+        assert_eq!(
+            gpt_action_gateway_target_route("stop_job"),
+            AdaptiveRuntimeGatewayTargetRoute::Gateway
+        );
+        for definition in webcodex_tool_contracts::model_visible_tool_definitions() {
+            if definition.gpt_action_exposure()
+                == webcodex_tool_contracts::ToolGptActionExposure::GatewayOnly
+            {
+                assert_eq!(
+                    gpt_action_gateway_target_route(definition.name),
+                    AdaptiveRuntimeGatewayTargetRoute::Gateway
+                );
+            }
+        }
+        assert_eq!(
+            gpt_action_gateway_target_route("cancel_job"),
+            AdaptiveRuntimeGatewayTargetRoute::Unknown
         );
     }
 
     #[test]
-    fn local_coding_tools_are_fully_registered_in_order() {
-        let specs = local_coding_tool_specs();
-        let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
-        assert_eq!(names, LOCAL_CODING_TOOL_NAMES);
-        for spec in &specs {
-            assert!(
-                crate::tool_runtime::tool_definition::is_model_visible_tool_name(&spec.name),
-                "{} must be model-visible",
-                spec.name
-            );
-        }
-    }
-
-    #[test]
-    fn adaptive_runtime_routes_every_local_coding_compatibility_tool() {
-        for tool_name in LOCAL_CODING_TOOL_NAMES {
-            let (availability, via) =
-                ModelSurface::AdaptiveRuntime.runtime_tool_invocation_route(tool_name);
-            assert_ne!(
-                availability, TOOL_SURFACE_AVAILABILITY_UNAVAILABLE,
-                "AdaptiveRuntime must preserve Local Coding capability {tool_name}"
-            );
-            if availability == TOOL_SURFACE_AVAILABILITY_DIRECT {
-                assert_eq!(via, None, "direct tool {tool_name} must not name a gateway");
-            } else {
-                assert_eq!(availability, TOOL_SURFACE_AVAILABILITY_GATEWAY);
-                assert_eq!(via, Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME));
-            }
-        }
-    }
-
-    #[test]
-    fn coding_intent_tools_are_all_adaptive_reachable_with_expected_routes() {
-        let expected_gateway = [
-            "project_overview",
-            "document_symbols",
-            "document_diagnostics",
-            "hover",
-            "workspace_symbols",
-            "goto_definition",
-            "find_references",
-            "call_hierarchy",
-            "apply_patch",
-            "run_script",
-            "cargo_fmt",
-            "go_test",
-        ];
-        for tool_name in crate::tool_runtime::tool_definition::CODING_INTENT_TOOL_NAMES {
-            let (availability, via) =
-                ModelSurface::AdaptiveRuntime.runtime_tool_invocation_route(tool_name);
-            assert_ne!(
-                availability, TOOL_SURFACE_AVAILABILITY_UNAVAILABLE,
-                "coding intent tool {tool_name} must remain Adaptive reachable"
-            );
-            if expected_gateway.contains(tool_name) {
-                assert_eq!(
-                    (availability, via),
-                    (
-                        TOOL_SURFACE_AVAILABILITY_GATEWAY,
-                        Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME)
-                    ),
-                    "coding specialist {tool_name} must remain gateway-routed"
-                );
-            } else {
-                assert_eq!(
-                    (availability, via),
-                    (TOOL_SURFACE_AVAILABILITY_DIRECT, None),
-                    "ordinary coding tool {tool_name} should use the Adaptive direct path"
-                );
-            }
-        }
-    }
-
-    const EXPECTED_ADAPTIVE_RUNTIME_DIRECT_TOOL_NAMES: &[&str] = &[
-        "work_on_project",
-        "session_discussion_summary",
-        "session_handoff_summary",
-        "present_goal_plan",
-        "present_agent_continuation",
-        "rotate_agent_continuation_endpoint",
-        "runtime_status",
-        "wait_for_agent_events",
-        "plugin_tool",
-        "tool_manifest",
-        "search_project_texts",
-        "read_files",
-        "import_conversation_files_to_project",
-        "export_project_artifact",
-        "apply_text_edits",
-        "run_process",
-        "run_detached_process",
-        "run_shell",
-        "observe_jobs",
-        "list_jobs",
-        "cargo_check",
-        "cargo_test",
-        "git_review_summary",
-        "git_diff_hunks",
-        "show_changes",
-        "workspace_hygiene_check",
-        "finish_coding_task",
-        "present_work_result",
-    ];
-
-    #[test]
-    fn adaptive_runtime_direct_set_is_definition_derived_and_preserves_current_order() {
-        let specs = adaptive_runtime_direct_tool_specs();
-        let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
-        assert_eq!(names, EXPECTED_ADAPTIVE_RUNTIME_DIRECT_TOOL_NAMES);
-        for spec in &specs {
-            assert!(
-                crate::tool_runtime::tool_definition::is_model_visible_tool_name(&spec.name),
-                "{} must be model-visible",
-                spec.name
-            );
-        }
-    }
-
-    #[test]
-    fn adaptive_runtime_structured_action_targets_are_directly_actionable() {
-        for (source_tool, edge, target_tool) in [
-            (
-                "read_files",
-                "session_hint.suggested_next_tool",
-                "session_discussion_summary",
-            ),
-            ("observe_jobs", "items[].suggested_call.tool", "list_jobs"),
-            (
-                "run_process",
-                "session_continuity.suggested_call.tool",
-                "session_handoff_summary",
-            ),
-            (
-                "show_changes",
-                "diff_review_handoff.recovery.tool",
-                "git_diff_hunks",
-            ),
-            (
-                "finish_coding_task",
-                "changes.show_changes.diff_review_handoff.recovery.tool",
-                "git_diff_hunks",
-            ),
-        ] {
-            assert_eq!(
-                ModelSurface::AdaptiveRuntime.runtime_tool_invocation_route(source_tool),
-                (TOOL_SURFACE_AVAILABILITY_DIRECT, None),
-                "structured action source {source_tool}.{edge} must itself be Adaptive direct"
-            );
-            assert_eq!(
-                ModelSurface::AdaptiveRuntime.runtime_tool_invocation_route(target_tool),
-                (TOOL_SURFACE_AVAILABILITY_DIRECT, None),
-                "{source_tool}.{edge} points to non-direct Adaptive target {target_tool}"
-            );
-        }
-
+    fn hidden_tools_fail_closed_without_protocol_admission() {
+        assert!(!is_model_visible_tool_name("skill_list"));
         assert_eq!(
-            ModelSurface::AdaptiveRuntime.runtime_tool_invocation_route("apply_patch"),
+            adaptive_runtime_gateway_target_route("skill_list"),
+            AdaptiveRuntimeGatewayTargetRoute::Unknown
+        );
+        assert_eq!(
+            adaptive_runtime_tool_invocation_route_with_operator_extension("skill_list", true),
             (
                 TOOL_SURFACE_AVAILABILITY_GATEWAY,
                 Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME)
-            ),
-            "specialized patching should be discovered through the Adaptive gateway"
+            )
         );
+    }
+
+    #[test]
+    fn gateway_is_not_recursive() {
         assert_eq!(
-            ModelSurface::AdaptiveRuntime.runtime_tool_invocation_route("read_files"),
-            (TOOL_SURFACE_AVAILABILITY_DIRECT, None),
-            "apply_patch recovery must still point to a directly actionable read_files target"
+            adaptive_runtime_gateway_target_route(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME),
+            AdaptiveRuntimeGatewayTargetRoute::Recursive
         );
     }
 
     #[test]
-    fn adaptive_handoff_promotions_preserve_local_and_full_operator_routes() {
-        for tool_name in ["list_jobs", "git_diff_hunks"] {
+    fn browser_tools_stay_gateway_only_on_adaptive_runtime() {
+        for tool_name in ["browser_observe", "browser_act"] {
+            assert!(adaptive_runtime_direct_tool_definitions()
+                .iter()
+                .all(|definition| definition.name != tool_name));
             assert_eq!(
-                ModelSurface::LocalCoding.runtime_tool_invocation_route(tool_name),
-                (TOOL_SURFACE_AVAILABILITY_DIRECT, None),
-                "{tool_name} was already Local Coding direct"
-            );
-        }
-        for tool_name in ["list_jobs", "git_diff_hunks"] {
-            assert_eq!(
-                ModelSurface::FullOperatorRuntime.runtime_tool_invocation_route(tool_name),
-                (TOOL_SURFACE_AVAILABILITY_DIRECT, None),
-                "Full Operator must remain direct for {tool_name}"
-            );
-        }
-    }
-
-    #[test]
-    fn ordinary_model_visible_tool_defaults_to_adaptive_gateway() {
-        for tool_name in ["run_script", "apply_patch"] {
-            assert!(is_model_visible_tool_name(tool_name));
-            assert!(!is_adaptive_runtime_direct_tool(tool_name));
-            assert_eq!(
-                ModelSurface::AdaptiveRuntime.runtime_tool_invocation_route(tool_name),
+                adaptive_runtime_tool_invocation_route(tool_name),
                 (
                     TOOL_SURFACE_AVAILABILITY_GATEWAY,
                     Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME)
@@ -493,219 +602,250 @@ mod tests {
     }
 
     #[test]
-    fn specialized_patch_remains_direct_on_compatibility_surfaces() {
-        assert!(LOCAL_CODING_TOOL_NAMES.contains(&"apply_patch"));
-        for surface in [ModelSurface::LocalCoding, ModelSurface::FullOperatorRuntime] {
-            assert_eq!(
-                surface.runtime_tool_invocation_route("apply_patch"),
-                (TOOL_SURFACE_AVAILABILITY_DIRECT, None),
-                "apply_patch must remain directly callable on {surface:?}"
-            );
+    fn structured_suggested_call_targets_project_to_actionable_adaptive_routes() {
+        let mut targets = std::collections::BTreeSet::new();
+        for spec in registered_tool_specs()
+            .into_iter()
+            .chain(crate::tool_runtime::stateless_operator_extension_tool_specs())
+        {
+            collect_suggested_call_targets(&spec.output_schema, &mut targets);
         }
-    }
-
-    #[test]
-    fn ergonomics_promotions_do_not_expand_local_coding_or_project_connector() {
-        for tool_name in [
-            "import_conversation_files_to_project",
-            "export_project_artifact",
-        ] {
-            assert!(is_adaptive_runtime_direct_tool(tool_name), "{tool_name}");
-            assert!(
-                !LOCAL_CODING_TOOL_NAMES.contains(&tool_name),
-                "{tool_name} must not expand local_coding"
-            );
-            assert!(
-                !crate::connector_runtime::surface::CAPABILITY_NAMES.contains(&tool_name),
-                "{tool_name} must not expand project_connector"
-            );
-            assert_eq!(
-                ModelSurface::FullOperatorRuntime.runtime_tool_invocation_route(tool_name),
-                (TOOL_SURFACE_AVAILABILITY_DIRECT, None),
-                "Full Operator must remain direct for {tool_name}"
-            );
-        }
-        assert!(is_adaptive_runtime_direct_tool("run_shell"));
-        assert!(!is_adaptive_runtime_direct_tool("run_script"));
-    }
-
-    #[test]
-    fn computer_tools_are_full_operator_only() {
-        let full = registered_tool_specs();
-        let full_names = full
-            .iter()
-            .map(|spec| spec.name.as_str())
-            .collect::<Vec<_>>();
-        for name in [
-            "computer_list_targets",
-            "computer_list_windows",
-            "computer_list_displays",
-            "computer_list_applications",
-            "computer_launch_application",
-            "computer_accessibility_status",
-            "computer_accessibility_tree",
-            "computer_find_elements",
-            "computer_element_state",
-            "computer_activate_window",
-            "computer_control",
-            "computer_scroll_to_element",
-            "computer_key_input",
-            "computer_pointer_move",
-            "computer_pointer_click",
-            "computer_input_text",
-            "computer_snapshot",
-            "computer_snapshot_display",
-            "computer_save_snapshot",
+        for expected in [
+            "list_runners",
+            "git_log",
+            "read_project_artifact",
+            "skill_versions",
         ] {
             assert!(
-                full_names.contains(&name),
-                "{name} must be in full_operator_runtime"
-            );
-            assert!(
-                !LOCAL_CODING_TOOL_NAMES.contains(&name),
-                "{name} must not expand local_coding"
-            );
-            assert!(
-                !is_adaptive_runtime_direct_tool(name),
-                "{name} must stay behind adaptive_runtime discovery"
-            );
-            assert!(
-                !crate::connector_runtime::surface::CAPABILITY_NAMES.contains(&name),
-                "{name} must not expand project_connector"
+                targets.contains(expected),
+                "formal SuggestedToolCall discovery missed representative target {expected}: {targets:?}"
             );
         }
-    }
+        assert!(!targets.is_empty());
+        for target in targets {
+            assert_ne!(
+                test_suggested_call_route(&target),
+                SuggestedToolCallRoute::Unavailable,
+                "Adaptive projection must make formal SuggestedToolCall target {target} immediately executable"
+            );
+        }
 
-    fn connector_context() -> ConnectorContext {
-        ConnectorContext {
-            project_id: "wc_proj_1111111111111111".to_string(),
-            project_name: "demo".to_string(),
-            workspace_id: "wc_ws_1111111111111111".to_string(),
-            executor_project: "agent:special:webcodex".to_string(),
-            executor_root: "/tmp/webcodex".to_string(),
-            runs_root: "/tmp/webcodex-runs".to_string(),
-            results_root: "/tmp/webcodex-results".to_string(),
-            project_registry_dir: "/tmp/webcodex-projects".to_string(),
-            profile: "default".to_string(),
-            project_grant_id: "wc_pgrant_1111111111111111".to_string(),
-        }
-    }
-
-    #[test]
-    fn compact_schema_policy_defaults_only_adaptive_runtime_to_compact() {
-        for exposure in [
-            RuntimeExposure::Runtime(ModelSurface::LocalCoding),
-            RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime),
-            RuntimeExposure::Runtime(ModelSurface::FullOperatorRuntime),
-            RuntimeExposure::ProjectConnector,
-        ] {
-            let expected_default = matches!(
-                exposure,
-                RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime)
-            );
-            assert_eq!(
-                effective_mcp_compact_schemas(exposure, None),
-                expected_default,
-                "unset compact policy drifted for {exposure:?}"
-            );
-            assert!(
-                effective_mcp_compact_schemas(exposure, Some(true)),
-                "explicit true must win for {exposure:?}"
-            );
-            assert!(
-                !effective_mcp_compact_schemas(exposure, Some(false)),
-                "explicit false must win for {exposure:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn runtime_exposure_connector_state_matrix_is_closed() {
-        for (exposure, connector_present) in [
-            (RuntimeExposure::ProjectConnector, true),
-            (RuntimeExposure::Runtime(ModelSurface::LocalCoding), false),
-            (
-                RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime),
-                false,
-            ),
-            (
-                RuntimeExposure::Runtime(ModelSurface::FullOperatorRuntime),
-                false,
-            ),
-        ] {
-            assert!(
-                validate_connector_runtime_presence(exposure, connector_present).is_ok(),
-                "expected valid state: {exposure:?}, connector_present={connector_present}"
-            );
-        }
-        assert!(
-            validate_connector_runtime_presence(RuntimeExposure::ProjectConnector, false)
-                .unwrap_err()
-                .contains("requires Connector runtime state")
+        assert_eq!(
+            adaptive_runtime_tool_invocation_route("session_discussion_summary"),
+            (TOOL_SURFACE_AVAILABILITY_DIRECT, None),
+            "session_hint.suggested_next_tool remains a non-parser-ready direct-only hint"
         );
-        assert!(validate_connector_runtime_presence(
-            RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime),
-            true
+        assert_eq!(
+            adaptive_runtime_tool_invocation_route("apply_patch"),
+            (
+                TOOL_SURFACE_AVAILABILITY_GATEWAY,
+                Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME)
+            ),
+            "specialized patching should remain behind the Adaptive gateway"
+        );
+    }
+
+    #[test]
+    fn suggested_call_value_and_schema_projection_cover_representative_gateway_edges() {
+        for (source_tool, target_tool, arguments) in [
+            (
+                "work_on_project",
+                "list_runners",
+                json!({"include_projects": false, "summary_only": true}),
+            ),
+            (
+                "git_log",
+                "git_log",
+                json!({"project": "demo", "head_commit": "0123456789012345678901234567890123456789", "limit": 20, "skip": 20}),
+            ),
+            (
+                "read_project_artifact",
+                "read_project_artifact",
+                json!({"project": "demo", "path": "out.bin", "encoding": "base64", "offset": 65536, "length": 65536, "expected_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}),
+            ),
+            (
+                "skill_install",
+                "skill_versions",
+                json!({"project": "demo", "skill_key": "trusted-skill"}),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    test_suggested_call_route(target_tool),
+                    SuggestedToolCallRoute::Gateway(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME)
+                ),
+                "representative edge {source_tool}->{target_tool} should remain Adaptive gateway-routed"
+            );
+            let canonical_schema = webcodex_tool_contracts::output_schema_for_tool(source_tool);
+            let canonical_call = json!({"tool": target_tool, "arguments": arguments});
+            let mut projected_value = json!({
+                "success": false,
+                "output": {"suggested_call": canonical_call.clone()},
+                "error": "recovery"
+            });
+            project_suggested_tool_calls_in_value(
+                &mut projected_value,
+                &canonical_schema,
+                &test_suggested_call_route,
+            );
+            let projected_call = &projected_value["output"]["suggested_call"];
+            assert_eq!(projected_call["tool"], ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME);
+            assert_eq!(projected_call["arguments"]["tool"], target_tool);
+            assert_eq!(
+                projected_call["arguments"]["arguments"],
+                canonical_call["arguments"]
+            );
+
+            let mut projected_schema = canonical_schema;
+            project_suggested_tool_call_schema(&mut projected_schema, &test_suggested_call_route);
+            let suggested_schema =
+                &projected_schema["properties"]["output"]["properties"]["suggested_call"];
+            assert_eq!(
+                suggested_schema["properties"]["tool"]["const"],
+                ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+            );
+            assert_eq!(
+                suggested_schema["properties"]["arguments"]["properties"]["tool"]["const"],
+                target_tool
+            );
+            crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+                projected_call,
+                suggested_schema,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "Adaptive projected SuggestedToolCall {source_tool}->{target_tool} must match its projected schema: {error}"
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn unavailable_suggested_call_is_removed_from_value_and_schema() {
+        let mut value = json!({
+            "type": "result",
+            "next": {"tool": "not_available_here", "arguments": {"x": 1}}
+        });
+        let mut schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "type": {"type": "string"},
+                "next": webcodex_tool_contracts::suggested_tool_call_schema(
+                    "not_available_here",
+                    json!({
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {"x": {"type": "integer"}},
+                        "required": ["x"]
+                    }),
+                    "unavailable edge"
+                )
+            },
+            "required": ["type", "next"]
+        });
+        let canonical_schema = schema.clone();
+        project_suggested_tool_calls_in_value(&mut value, &canonical_schema, &|_| {
+            SuggestedToolCallRoute::Unavailable
+        });
+        project_suggested_tool_call_schema(&mut schema, &|_| SuggestedToolCallRoute::Unavailable);
+        assert!(value.get("next").is_none());
+        assert!(schema["properties"].get("next").is_none());
+        assert_eq!(schema["required"], json!(["type"]));
+        crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&value, &schema)
+            .unwrap_or_else(|error| {
+                panic!("unavailable edge removal must stay schema-valid: {error}")
+            });
+    }
+
+    #[test]
+    fn finish_coding_task_nested_show_changes_recovery_projects_with_route() {
+        let canonical_schema =
+            webcodex_tool_contracts::output_schema_for_tool("finish_coding_task");
+        let canonical_call = json!({
+            "tool": "git_diff_hunks",
+            "arguments": {
+                "project": "demo",
+                "cached": false,
+                "paths": [],
+                "max_hunks": 30,
+                "max_hunk_lines": 400,
+                "max_page_bytes": webcodex_core::runtime_contract::DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES
+            }
+        });
+        let canonical_value = json!({
+            "success": true,
+            "output": {
+                "changes": {
+                    "show_changes": {
+                        "diff_review_handoff": {"next_call": canonical_call.clone()}
+                    },
+                    "hunks_truncated": true
+                }
+            }
+        });
+
+        let mut current_adaptive = canonical_value.clone();
+        project_suggested_tool_calls_in_value(
+            &mut current_adaptive,
+            &canonical_schema,
+            &|target| suggested_tool_call_route(target, false),
+        );
+        assert_eq!(
+            current_adaptive["output"]["changes"]["show_changes"]["diff_review_handoff"]
+                ["next_call"],
+            canonical_call,
+            "current Adaptive direct routing must preserve the canonical nested call"
+        );
+
+        let synthetic_gateway_route = |target: &str| {
+            if target == "git_diff_hunks" {
+                SuggestedToolCallRoute::Gateway(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME)
+            } else {
+                SuggestedToolCallRoute::Direct
+            }
+        };
+        let mut projected_value = canonical_value;
+        project_suggested_tool_calls_in_value(
+            &mut projected_value,
+            &canonical_schema,
+            &synthetic_gateway_route,
+        );
+        let projected_call = &projected_value["output"]["changes"]["show_changes"]
+            ["diff_review_handoff"]["next_call"];
+        assert_eq!(projected_call["tool"], ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME);
+        assert_eq!(projected_call["arguments"]["tool"], "git_diff_hunks");
+        assert_eq!(
+            projected_call["arguments"]["arguments"],
+            canonical_call["arguments"]
+        );
+
+        let mut projected_schema = canonical_schema;
+        project_suggested_tool_call_schema(&mut projected_schema, &synthetic_gateway_route);
+        let projected_call_schema = &projected_schema["properties"]["output"]["properties"]
+            ["changes"]["properties"]["show_changes"]["properties"]["diff_review_handoff"]
+            ["properties"]["next_call"];
+        assert_eq!(
+            projected_call_schema["properties"]["tool"]["const"],
+            ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
+        );
+        assert_eq!(
+            projected_call_schema["properties"]["arguments"]["properties"]["tool"]["const"],
+            "git_diff_hunks"
+        );
+        crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+            &projected_value,
+            &projected_schema,
         )
-        .unwrap_err()
-        .contains("cannot coexist with Connector runtime state"));
+        .unwrap_or_else(|error| {
+            panic!("projected finish_coding_task nested recovery must match schema: {error}")
+        });
     }
 
     #[test]
-    fn default_surface_is_adaptive_runtime_without_connector_or_env() {
-        let mut env = crate::test_support::TestEnvGuard::new();
-        env.remove(MCP_MODEL_SURFACE_ENV);
-        assert_eq!(
-            resolve_runtime_exposure(None),
-            Ok(RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime))
-        );
-    }
-
-    #[test]
-    fn explicit_local_coding_adaptive_and_full_operator_values() {
-        let mut env = crate::test_support::TestEnvGuard::new();
-        env.set(MCP_MODEL_SURFACE_ENV, MCP_MODEL_SURFACE_LOCAL_CODING_V1);
-        assert_eq!(
-            resolve_runtime_exposure(None),
-            Ok(RuntimeExposure::Runtime(ModelSurface::LocalCoding))
-        );
-        env.set(MCP_MODEL_SURFACE_ENV, MCP_MODEL_SURFACE_ADAPTIVE_RUNTIME_V1);
-        assert_eq!(
-            resolve_runtime_exposure(None),
-            Ok(RuntimeExposure::Runtime(ModelSurface::AdaptiveRuntime))
-        );
-        env.set(MCP_MODEL_SURFACE_ENV, MCP_MODEL_SURFACE_FULL_OPERATOR_V1);
-        assert_eq!(
-            resolve_runtime_exposure(None),
-            Ok(RuntimeExposure::Runtime(ModelSurface::FullOperatorRuntime))
-        );
-        env.remove(MCP_MODEL_SURFACE_ENV);
-    }
-
-    #[test]
-    fn connector_configured_selects_project_connector() {
-        let mut env = crate::test_support::TestEnvGuard::new();
-        env.remove(MCP_MODEL_SURFACE_ENV);
-        let context = connector_context();
-        assert_eq!(
-            resolve_runtime_exposure(Some(&context)),
-            Ok(RuntimeExposure::ProjectConnector)
-        );
-    }
-
-    #[test]
-    fn invalid_and_conflicting_values_fail_resolution() {
-        let mut env = crate::test_support::TestEnvGuard::new();
-        env.set(MCP_MODEL_SURFACE_ENV, "bogus-surface");
-        let error = resolve_runtime_exposure(None).expect_err("invalid value must fail");
-        assert!(error.contains("unsupported"), "error: {error}");
-        assert!(error.contains("bogus-surface"), "error: {error}");
-
-        env.set(MCP_MODEL_SURFACE_ENV, MCP_MODEL_SURFACE_LOCAL_CODING_V1);
-        let context = connector_context();
-        let error = resolve_runtime_exposure(Some(&context)).expect_err("conflict must fail");
-        assert!(error.contains("cannot be combined"), "error: {error}");
-        assert!(error.contains(MCP_MODEL_SURFACE_ENV), "error: {error}");
-        env.remove(MCP_MODEL_SURFACE_ENV);
+    fn compact_schema_policy_defaults_true_and_respects_override() {
+        assert!(effective_mcp_compact_schemas(None));
+        assert!(effective_mcp_compact_schemas(Some(true)));
+        assert!(!effective_mcp_compact_schemas(Some(false)));
     }
 }

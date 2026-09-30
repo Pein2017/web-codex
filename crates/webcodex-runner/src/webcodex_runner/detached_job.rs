@@ -33,8 +33,7 @@ use webcodex_core::runner_protocol::{
     ShellJobActivitySource, ShellJobActivityState, ShellJobContext, ShellJobSnapshot,
     ShellJobStreamSnapshot, ShellProcessArgv, JOB_INVENTORY_MAX_JOBS,
     JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS, PROCESS_CWD_MAX_BYTES,
-    PROCESS_STDIN_MAX_BYTES, STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS,
-    STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS,
+    PROCESS_STDIN_MAX_BYTES, PROCESS_TIMEOUT_MAX_SECS, STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS,
 };
 
 #[cfg(unix)]
@@ -82,7 +81,10 @@ pub(crate) const DETACHED_ENV_FIELD_MAX_BYTES: usize = 8 * 1024;
 pub(crate) const DETACHED_ENV_TOTAL_MAX_BYTES: usize = 64 * 1024;
 pub(crate) const DETACHED_LAUNCH_MAX_BYTES: usize = 192 * 1024;
 pub(crate) const DETACHED_HANDOFF_TIMEOUT: Duration = Duration::from_secs(5);
-pub(crate) const DETACHED_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(250);
+// Detached payloads may run for days. Output tails are recovery/presentation data,
+// not process-liveness authority, so do not fsync+rename durable state at the live
+// Job update cadence. Terminalization still drains and commits the final tails.
+pub(crate) const DETACHED_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 const DETACHED_CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DETACHED_OUTPUT_CHANNEL_CAPACITY: usize = 64;
 const DETACHED_OUTPUT_READ_CHUNK: usize = 8 * 1024;
@@ -853,11 +855,11 @@ fn validate_launch_spec(spec: &DetachedLaunchSpec) -> Result<(), String> {
             return Err("detached process stdin cannot contain NUL bytes".to_string());
         }
     }
-    if !(STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS..=STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS)
+    if !(STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS..=PROCESS_TIMEOUT_MAX_SECS)
         .contains(&spec.timeout_secs)
     {
         return Err(format!(
-            "detached process timeout must be {STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS}..={STRUCTURED_EXECUTION_TIMEOUT_MAX_SECS} seconds"
+            "detached process timeout must be {STRUCTURED_EXECUTION_TIMEOUT_MIN_SECS}..={PROCESS_TIMEOUT_MAX_SECS} seconds"
         ));
     }
     if spec.env.len() > DETACHED_ENV_MAX_ENTRIES {

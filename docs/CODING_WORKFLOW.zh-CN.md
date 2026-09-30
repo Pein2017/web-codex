@@ -12,19 +12,63 @@
 work_on_project
 → inspect / search / read
 → edit
+→ substantial work 调用一次 present_work_result
 → focused validation
 → review changes
 → finish_coding_task
 ```
 
 `work_on_project` 是普通 coding/review 的 canonical bootstrap。把当前任务 instruction 交给它，然后遵循连接到的 Server 返回的 project instructions 与 tool surface。
-默认情况下，它还会返回一个很小且有界的 `extensions` selection catalog：Skill metadata 来自 canonical 的 project / Runner-configured `skills.roots` / Runner-managed Skill Store 三类来源；Plugin metadata 只包含 configured working directory 与当前 Project root 匹配、且已 ready/committed 的 provider。该 metadata 不授予任何 authority，也不会自动读取 Skill body 或创建 Plugin binding；模型选择后仍需使用 `skill_read_file`，或走 `plugin_tool describe -> call`。只有当前模型上下文仍明确保留这些 discovery metadata 时，才应设置 `include_extension_catalog=false`。
 
-Server 配置的 MCP initialization guidance 是默认的专用 guidance body。
-`work_on_project` 只返回它的 SHA-256 revision 和字节数，让调用方确认已收到
-哪一版 guidance，而不再次复制正文。Repository instruction body 和 WebCodex
-内置 workflow body 是彼此独立的 opt-in projection；需要时分别显式设置
-`include_project_instructions=true` 或 `include_workflow_guidance=true`。
+对于 substantial coding，在 Workflow Session 进入真实工作状态后（例如第一次有意义的源码 mutation，或开始长时间 validation），对该 exact Session 调用一次 `present_work_result(project, session_id)`。挂载后的 MCP App 会自行进行有界的 Workspace / Validation / Review live read，因此不要重复创建卡片，也不要为了给卡片喂状态而额外消耗 model turn。tiny/read-only 工作不需要 progress card。`finish_coding_task` 在 non-blocking closeout 时 seal eligible final changes，已经挂载的同一张卡会在后续 App refresh 中发现这份 immutable snapshot；如果此前没有挂卡而 closeout 明确返回 presentation suggestion，再在收尾时调用一次即可。
+它的 primary output 默认保持紧凑，不重复静态 instruction/workflow 正文；当前模型上下文缺少这些材料时，分别显式请求 `context_request=["project.instructions"]` 和/或 `context_request=["webcodex.workflow"]`。Workflow Session identity 不证明当前模型仍保留这些上下文。
+Bootstrap 或 discovery 返回 `project_ref` 后，普通 Project-scoped tool call 的 `project` 应优先复用这个短 selector。Canonical `agent:<client_id>:<project_id>` 仍保留用于 diagnostic 与显式 addressing，但模型无需机械重复。`project_ref` 由 Server 持久维护、按 principal 隔离，不携带 authority；每次调用都会根据其钉住的 canonical Project/root identity 重新授权。
+默认情况下，它还会返回一个很小且有界的 `extensions` selection catalog：Skill metadata 来自 canonical 的 project / Runner-configured `skills.roots` / Runner-managed Skill Store 三类来源；Plugin metadata 只包含 configured working directory 与当前 Project root 匹配、且已 ready/committed 的 provider。该 metadata 不授予任何 authority，也不会自动读取 Skill body 或创建 Plugin binding；模型选择后使用 `skill_read_file` 读取 Skill 文本，`run_skill_resource` 只执行可信 Runner-configured live `scripts/` resource（由 `expected_definition_revision` fence definition）或 Runner-installed managed resource（另由 `expected_package_revision` fence package），Plugin 则走 `plugin_tool describe -> call`。Configured resource bytes 会一直保持 live 到实际执行时，并不会预先被 package revision 固定。只有当前模型上下文仍明确保留这些 discovery metadata 时，才应设置 `include_extension_catalog=false`。
+
+## 工具策略 guidance
+
+`work_on_project` 的 `guidance_profile` 默认是 `direct`。Workflow contract v20
+保持共享的 `guidance`、`model_protocol` 和 review `roles`，并在显式
+`context_request=["webcodex.workflow"]` 时通过
+`tool_strategy` 返回本次请求选中的策略。
+
+- `direct`：简单 observation 直接调用最合适的 primitive；预先确定且独立的
+  observations 可以批量执行，模型根据结果顺序决定 adaptive follow-up。
+- `host_code_mode`：Host 确实提供 native orchestration 时使用。预先确定的同类输入
+  首先使用工具自己的 canonical batch，不要拆成同类 micro-call 并发；预先确定、互相
+  独立的 cross-tool read-only observation 才适合 Host 并行。native batch 之后若仍需
+  cross-tool fan-out，partial evidence 仍有价值时优先 `Promise.allSettled`，只有真正的
+  all-or-nothing 才使用 `Promise.all`。对于 result-dependent search/read/branch chain，
+  只要下一调用由结果机械确定且没有新的语义判断，就继续留在
+  同一个 Host cell。单个 child ToolResult 返回本身不是 model-turn boundary；需要 semantic
+  choice、ambiguous result、新用户决策、authority/permission、uncertain outcome、竞争性
+  recovery 或 mutation intent 尚未确定时才自然回到模型。完整 ToolResult 尽量留在 Host
+  cell，只返回下一次决策需要的紧凑证据。每个 Host cell 应是短生命周期 dependency DAG，
+  而不是承载长时间 Job lifetime。Job handoff 保存精确 identity 后，先完成已经确定的独立工作；
+  如果剩余工作主要只是等待，就结束当前 cell，之后从 exact continuation 恢复，不要让 cell
+  持续挂在长等待上，也不要因为 Job 存在就机械 `observe_jobs`。startup
+  `tool_strategy.host_orchestration` catalog 与 exact
+  `tool_manifest(tool_name=...)` hint 都从 canonical `ToolDefinition` metadata 派生；
+  它们只提供 guidance，不改变 `ToolCompositionPolicy`、authority、effect、permission、
+  retry、idempotency 或 runtime scheduling，默认/broad ToolSpec 也不携带这批 metadata。
+  该 profile 不授予任何 WebCodex capability/authority，也不要求 nested WebCodex Code Mode。
+- `code_mode`：简单单步 observation 仍直接调用；相关 search/read、跨文件定位或
+  综合调查能减少外层模型往返时，优先 read-only Code Mode。在同一个 cell 内顺序
+  完成依赖结果的 follow-up，只并发独立 observations。Raw child results 留在 cell
+  内，先筛选、提取、交叉引用和归纳，再用 `text(...)` 输出下一步决策需要的紧凑证据；
+  避免 `text(results)` 原样倾倒，并在触及 outer-output limit 前主动 projection。
+
+这只是本次请求的 presentation 选择，不增加 admission、权限或 execution semantics，
+不写入 Session。Exact resume 可以重新选择，也不会根据 Window、Session 或历史调用
+猜测。未编译 Experimental Code Mode 时，显式 `code_mode` 被拒绝为无效输入。
+在 `work_on_project` 调用中，`webcodex.workflow` sidecar 使用该次请求的
+`guidance_profile`；其他无 profile context 的普通工具显式请求该 material 时，
+继续使用 canonical default `direct`。
+
+这些策略共用 scope、recovery、validation truth、Job continuation、review 和 closeout。
+默认仍走 canonical edit 和 structured validation；只有多个相关 validation 或
+adaptive read → one guarded edit 确实减少外层往返时，才考虑相应的 effectful/mutating
+Code Mode。Nested canonical authority、effects、evidence 和 retry certainty 不变。
 
 ## 开始或继续任务
 
@@ -32,7 +76,7 @@ Server 配置的 MCP initialization guidance 是默认的专用 guidance body。
 
 普通使用不需要理解 WebCodex 内部的 continuity/audit field；这些属于 implementation/maintainer contract。
 
-显式请求后，内置 workflow body 会提供普通 implementation guidance。正常的“implement/fix/refactor”任务不需要知道任何实现角色名：把已授权工作推进到具体、可评审的完成状态，端到端覆盖跨层改动，保持设计最小化，按范围验证，并如实报告证据。只使用当前暴露 schema 支持的工具与协议字段。
+内置默认 guidance 本身就是普通 implementation workflow。正常的“implement/fix/refactor”任务不需要知道任何实现角色名：把已授权工作推进到具体、可评审的完成状态，端到端覆盖跨层改动，保持设计最小化，按范围验证，并如实报告证据。只使用当前暴露 schema 支持的工具与协议字段。
 
 `independent_review` 是唯一保留的可选 named role，因为它确实改变行为。只有任务明确要求独立评审 pass 时才使用：
 
@@ -43,7 +87,7 @@ Server 配置的 MCP initialization guidance 是默认的专用 guidance body。
 
 如果也希望修复，明确补充“修复具体发现，并运行聚焦回归验证”。单独指定评审角色不代表授权修改，任何 role 都不会授予额外 authority。
 
-Opt-in workflow guidance 通过工具结果交给客户端，不是客户端的 system prompt，也不会授予执行权限。Host 指令、用户任务、适用项目规则、认证和运行时安全策略仍然有效。返回 guidance 不等于模型已经读取、记住或遵守。MCP initialization guidance 遵循 MCP connection lifecycle，并与这些 project-startup projection 保持分离。
+Guidance 通过工具结果交给客户端，不是客户端的 system prompt，也不会授予执行权限。Host 指令、用户任务、适用项目规则、认证和运行时安全策略仍然有效。返回 guidance 不等于模型已经读取、记住或遵守；只有当前模型上下文仍保留内容时才应关闭其返回。
 
 ## 编辑前先检查
 
@@ -67,7 +111,11 @@ Guard failure 是 **zero-write conflict**，不是削弱 guard 的理由。重�
 
 ## Validation
 
+Formatting 属于收尾，不是每次编辑后的 validation。普通循环是：编辑 → focused validation → 必要时继续编辑 → 源码稳定 → format 一次 → 最终 review/validation。Rust 格式化应在相关源码稳定后、最终 diff/closeout 前执行；只有后续 Rust 编辑可能改变格式时才重跑。`cargo_fmt(check=false)` 用于有意执行最终格式化，`check=true` 用于需要最终只读格式证明的情况。CI/release 格式检查保持不变。
+
 能使用 `cargo_test`、`cargo_check`、`go_test` 等 structured validation 时优先使用它们。先运行能够发现当前回归的最小检查，只有实际受影响的边界需要时才扩大范围。
+
+检查一个 Cargo workspace package 时，`cargo_check` 接受 `package`；检查多个 package 时传入 `packages`。WebCodex 会对该集合排序并去重，然后在同一个 Cargo 进程中使用重复的 `-p` selector。两个 selector 互斥，显式空列表无效。
 
 如果一个确定需要执行的 validation 很可能明显超过 synchronous grace，同时还有真正独立的 read-only inspection，可以显式设置较短的 `sync_wait_secs`（通常可用 `1`），让已经启动的 validation 以**同一个 execution** 尽早 handoff 为 Job。随后只继续独立的源码读取、搜索、diff/architecture inspection 或 review，再观察该 Job；不要为了“并行”额外启动 CPU-heavy validation。如果运行中的 validation 所覆盖源码随后发生 mutation，那么其结果只能算 stale/cache-warmup evidence，不能证明 final workspace；最终源码仍需重新运行 task-appropriate validation。
 
@@ -85,7 +133,7 @@ Guard failure 是 **zero-write conflict**，不是削弱 guard 的理由。重�
 
 ## 长时间运行的工作
 
-命令或 validation 超过同步等待窗口时，会作为同一条 WebCodex Job 继续执行。保留其精确 Job identity 与 parser-ready continuation；如果仍有有用的独立工作，就先继续这些工作，之后再 observe，不要为了“保持可见”反复轮询 running Job。只有下一步真正依赖 terminal result 时，才使用返回的 `wait_secs=100, wake_on=terminal` 有界等待 continuation。Recovery/continuation hint 不会授权对不确定 effect 做 retry。
+命令或 validation 超过同步等待窗口时，会作为同一条 WebCodex Job 继续执行。保留其精确 Job identity 与 parser-ready continuation；如果仍有有用的独立工作，就先继续这些工作，之后再 observe，不要为了“保持可见”反复轮询 running Job。只有下一步真正依赖 terminal result 时，才使用返回的 host-safe `wait_secs=55, wake_on=terminal` continuation。Runtime 仍接受最长 100 秒的显式 observation wait，但更长的 model-facing wait 可能超过外层 MCP Host deadline。单个 Job 或任一 terminal result 即可推进时使用 `terminal`；预先确定的一组 Job 必须全部结束才能推进时使用 `all_terminal`。Recovery/continuation hint 不会授权对不确定 effect 做 retry。
 
 ## 手动多窗口协作
 

@@ -275,7 +275,7 @@ fn non_git_show_changes_payload_with_observation(
         "git_error": "not a git repository; git-backed diff unavailable",
         "branch": null,
         "upstream_status": "unobserved",
-        "upstream_reason_code": "git_unavailable",
+        "upstream_reason_code": "non_git_project",
         "upstream": null,
         "ahead": null,
         "behind": null,
@@ -316,7 +316,7 @@ fn non_git_show_changes_payload_with_observation(
         "head_exit": null,
         "warnings": [],
         "suggested_next_actions": [
-            "git-backed status/diff unavailable; project is not a git repository",
+            "git-backed status/diff is not applicable; project is not a git repository",
         ],
         "session": null,
         "exit_code": observation.exit_code,
@@ -1464,7 +1464,12 @@ pub(crate) fn parse_show_changes_output_with_observation(
         }
     }
 
-    let suggested_next_actions = if status_observed {
+    let suggested_next_actions = if observation.non_git() {
+        vec![
+            "git-backed status/diff is not applicable; continue with non-git review evidence"
+                .to_string(),
+        ]
+    } else if status_observed {
         suggested_next_actions_for(
             clean.unwrap_or(false),
             untracked > 0,
@@ -1658,33 +1663,18 @@ fn untracked_preview_path_is_invalid(path: &str) -> bool {
 }
 
 fn untracked_preview_path_is_sensitive(path: &str) -> bool {
-    let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    normalized
-        .split('/')
-        .filter(|part| !part.is_empty() && *part != ".")
-        .any(|part| {
-            matches!(
-                part,
-                ".git"
-                    | "target"
-                    | "node_modules"
-                    | "project-registry"
-                    | "projects.d"
-                    | "runner.toml"
-                    | "agent.toml"
-                    | "webcodex.env"
-                    | ".env"
-                    | "secrets"
-                    | "tokens"
-                    | "id_rsa"
-                    | "id_ed25519"
-            ) || part.starts_with(".env")
-                || part.starts_with("runner.toml")
-                || part.starts_with("agent.toml")
-                || part.starts_with("webcodex.env")
-                || part.ends_with(".pem")
-                || part.ends_with(".key")
-        })
+    webcodex_core::sensitive_paths::is_secret_path(path)
+        || path
+            .replace('\\', "/")
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .map(str::to_ascii_lowercase)
+            .any(|part| {
+                matches!(
+                    part.as_str(),
+                    "target" | "node_modules" | "id_rsa" | "id_ed25519"
+                )
+            })
 }
 
 fn untracked_preview_from_bytes(
@@ -2074,11 +2064,17 @@ fn set_show_changes_verdict(output: &mut Value) {
         }
         _ => {}
     }
-    if !git_available || non_git_project {
+    if non_git_project {
+        push_unique_reason(&mut warning_reasons, "non_git_project");
+        push_unique_action(
+            &mut actions,
+            "git-backed status/diff is not applicable; continue with non-git review evidence",
+        );
+    } else if !git_available {
         push_unique_reason(&mut warning_reasons, "git_unavailable");
         push_unique_action(
             &mut actions,
-            "git-backed status/diff unavailable; continue with non-git review evidence",
+            "git-backed status/diff unavailable; inspect Git availability before relying on worktree review",
         );
     }
 
@@ -2437,6 +2433,7 @@ impl ToolRuntime {
             .runner_registry
             .enqueue_run(
                 ShellRunRequest {
+                    login: false,
                     client_id,
                     cwd: Some(proj.path.clone()),
                     command: "git status --porcelain".to_string(),
@@ -2477,6 +2474,38 @@ impl ToolRuntime {
         max_hunk_lines: Option<usize>,
         session_event_limit: Option<usize>,
     ) -> ToolResult {
+        self.show_changes_observation(
+            project,
+            session_id,
+            include_diff,
+            max_hunks,
+            max_hunk_lines,
+            session_event_limit,
+            false,
+        )
+        .await
+    }
+
+    /// Presentation must not execute repository-configured filters or hooks.
+    /// Reuse the ordinary bounded producer/parser without recording a Session.
+    pub(in crate::tool_runtime) async fn show_changes_for_presentation(
+        &self,
+        project: String,
+    ) -> ToolResult {
+        self.show_changes_observation(project, None, Some(false), None, None, None, true)
+            .await
+    }
+
+    async fn show_changes_observation(
+        &self,
+        project: String,
+        session_id: Option<String>,
+        include_diff: Option<bool>,
+        max_hunks: Option<usize>,
+        max_hunk_lines: Option<usize>,
+        session_event_limit: Option<usize>,
+        read_only_presentation: bool,
+    ) -> ToolResult {
         let include_diff = include_diff.unwrap_or(false);
         let max_hunks = max_hunks
             .filter(|n| *n > 0)
@@ -2492,7 +2521,26 @@ impl ToolRuntime {
         let session_summary_limit = recent_events_limit
             .max(SHOW_CHANGES_SESSION_SIGNAL_EVENT_LIMIT)
             .min(SHOW_CHANGES_MAX_SESSION_EVENT_LIMIT);
-        let command = show_changes_command(include_diff, max_hunks, max_hunk_lines);
+        let mut command = show_changes_command(include_diff, max_hunks, max_hunk_lines);
+        if read_only_presentation {
+            command = format!(
+                r#"set -eu
+umask 077
+GIT_OPTIONAL_LOCKS=0; export GIT_OPTIONAL_LOCKS
+{safe_config}
+git() {{
+  if [ "$1" = diff ]; then
+    shift
+    command git -c include.path="$changes_git_overlay" -c core.fsmonitor=false diff --no-ext-diff --no-textconv "$@"
+  else
+    command git -c include.path="$changes_git_overlay" -c core.fsmonitor=false "$@"
+  fi
+}}
+set +e
+{command}"#,
+                safe_config = super::super::changes::CHANGES_GIT_SAFE_CONFIG_SETUP,
+            );
+        }
         let output = match self
             .run_project_internal_posix_script_capture(&project, command, 30, None)
             .await

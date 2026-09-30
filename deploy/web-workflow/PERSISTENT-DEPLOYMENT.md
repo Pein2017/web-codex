@@ -6,7 +6,7 @@ This is a named Linux dogfood deployment, not an npm or GitHub release.
 
 ## Layout and prerequisites
 
-- `releases/<id>/`: immutable Server/Runner binaries, guidance, and the **complete**
+- `releases/<id>/`: immutable matching Server/Runner/CLI binaries, guidance, and the **complete**
   workflow Plugin bundle (`plugin.mjs`, `pytest_report.py`, package metadata).
 - `current`: symlink selecting one release; state is never stored beneath it.
 - `config/`: private Server env, Runner TOML and Tunnel control-plane credentials.
@@ -54,7 +54,8 @@ Credentials remain the existing private files; do not paste them into commands.
 
 ## Controlled update and rollback
 
-New deployment bundles include executable `service.sh` at their release root.
+New deployment bundles include executable `service.sh` at their release root and
+their matching CLI at `bin/webcodex-cli`.
 `bin/control.sh` uses that versioned launcher when present; older releases use
 the retained `bin/service.sh`. Thus switching back also restores the former
 execution environment. A configuration-only release may reuse unchanged native

@@ -94,6 +94,10 @@ async fn fast_cargo_test_require_tests_rejects_ignored_only_and_records_failed_s
     assert!(error.contains("substring filter"), "{error}");
     assert!(error.contains("full qualified name"), "{error}");
     assert!(error.contains("--exact"), "{error}");
+    assert!(error.contains("terminal"), "{error}");
+    assert!(error.contains("no active Job continuation"), "{error}");
+    assert!(result.output.get("job_id").is_none());
+    assert!(result.output.get("continuation").is_none());
     assert_eq!(result.output["test_count_assertion"]["actual_tests_run"], 0);
     assert_model_cargo_result_matches_schema("cargo_test", &result);
     assert!(
@@ -365,7 +369,7 @@ async fn handoff_cargo_test_authoritative_count_passes_session_validation() {
         .validation_summary_for_session_with_jobs(&summary, 50, Some(&auth))
         .await;
     assert_eq!(validation["status"], "passed", "{validation:#}");
-    assert_eq!(validation["current_evidence"]["status"], "passed");
+    assert_eq!(validation["current_evidence"]["status"], "unproven");
     assert_eq!(
         validation["current_evidence"]["evidence_gap_event_count"],
         0
@@ -515,7 +519,7 @@ async fn cargo_test_minimum_misassertion_then_sufficient_same_target_is_non_bloc
                 include_workspace: Some(false),
                 include_checkpoints: Some(false),
                 include_validation: Some(true),
-                summary_only: true,
+                diagnostic: true,
                 limit: Some(50),
             },
             Some(&auth),
@@ -525,7 +529,7 @@ async fn cargo_test_minimum_misassertion_then_sufficient_same_target_is_non_bloc
     assert_eq!(handoff.output["validation"]["status"], "passed");
     assert_eq!(
         handoff.output["validation"]["current_evidence"]["status"],
-        "passed"
+        "unproven"
     );
     assert_eq!(
         handoff.output["validation"]["current_evidence"]["evidence_gap_event_count"],

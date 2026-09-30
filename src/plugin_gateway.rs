@@ -10,6 +10,8 @@ pub(crate) use webcodex_core::plugin::*;
 use crate::auth::{AuthContext, SCOPE_PLUGIN_INSPECT, SCOPE_PLUGIN_INVOKE, SCOPE_PLUGIN_MANAGE};
 use crate::json_measurement::serialized_json_len;
 use crate::tool_runtime::sessions::SessionTransport;
+#[cfg(test)]
+use crate::tool_runtime::specialized::SpecializedAuthorityRequirement;
 use crate::tool_runtime::specialized::{
     SpecializedGovernanceDenial, SpecializedOperationPolicy, SpecializedSource,
 };
@@ -19,6 +21,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
+use webcodex_tool_contracts::PluginToolAction;
 
 pub(crate) const PLUGIN_TOOL_NAME: &str = "plugin_tool";
 const MAX_PLUGIN_BINDINGS: usize = 512;
@@ -143,18 +146,19 @@ pub(crate) enum PluginOperation {
     Call,
 }
 
-impl PluginOperation {
-    fn parse(action: &str) -> Option<Self> {
+impl From<PluginToolAction> for PluginOperation {
+    fn from(action: PluginToolAction) -> Self {
         match action {
-            "list" => Some(Self::List),
-            "check" => Some(Self::Check),
-            "reload" => Some(Self::Reload),
-            "describe" => Some(Self::Describe),
-            "call" => Some(Self::Call),
-            _ => None,
+            PluginToolAction::List => Self::List,
+            PluginToolAction::Check => Self::Check,
+            PluginToolAction::Reload => Self::Reload,
+            PluginToolAction::Describe => Self::Describe,
+            PluginToolAction::Call => Self::Call,
         }
     }
+}
 
+impl PluginOperation {
     pub(crate) fn policy(self) -> SpecializedOperationPolicy {
         match self {
             Self::List => SpecializedOperationPolicy::read(
@@ -282,7 +286,6 @@ fn audit_arguments_with_resolved_binding(mut audit: Value, binding: &PluginBindi
 pub(crate) struct PluginInvocationResult {
     operation: PluginOperation,
     result: Result<GatewaySuccess, GatewayError>,
-    session_attention: Option<crate::tool_runtime::specialized::SpecializedSessionAttention>,
 }
 
 impl PluginInvocationResult {
@@ -317,40 +320,12 @@ impl PluginInvocationResult {
         }
     }
 
-    pub(crate) fn to_mcp_result(&self, runtime: &ToolRuntime, ignored_metadata: &[&str]) -> Value {
-        let mut result = render_gateway_result(self.result.clone());
-        let mut projection = ToolResult::ok(json!({}));
-        if let Some(attention) = &self.session_attention {
-            attention.add_to_result(runtime, &mut projection);
-        }
-        if !ignored_metadata.is_empty() {
-            projection.output["ignored_invocation_metadata"] = json!(ignored_metadata);
-        }
-        if let Some(metadata) = projection
-            .output
-            .as_object()
-            .filter(|value| !value.is_empty())
-        {
-            if matches!(&self.result, Ok(GatewaySuccess::ToolResult(_))) {
-                // Provider structuredContent belongs to its own schema and can
-                // be absent or use these same field names. Do not overwrite it.
-                if let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) {
-                    content.push(json!({"type": "text", "text": format!(
-                        "WebCodex invocation metadata: {}", projection.output
-                    )}));
-                }
-            } else if let Some(structured) = result
-                .get_mut("structuredContent")
-                .and_then(Value::as_object_mut)
-            {
-                structured.extend(metadata.clone());
-            }
-        }
-        result
+    pub(crate) fn to_mcp_result(&self) -> Value {
+        render_gateway_result(self.result.clone())
     }
 
-    pub(crate) fn to_tool_result(&self, runtime: &ToolRuntime) -> ToolResult {
-        let mut result = match &self.result {
+    pub(crate) fn to_tool_result(&self) -> ToolResult {
+        match &self.result {
             Ok(GatewaySuccess::Metadata(value)) => ToolResult::ok(value.clone()),
             Ok(GatewaySuccess::ToolResult(result)) => {
                 let mut output = serde_json::to_value(result).unwrap_or_else(|_| json!({}));
@@ -373,11 +348,7 @@ impl PluginInvocationResult {
                 }
             }
             Err(error) => gateway_error_tool_result(error),
-        };
-        if let Some(attention) = &self.session_attention {
-            attention.add_to_result(runtime, &mut result);
         }
-        result
     }
 }
 
@@ -389,10 +360,8 @@ pub(crate) async fn invoke(
     recording_session_id: Option<&str>,
     auth: Option<&AuthContext>,
     transport: SessionTransport,
-    ack_session_message_ids: &[String],
 ) -> Result<PluginInvocationResult, SpecializedGovernanceDenial> {
-    let operation = PluginOperation::parse(&request.action)
-        .expect("PluginToolCall parser admits only the closed action vocabulary");
+    let operation = PluginOperation::from(request.action);
     let policy = operation.policy();
     let audit = audit_request_with_identity(runtime, &request, auth).await;
     let permit = runtime
@@ -403,17 +372,11 @@ pub(crate) async fn invoke(
             recording_session_id,
             auth,
             &audit,
-            ack_session_message_ids,
         )
         .await?;
 
     let result = execute_business(runtime, operation, request, auth).await;
-    let session_attention = runtime.specialized_session_attention(&permit);
-    let invocation = PluginInvocationResult {
-        operation,
-        result,
-        session_attention,
-    };
+    let invocation = PluginInvocationResult { operation, result };
     runtime.finish_specialized_invocation(
         permit,
         invocation.success(),
@@ -1271,38 +1234,6 @@ fn dispatch_state_name(state: PluginDispatchState) -> &'static str {
 mod tests {
     use super::*;
 
-    #[test]
-    fn invocation_metadata_preserves_provider_content_and_optional_structured_result() {
-        let runtime = ToolRuntime::new_for_tests();
-        for structured_content in [
-            None,
-            Some(json!({"ignored_invocation_metadata": "provider-owned"})),
-        ] {
-            let invocation = PluginInvocationResult {
-                operation: PluginOperation::Call,
-                result: Ok(GatewaySuccess::ToolResult(PluginToolResult {
-                    content: vec![webcodex_core::plugin::PluginContent::Text {
-                        text: "provider text".into(),
-                    }],
-                    structured_content: structured_content.clone(),
-                    is_error: false,
-                })),
-                session_attention: None,
-            };
-            let result = invocation.to_mcp_result(&runtime, &["ack_session_context_revision"]);
-            assert_eq!(
-                result["structuredContent"],
-                structured_content.unwrap_or(Value::Null)
-            );
-            assert_eq!(result["content"][0]["text"], "provider text");
-            assert!(result["content"][1]["text"]
-                .as_str()
-                .unwrap()
-                .contains("ack_session_context_revision"));
-            assert_eq!(result["isError"], false);
-        }
-    }
-
     fn test_binding(provider: &str, tool: &str) -> PluginBinding {
         PluginBinding {
             client_id: "runner-a".to_string(),
@@ -1551,16 +1482,16 @@ mod tests {
             SpecializedEffect::Management
         );
         assert_eq!(
-            PluginOperation::Check.policy().required_scope,
-            SCOPE_PLUGIN_MANAGE
+            PluginOperation::Check.policy().authority,
+            SpecializedAuthorityRequirement::Scope(SCOPE_PLUGIN_MANAGE)
         );
         assert!(!PluginOperation::Check.policy().write_like);
         assert!(PluginOperation::Check.policy().shell_like);
         assert!(PluginOperation::Reload.policy().write_like);
         assert!(PluginOperation::Reload.policy().shell_like);
         assert_eq!(
-            PluginOperation::Call.policy().required_scope,
-            SCOPE_PLUGIN_INVOKE
+            PluginOperation::Call.policy().authority,
+            SpecializedAuthorityRequirement::Scope(SCOPE_PLUGIN_INVOKE)
         );
     }
 }

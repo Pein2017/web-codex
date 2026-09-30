@@ -15,6 +15,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
 
 fn cargo_output_schema(tool_name: &str) -> Value {
     let mut fields = vec![
+            ("source_state", super::common::validation_source_state_schema()),
             ("project", schema_type("string", "Runtime project id.")),
             ("command_summary", schema_type("string", "Bounded structured validation command summary.")),
             (
@@ -43,7 +44,7 @@ fn cargo_output_schema(tool_name: &str) -> Value {
             ),
             (
                 "passed",
-                nullable_schema("boolean", "Whether command execution succeeded and every requested structured validation postcondition was proven. Absent while a promoted Job is still running."),
+                nullable_schema("boolean", "Whether execution and requested validator postconditions passed; NOT proof of current workspace source. Inspect source_state independently. Absent while a Job is running."),
             ),
             (
                 "command_started",
@@ -110,6 +111,7 @@ fn cargo_output_schema(tool_name: &str) -> Value {
             ("async_handoff_available", schema_type("boolean", "Whether this Runner supports validation Job handoff.")),
             ("detected_summary", open_object_schema("Current bounded validation/progress summary at the initial durable Job handoff; advisory only and never retry authority.")),
             ("continuation", observe_job_continuation_schema()),
+            ("suggested_call", super::jobs::list_jobs_recovery_call_schema(true)),
             ("session_hint", session_hint_schema()),
             ("permission", permission_decision_schema()),
     ];
@@ -368,19 +370,38 @@ fn cargo_output_schema(tool_name: &str) -> Value {
                     "success": {"const": false},
                     "error": {"type": "string", "minLength": 1},
                     "output": {
-                        "required": terminal_failure_required.clone(),
+                        "required": ["execution_state", "command_started", "command_completed", "terminal", "failure_kind"],
                         "properties": {
-                            "promoted_to_job": {"const": false},
                             "terminal": {"const": false},
                             "command_started": {"const": true},
                             "command_completed": {"const": false},
                             "execution_state": {"const": "outcome_unknown"},
                             "passed": {"const": false},
-                            "failure_kind": {"const": "outcome_unknown"},
-                            "job_id": {"enum": []},
-                            "job_status": {"enum": []},
-                            "continuation": {"enum": []},
-                        }
+                            "failure_kind": {"const": "outcome_unknown"}
+                        },
+                        "allOf": [{
+                            "if": {
+                                "properties": {"job_id": {"type": "string"}},
+                                "required": ["job_id"]
+                            },
+                            "then": {
+                                "required": ["job_status", "continuation"],
+                                "properties": {
+                                    "job_id": {"type": "string", "minLength": 1},
+                                    "job_status": {"type": "string", "minLength": 1},
+                                    "promoted_to_job": {"const": true},
+                                    "suggested_call": {"enum": []}
+                                }
+                            },
+                            "else": {
+                                "properties": {
+                                    "job_id": {"type": "null"},
+                                    "job_status": {"type": "null"},
+                                    "promoted_to_job": {"const": false},
+                                    "continuation": {"enum": []}
+                                }
+                            }
+                        }]
                     }
                 }
             },

@@ -18,9 +18,98 @@ pub(crate) const MAX_READ_FILES_ITEMS: usize = 8;
 // and downstream Runner admission (for example polling capacity) remain hard bounds.
 pub(crate) const MAX_READ_FILES_CONCURRENCY: usize = 8;
 pub(crate) const DEFAULT_READ_FILES_DEADLINE: Duration = Duration::from_secs(30);
+const READ_FILES_MERGE_GAP_LINES: usize = 20;
+const READ_FILES_MAX_MERGED_LINES: usize = 400;
 pub(crate) use webcodex_core::runtime_contract::{
     DEFAULT_READ_FILES_RESULT_BYTES, MIN_READ_FILES_RESULT_BYTES,
 };
+
+#[derive(Clone, Debug)]
+struct PlannedReadMember {
+    index: usize,
+    start_line: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct PlannedRead {
+    item: ReadFilesItem,
+    members: Vec<PlannedReadMember>,
+}
+
+fn plan_read_files(items: Vec<ReadFilesItem>) -> Vec<PlannedRead> {
+    let mut normalized = items
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let (start, _, end) =
+                super::files::effective_read_file_range(item.start_line, item.limit);
+            (
+                item.path.clone(),
+                item.expected_read_revision,
+                start,
+                end,
+                PlannedReadMember {
+                    index,
+                    start_line: item.start_line,
+                    limit: item.limit,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    normalized.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.3.cmp(&right.3))
+    });
+
+    let mut planned: Vec<PlannedRead> = Vec::with_capacity(normalized.len());
+    for (path, expected_read_revision, start, end, member) in normalized {
+        let merge_into_last = planned.last_mut().filter(|existing| {
+            existing.item.path == path
+                && existing.item.expected_read_revision == expected_read_revision
+        });
+        if let Some(existing) = merge_into_last {
+            let (existing_start, _, existing_end) = super::files::effective_read_file_range(
+                existing.item.start_line,
+                existing.item.limit,
+            );
+            let merged_end = existing_end.max(end);
+            let merged_lines = merged_end.saturating_sub(existing_start).saturating_add(1);
+            let close_enough = start <= existing_end.saturating_add(READ_FILES_MERGE_GAP_LINES);
+            // Contained/identical ranges add no physical lines or bytes, even
+            // when the original caller range exceeds the union-planning cap.
+            if end <= existing_end || (close_enough && merged_lines <= READ_FILES_MAX_MERGED_LINES)
+            {
+                existing.item.limit = Some(merged_lines);
+                existing.members.push(member);
+                continue;
+            }
+        }
+
+        planned.push(PlannedRead {
+            item: ReadFilesItem {
+                path,
+                start_line: Some(start),
+                limit: Some(end.saturating_sub(start).saturating_add(1)),
+                expected_read_revision,
+            },
+            members: vec![member],
+        });
+    }
+    planned
+}
+
+/// Inspect the unique ranges of the canonical physical read plan in tests.
+#[cfg(test)]
+pub(crate) fn coalesce_read_files_items(items: Vec<ReadFilesItem>) -> Vec<ReadFilesItem> {
+    plan_read_files(items)
+        .into_iter()
+        .map(|planned| planned.item)
+        .collect()
+}
 
 /// Read request facts captured before the ToolCall is moved into execution.
 /// Canonical read results remain independent of this projection; these facts
@@ -90,7 +179,7 @@ fn read_revision_target(
     }
 }
 
-fn stale_read_revision_failure(path: &str) -> ToolResult {
+pub(super) fn stale_read_revision_failure(path: &str) -> ToolResult {
     ToolResult::err_with_output(
         "read_file failed: stale_read_revision",
         json!({
@@ -194,6 +283,7 @@ pub(crate) fn add_actionable_read_continuations(
     let Some(output) = result.output.as_object_mut() else {
         return;
     };
+    output.remove("suggested_call");
     let Some(returned) = output.get("items").and_then(Value::as_array) else {
         return;
     };
@@ -201,22 +291,31 @@ pub(crate) fn add_actionable_read_continuations(
     let mut returned_indices = BTreeSet::new();
     let mut next_by_index = BTreeMap::new();
     for item in returned {
-        let Some(index) = item
-            .get("index")
-            .and_then(Value::as_u64)
-            .map(|index| index as usize)
-        else {
+        let Some(index) = item["index"].as_u64().map(|index| index as usize) else {
             continue;
         };
         returned_indices.insert(index);
-        if let Some(next) = read_range_next_item(item) {
+        if let Some(mut next) = read_range_next_item(item) {
+            if item["output"]["budget_truncated"].as_bool() == Some(true) {
+                let Some(original) = original_items.get(index) else {
+                    continue;
+                };
+                let (_, _, end) =
+                    super::files::effective_read_file_range(original.start_line, original.limit);
+                let start = next.start_line.unwrap_or(1);
+                if start > end {
+                    continue;
+                }
+                next.limit = Some(next.limit.unwrap_or(1).min(end - start + 1));
+            }
             next_by_index.insert(index, next);
         }
     }
-    // A batch may be packed out of order when an item cannot fit. Build the
-    // continuation from original indices rather than a suffix cursor so a
-    // later small item never causes an earlier or middle request to vanish.
     if truncated {
+        // A replay with the same budget cannot advance an empty batch.
+        if returned_indices.is_empty() {
+            return;
+        }
         for (index, item) in original_items.iter().enumerate() {
             if !returned_indices.contains(&index) {
                 next_by_index.insert(index, item.clone());
@@ -224,22 +323,6 @@ pub(crate) fn add_actionable_read_continuations(
         }
     }
     let next_items = next_by_index.into_values().collect::<Vec<_>>();
-    let mut next_budget = *max_result_bytes;
-    if truncated && next_items.is_empty() {
-        return;
-    }
-    if truncated {
-        if returned_indices.is_empty() {
-            // Repeating a zero-progress request only helps with a larger budget.
-            // At the hard cap there is no proven next call.
-            if max_result_bytes.unwrap_or(DEFAULT_READ_FILES_RESULT_BYTES)
-                >= MAX_SERIALIZED_OUTPUT_BYTES
-            {
-                return;
-            }
-            next_budget = Some(MAX_SERIALIZED_OUTPUT_BYTES);
-        }
-    }
     if !next_items.is_empty() {
         output.insert(
             "suggested_call".to_string(),
@@ -250,7 +333,7 @@ pub(crate) fn add_actionable_read_continuations(
                     &next_items,
                     session_id.as_deref(),
                     *with_line_numbers,
-                    next_budget,
+                    *max_result_bytes,
                 ),
             )
             .to_value(),
@@ -380,136 +463,82 @@ fn apply_output_budget(
         "batch_response_budget"
     };
     let mut returned = Vec::with_capacity(completed.len());
-    let mut omitted_indices = BTreeSet::new();
+    let mut omitted = Vec::new();
+    let mut pending = completed
+        .iter()
+        .filter_map(|item| item["index"].as_u64().map(|index| index as usize))
+        .collect::<BTreeSet<_>>();
 
+    // Fit independent whole items first. A partial oversized read must not use
+    // the space needed by a later small read.
     for item in completed {
         let index = item["index"].as_u64().unwrap_or(returned.len() as u64) as usize;
         let mut candidate_items = returned.clone();
         candidate_items.push(item.clone());
-        let next_index = omitted_indices
-            .iter()
-            .copied()
-            .chain(std::iter::once(index))
-            .min();
         let candidate = batch_output(
             project,
             requested_count,
             candidate_items,
             true,
-            next_index,
+            pending
+                .iter()
+                .copied()
+                .find(|pending_index| *pending_index != index),
             Some(truncation_reason),
         );
         if projected_batch_serialized_len(&candidate, projection) <= payload_budget {
             returned.push(item);
-            continue;
-        }
-
-        // Read ranges are line-granular. If a whole item does not fit, retain
-        // the largest prefix whose exact parser-ready response (including all
-        // omitted-item continuations) remains within the same budget.
-        let returned_lines = item
-            .get("output")
-            .and_then(|output| output.get("returned_lines"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
-        let mut best_partial = None;
-        if returned_lines > 1 {
-            let mut low = 1usize;
-            let mut high = returned_lines - 1;
-            while low <= high {
-                let keep = low + (high - low) / 2;
-                let Some(partial) = truncate_read_item(&item, keep) else {
-                    break;
-                };
-                let mut candidate_items = returned.clone();
-                candidate_items.push(partial.clone());
-                let candidate = batch_output(
-                    project,
-                    requested_count,
-                    candidate_items,
-                    true,
-                    next_index,
-                    Some(truncation_reason),
-                );
-                if projected_batch_serialized_len(&candidate, projection) <= payload_budget {
-                    best_partial = Some(partial);
-                    low = keep.saturating_add(1);
-                } else {
-                    high = keep.saturating_sub(1);
-                }
-            }
-        }
-        if let Some(partial) = best_partial {
-            returned.push(partial);
+            pending.remove(&index);
         } else {
-            omitted_indices.insert(index);
+            omitted.push(item);
         }
     }
 
-    let mut next_index = omitted_indices.iter().next().copied();
-
-    let mut output = batch_output(
-        project,
-        requested_count,
-        returned,
-        true,
-        next_index,
-        Some(truncation_reason),
-    );
-    // The exact candidate checks above account for follow-up size. This final
-    // guard is retained for defensive compatibility with callers that decorate
-    // the canonical output before invoking this function.
-    while projected_batch_serialized_len(&output, projection) > payload_budget {
-        let Some(items) = output.get_mut("items").and_then(Value::as_array_mut) else {
-            break;
-        };
-        let Some(removed) = items.pop() else {
-            break;
-        };
-        let removed_index = removed["index"].as_u64().map(|index| index as usize);
-        next_index = next_index.into_iter().chain(removed_index).min();
-        let prefix = items.clone();
+    // Spend remaining space on whole source-line prefixes, measuring the
+    // combined invocation and revision-fenced follow-up for every candidate.
+    for item in omitted {
         let mut low = 1;
-        let mut high = removed["output"]["returned_lines"]
+        let mut high = item["output"]["returned_lines"]
             .as_u64()
             .unwrap_or(0)
             .saturating_sub(1) as usize;
         let mut best = None;
         while low <= high {
             let keep = low + (high - low) / 2;
-            let Some(partial) = truncate_read_item(&removed, keep) else {
+            let Some(partial) = truncate_read_item(&item, keep) else {
                 break;
             };
-            let mut candidate_items = prefix.clone();
-            candidate_items.push(partial);
+            let mut candidate_items = returned.clone();
+            candidate_items.push(partial.clone());
+            candidate_items.sort_by_key(|item| item["index"].as_u64());
             let candidate = batch_output(
                 project,
                 requested_count,
                 candidate_items,
                 true,
-                next_index,
+                pending.iter().next().copied(),
                 Some(truncation_reason),
             );
             if projected_batch_serialized_len(&candidate, projection) <= payload_budget {
-                best = Some(candidate);
+                best = Some(partial);
                 low = keep + 1;
             } else {
                 high = keep.saturating_sub(1);
             }
         }
-        if let Some(candidate) = best {
-            return candidate;
+        if let Some(partial) = best {
+            returned.push(partial);
         }
-        output = batch_output(
-            project,
-            requested_count,
-            prefix,
-            true,
-            next_index,
-            Some(truncation_reason),
-        );
     }
-    output
+    returned.sort_by_key(|item| item["index"].as_u64());
+    batch_output(
+        project,
+        requested_count,
+        returned,
+        true,
+        pending.iter().next().copied(),
+        Some(truncation_reason),
+    )
 }
 
 pub(crate) fn apply_model_facing_output_budget(
@@ -602,6 +631,13 @@ fn mark_final_hard_cap_truncation(output: &mut Value, next_index: usize) {
         json!(returned_count.saturating_sub(succeeded_count)),
     );
     root.insert("output_truncated".to_string(), json!(true));
+    let next_index = root
+        .get("next_index")
+        .and_then(Value::as_u64)
+        .map(|index| index as usize)
+        .into_iter()
+        .chain(std::iter::once(next_index))
+        .min();
     root.insert("next_index".to_string(), json!(next_index));
     root.insert("truncation_reason".to_string(), json!("hard_result_cap"));
 }
@@ -719,27 +755,138 @@ impl ToolRuntime {
             .await
     }
 
+    async fn read_planned_member(
+        &self,
+        resolved: &ResolvedProject,
+        runner_project_id: &str,
+        runner_instance_id: &str,
+        path: &str,
+        member: PlannedReadMember,
+        expected_sha256: Option<&str>,
+        with_line_numbers: bool,
+        deadline: Instant,
+    ) -> Value {
+        let mut result = self
+            .read_project_snapshot(
+                resolved,
+                runner_project_id,
+                runner_instance_id,
+                path.to_string(),
+                member.start_line,
+                member.limit,
+                expected_sha256,
+                deadline,
+            )
+            .await;
+        if result.success {
+            if let Some(expected_sha256) = expected_sha256 {
+                let actual_sha256 = result.output.get("sha256").and_then(Value::as_str);
+                if actual_sha256 != Some(expected_sha256) {
+                    result = stale_read_revision_failure(path);
+                }
+            }
+        }
+        let success = result.success;
+        let error = result.error.clone();
+        let output = result.output;
+        if !success {
+            return json!({
+                "index": member.index,
+                "path": path,
+                "success": false,
+                "output": output,
+                "error": error,
+            });
+        }
+
+        let target = read_revision_target(resolved, path, runner_instance_id);
+        let read_revision = output
+            .get("sha256")
+            .and_then(Value::as_str)
+            .map(|sha256| self.read_revisions.observe(target, sha256.to_string()));
+        let member_result = super::files::slice_read_file_result(
+            &output,
+            member.start_line,
+            member.limit,
+            with_line_numbers,
+            path,
+        );
+        if !member_result.success {
+            return json!({
+                "index": member.index,
+                "path": path,
+                "success": false,
+                "output": member_result.output,
+                "error": member_result.error,
+            });
+        }
+        let mut member_output = member_result.output;
+        if let Some(read_revision) = read_revision {
+            if let Some(object) = member_output.as_object_mut() {
+                object.insert("read_revision".to_string(), json!(read_revision));
+            }
+        }
+        json!({
+            "index": member.index,
+            "path": path,
+            "success": true,
+            "output": member_output,
+            "error": Value::Null,
+        })
+    }
+
     pub(crate) async fn read_files_resolved(
         &self,
         resolved: &ResolvedProject,
         items: Vec<ReadFilesItem>,
         with_line_numbers: Option<bool>,
     ) -> ToolResult {
+        self.read_files_planned_resolved(resolved, items, with_line_numbers, false)
+            .await
+            .0
+    }
+
+    /// Return successful union ranges once, while retaining the original member
+    /// fallback. The accompanying items describe the actual output order/ranges
+    /// so compound inspection can use canonical budget and continuation logic.
+    pub(crate) async fn read_files_coalesced_resolved(
+        &self,
+        resolved: &ResolvedProject,
+        items: Vec<ReadFilesItem>,
+        with_line_numbers: Option<bool>,
+    ) -> (ToolResult, Vec<ReadFilesItem>) {
+        self.read_files_planned_resolved(resolved, items, with_line_numbers, true)
+            .await
+    }
+
+    async fn read_files_planned_resolved(
+        &self,
+        resolved: &ResolvedProject,
+        items: Vec<ReadFilesItem>,
+        with_line_numbers: Option<bool>,
+        coalesced_output: bool,
+    ) -> (ToolResult, Vec<ReadFilesItem>) {
         if !(1..=MAX_READ_FILES_ITEMS).contains(&items.len())
             || items.iter().any(|item| item.path.trim().is_empty())
         {
-            return ToolResult::err("read_files requires 1 to 8 items with non-empty paths");
+            return (
+                ToolResult::err("read_files requires 1 to 8 items with non-empty paths"),
+                Vec::new(),
+            );
         }
 
         let runtime_project_id = resolved.resolved_id.clone();
         let Some(runner_project_id) =
             crate::tool_runtime::runner_local_project_id(&resolved.resolved_id).map(str::to_string)
         else {
-            return ToolResult::err(
-                "read_files could not bind the resolved Project to a Runner-local project id",
+            return (
+                ToolResult::err(
+                    "read_files could not bind the resolved Project to a Runner-local project id",
+                ),
+                Vec::new(),
             );
         };
-        let requested_count = items.len();
+        let planned_reads = plan_read_files(items.clone());
         let with_line_numbers = with_line_numbers.unwrap_or(false);
         let deadline = Instant::now() + self.read_files_deadline;
         // Capture the active Runner process before dispatch. A replacement that
@@ -752,14 +899,17 @@ impl ToolRuntime {
         {
             Some(view) => view.runner_instance_id,
             None => {
-                return ToolResult::err_with_output(
-                    "read_files could not bind the read snapshot to an active Runner process; retry after the Runner is available",
-                    json!({
-                        "project": runtime_project_id,
-                        "state_changed": false,
-                        "error_kind": "runner_unavailable",
-                        "retry_guidance": "retry read_files after the owning Runner is available"
-                    }),
+                return (
+                    ToolResult::err_with_output(
+                        "read_files could not bind the read snapshot to an active Runner process; retry after the Runner is available",
+                        json!({
+                            "project": runtime_project_id,
+                            "state_changed": false,
+                            "error_kind": "runner_unavailable",
+                            "retry_guidance": "retry read_files after the owning Runner is available"
+                        }),
+                    ),
+                    Vec::new(),
                 )
             }
         };
@@ -768,12 +918,12 @@ impl ToolRuntime {
         // No request can reach the Runner until its future is polled by
         // `buffer_unordered`, so at most MAX_READ_FILES_CONCURRENCY file reads
         // are actually in flight.
-        let mut completed: Vec<Value> =
-            stream::iter(items.into_iter().enumerate().map(|(index, item)| {
-                let project = &resolved.config;
+        let completed_groups: Vec<Vec<Value>> =
+            stream::iter(planned_reads.into_iter().map(|planned| {
                 let runner_project_id = runner_project_id.clone();
                 let runner_instance_id = runner_instance_id.clone();
                 async move {
+                    let PlannedRead { item, members } = planned;
                     let path = item.path;
                     let target = read_revision_target(resolved, &path, &runner_instance_id);
                     let expected_sha256 = match item.expected_read_revision {
@@ -781,26 +931,31 @@ impl ToolRuntime {
                             Ok(sha256) => Some(sha256),
                             Err(_) => {
                                 let result = stale_read_revision_failure(&path);
-                                return json!({
-                                    "index": index,
-                                    "path": path,
-                                    "success": false,
-                                    "output": result.output,
-                                    "error": result.error,
-                                });
+                                return members
+                                    .into_iter()
+                                    .map(|member| {
+                                        json!({
+                                            "index": member.index,
+                                            "path": path,
+                                            "success": false,
+                                            "output": result.output,
+                                            "error": result.error,
+                                        })
+                                    })
+                                    .collect::<Vec<_>>();
                             }
                         },
                         None => None,
                     };
                     let mut result = self
-                        .read_one_resolved_project_file(
-                            project,
+                        .read_project_snapshot(
+                            resolved,
                             &runner_project_id,
                             &runner_instance_id,
                             path.clone(),
                             item.start_line,
                             item.limit,
-                            with_line_numbers,
+                            expected_sha256.as_deref(),
                             deadline,
                         )
                         .await;
@@ -812,43 +967,168 @@ impl ToolRuntime {
                             }
                         }
                     }
+
+                    // Coalescing is an optimization, never a semantic reason for
+                    // otherwise-valid member reads to fail. A merged UTF-8 range
+                    // can cross the canonical raw-byte ceiling even when each
+                    // caller range fits independently; only that bounded failure
+                    // falls back to the original member reads.
+                    if members.len() > 1
+                        && !result.success
+                        && result.output.get("reason_code").and_then(Value::as_str)
+                            == Some("range_too_large")
+                    {
+                        let mut fallback = Vec::with_capacity(members.len());
+                        for member in members {
+                            fallback.push(
+                                self.read_planned_member(
+                                    resolved,
+                                    &runner_project_id,
+                                    &runner_instance_id,
+                                    &path,
+                                    member,
+                                    expected_sha256.as_deref(),
+                                    with_line_numbers,
+                                    deadline,
+                                )
+                                .await,
+                            );
+                        }
+                        return fallback;
+                    }
+
+                    // Only a successful physical union can replace its members.
+                    // Ordinary read_files and all failures retain caller ranges.
+                    // A plain union can fit while numbering/JSON projection
+                    // does not. In that case slice the original members from
+                    // the successful snapshot; no additional Runner read.
+                    let union_fits = coalesced_output
+                        && result.success
+                        && super::files::slice_read_file_result(
+                            &result.output,
+                            item.start_line,
+                            item.limit,
+                            with_line_numbers,
+                            &path,
+                        )
+                        .success;
+                    let members = if union_fits {
+                        vec![PlannedReadMember {
+                            index: members
+                                .iter()
+                                .map(|member| member.index)
+                                .min()
+                                .expect("planned read has at least one member"),
+                            start_line: item.start_line,
+                            limit: item.limit,
+                        }]
+                    } else {
+                        members
+                    };
                     let success = result.success;
-                    let error = result.error;
-                    let mut output = result.output;
-                    if success {
-                        if let Some(sha256) = output
+                    let error = result.error.clone();
+                    let output = result.output;
+                    let read_revision = if success {
+                        output
                             .get("sha256")
                             .and_then(Value::as_str)
-                            .map(str::to_string)
-                        {
-                            let read_revision = self.read_revisions.observe(target, sha256);
-                            if let Some(output) = output.as_object_mut() {
-                                output.insert("read_revision".to_string(), json!(read_revision));
+                            .map(|sha256| self.read_revisions.observe(target, sha256.to_string()))
+                    } else {
+                        None
+                    };
+                    members
+                        .into_iter()
+                        .map(|member| {
+                            if success {
+                                let member_result = super::files::slice_read_file_result(
+                                    &output,
+                                    member.start_line,
+                                    member.limit,
+                                    with_line_numbers,
+                                    &path,
+                                );
+                                if !member_result.success {
+                                    return json!({
+                                        "index": member.index,
+                                        "path": path,
+                                        "success": false,
+                                        "output": member_result.output,
+                                        "error": member_result.error,
+                                    });
+                                }
+                                let mut member_output = member_result.output;
+                                if let Some(read_revision) = read_revision {
+                                    if let Some(object) = member_output.as_object_mut() {
+                                        object.insert(
+                                            "read_revision".to_string(),
+                                            json!(read_revision),
+                                        );
+                                    }
+                                }
+                                json!({
+                                    "index": member.index,
+                                    "path": path,
+                                    "success": true,
+                                    "output": member_output,
+                                    "error": Value::Null,
+                                })
+                            } else {
+                                json!({
+                                    "index": member.index,
+                                    "path": path,
+                                    "success": false,
+                                    "output": output,
+                                    "error": error,
+                                })
                             }
-                        }
-                    }
-                    json!({
-                        "index": index,
-                        "path": path,
-                        "success": success,
-                        "output": output,
-                        "error": error,
-                    })
+                        })
+                        .collect::<Vec<_>>()
                 }
             }))
             .buffer_unordered(MAX_READ_FILES_CONCURRENCY)
             .collect()
             .await;
+        let mut completed: Vec<Value> = completed_groups.into_iter().flatten().collect();
         completed.sort_by_key(|item| item["index"].as_u64().unwrap_or(u64::MAX));
 
-        ToolResult::ok(batch_output(
-            &runtime_project_id,
-            requested_count,
-            completed,
-            false,
-            None,
-            None,
-        ))
+        let output_items = if coalesced_output {
+            completed
+                .iter_mut()
+                .enumerate()
+                .map(|(index, entry)| {
+                    let original_index = entry["index"]
+                        .as_u64()
+                        .expect("planned result retains its member index")
+                        as usize;
+                    let mut item = items[original_index].clone();
+                    if entry["success"].as_bool() == Some(true) {
+                        let output = &entry["output"];
+                        item.start_line =
+                            Some(output["start_line"].as_u64().expect("canonical read start")
+                                as usize);
+                        item.limit =
+                            Some(output["limit"].as_u64().expect("canonical read limit") as usize);
+                    }
+                    // Budget continuation indexes must refer to this actual plan,
+                    // including original ranges returned by byte-ceiling fallback.
+                    entry["index"] = json!(index);
+                    item
+                })
+                .collect::<Vec<_>>()
+        } else {
+            items
+        };
+        (
+            ToolResult::ok(batch_output(
+                &runtime_project_id,
+                output_items.len(),
+                completed,
+                false,
+                None,
+                None,
+            )),
+            output_items,
+        )
     }
 }
 
@@ -1038,7 +1318,7 @@ mod tests {
 
     #[test]
     fn oversized_first_item_does_not_suppress_later_small_items_or_revision_guards() {
-        let budget = 256 * 1024;
+        let budget = MIN_READ_FILES_RESULT_BYTES;
         let mut projection = batch_projection(3, Some(budget));
         if let ReadModelProjection::Batch { items, .. } = &mut projection {
             items[2].expected_read_revision = Some(9876);
@@ -1047,37 +1327,156 @@ mod tests {
             "agent:oe:demo",
             3,
             vec![
-                ranged_item(0, 1, &["x".repeat(300 * 1024)]),
+                ranged_item(0, 1, &["x".repeat(90 * 1024)]),
                 ranged_item(1, 1, &["small".to_string()]),
-                ranged_item(2, 1, &["z".repeat(300 * 1024)]),
+                ranged_item(2, 1, &["z".repeat(90 * 1024)]),
             ],
             Some(budget),
             &projection,
         );
-        assert_eq!(output["output_truncated"], true);
-        assert_eq!(
-            output["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|item| item["index"].as_u64().unwrap())
-                .collect::<Vec<_>>(),
-            vec![1]
-        );
-
+        assert_eq!(output["next_index"], 0);
+        assert_eq!(output["items"][0]["index"], 1);
+        assert_eq!(output["items"].as_array().unwrap().len(), 1);
         let mut model = ToolResult::ok(output);
         add_actionable_read_continuations(&projection, &mut model);
-        let suggested = &model.output["suggested_call"]["arguments"]["items"];
+        let suggested = &model.output["suggested_call"];
+        let ToolCall::ReadFiles {
+            items,
+            max_result_bytes,
+            ..
+        } = ToolCall::from_tool_name(
+            suggested["tool"].as_str().unwrap(),
+            suggested["arguments"].clone(),
+        )
+        .unwrap()
+        else {
+            panic!("read continuation must parse");
+        };
         assert_eq!(
-            suggested
-                .as_array()
-                .unwrap()
+            items
                 .iter()
-                .map(|item| item["path"].as_str().unwrap())
+                .map(|item| item.path.as_str())
                 .collect::<Vec<_>>(),
             vec!["src/0.rs", "src/2.rs"]
         );
-        assert_eq!(suggested[1]["expected_read_revision"], 9876);
+        assert_eq!(items[1].expected_read_revision, Some(9876));
+        assert_eq!(max_result_bytes, Some(budget));
+        super::super::dispatch::sparsify_complete_read_success("read_files", &mut model);
+        assert!(serialized_json_len(&model).unwrap() <= budget);
+
+        // Replaying only the omitted items cannot re-execute the small item or
+        // advertise an unproductive replay with a silently larger budget.
+        let replay_projection = ReadModelProjection::Batch {
+            project: "agent:oe:demo".to_string(),
+            items,
+            session_id: None,
+            with_line_numbers: None,
+            max_result_bytes,
+        };
+        let mut replay = ToolResult::ok(apply_output_budget(
+            "agent:oe:demo",
+            2,
+            vec![
+                ranged_item(0, 1, &["x".repeat(90 * 1024)]),
+                ranged_item(1, 1, &["z".repeat(90 * 1024)]),
+            ],
+            max_result_bytes,
+            &replay_projection,
+        ));
+        add_actionable_read_continuations(&replay_projection, &mut replay);
+        assert!(replay.output["items"].as_array().unwrap().is_empty());
+        assert!(replay.output.get("suggested_call").is_none());
+    }
+
+    #[test]
+    fn oversized_multiline_read_reserves_later_small_item_and_whole_lines() {
+        let budget = MIN_READ_FILES_RESULT_BYTES;
+        let projection = batch_projection(2, Some(budget));
+        let lines = (0..100)
+            .map(|index| format!("line-{index}-{}", "界".repeat(40)))
+            .collect::<Vec<_>>();
+        let output = apply_output_budget(
+            "agent:oe:demo",
+            2,
+            vec![
+                ranged_item(0, 1, &lines),
+                ranged_item(1, 1, &["small".to_string()]),
+            ],
+            Some(budget),
+            &projection,
+        );
+        assert_eq!(output["items"].as_array().unwrap().len(), 2);
+        assert_eq!(output["items"][1]["output"]["text"], "small");
+        let partial = &output["items"][0]["output"];
+        let kept = partial["returned_lines"].as_u64().unwrap() as usize;
+        assert!(kept > 0 && kept < lines.len());
+        assert_eq!(partial["text"], lines[..kept].join("\n"));
+        let mut model = ToolResult::ok(output);
+        add_actionable_read_continuations(&projection, &mut model);
+        let next = &model.output["suggested_call"]["arguments"]["items"];
+        assert_eq!(next.as_array().unwrap().len(), 1);
+        assert_eq!(next[0]["start_line"], kept + 1);
+        assert_eq!(next[0]["limit"], lines.len() - kept);
+        assert_eq!(next[0]["expected_read_revision"], 10_000);
+        super::super::dispatch::sparsify_complete_read_success("read_files", &mut model);
+        assert!(serialized_json_len(&model).unwrap() <= budget);
+    }
+
+    #[test]
+    fn budget_read_continuation_stays_inside_declared_range_but_natural_paging_remains() {
+        let projection = ReadModelProjection::Batch {
+            project: "agent:oe:demo".to_string(),
+            items: vec![ReadFilesItem {
+                path: "src/0.rs".to_string(),
+                start_line: Some(11),
+                limit: Some(5),
+                expected_read_revision: None,
+            }],
+            session_id: None,
+            with_line_numbers: None,
+            max_result_bytes: Some(4096),
+        };
+        let mut item = ranged_item(0, 11, &["a".to_string(), "b".to_string()]);
+        item["output"]["has_more"] = json!(true);
+        item["output"]["next_start_line"] = json!(13);
+        item["output"]["total_lines"] = json!(1000);
+        item["output"]["limit"] = json!(5);
+        item["output"]["budget_truncated"] = json!(true);
+        item["output"]["budget_next_limit"] = json!(900);
+        let mut result = ToolResult::ok(batch_output(
+            "agent:oe:demo",
+            1,
+            vec![item.clone()],
+            true,
+            Some(0),
+            Some("batch_response_budget"),
+        ));
+        add_actionable_read_continuations(&projection, &mut result);
+        assert_eq!(
+            result.output["suggested_call"]["arguments"]["items"][0]["limit"],
+            3
+        );
+        item["output"]
+            .as_object_mut()
+            .unwrap()
+            .remove("budget_truncated");
+        item["output"]
+            .as_object_mut()
+            .unwrap()
+            .remove("budget_next_limit");
+        let mut natural = ToolResult::ok(batch_output(
+            "agent:oe:demo",
+            1,
+            vec![item],
+            false,
+            None,
+            None,
+        ));
+        add_actionable_read_continuations(&projection, &mut natural);
+        assert_eq!(
+            natural.output["suggested_call"]["arguments"]["items"][0]["limit"],
+            5
+        );
     }
 
     #[test]
@@ -1107,15 +1506,7 @@ mod tests {
         );
         assert_eq!(output["output_truncated"], true);
         assert_eq!(output["next_index"], 1);
-        assert_eq!(
-            output["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|item| item["index"].as_u64().unwrap())
-                .collect::<Vec<_>>(),
-            vec![0, 2]
-        );
+        assert_eq!(output["items"].as_array().unwrap().len(), 2);
 
         let mut model = ToolResult::ok(output);
         add_actionable_read_continuations(&projection, &mut model);
@@ -1139,7 +1530,6 @@ mod tests {
             suggested["arguments"]["items"][0]["expected_read_revision"],
             1234
         );
-        assert_eq!(suggested["arguments"]["items"].as_array().unwrap().len(), 1);
         let next = ToolCall::from_tool_name(
             suggested["tool"].as_str().unwrap(),
             suggested["arguments"].clone(),
@@ -1188,28 +1578,15 @@ mod tests {
             ToolCall::from_tool_name(call["tool"].as_str().unwrap(), call["arguments"].clone())
                 .unwrap();
             let remaining = call["arguments"]["items"].as_array().unwrap();
-            let returned_indices = model.output["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|item| item["index"].as_u64())
-                .collect::<BTreeSet<_>>();
-            let expected_paths = (0..count)
-                .filter(|index| {
-                    *index == partial_index || !returned_indices.contains(&(*index as u64))
-                })
-                .map(|index| format!("src/{index}.rs"))
-                .collect::<Vec<_>>();
-            assert_eq!(remaining.len(), expected_paths.len());
-            for (item, expected_path) in remaining.iter().zip(expected_paths) {
-                assert_eq!(item["path"], expected_path);
-                if expected_path == format!("src/{partial_index}.rs") {
-                    assert_eq!(item["start_line"], next_start);
-                    assert_eq!(item["limit"], next_limit);
-                    assert_eq!(item["expected_read_revision"], revision);
-                } else {
-                    assert!(item.get("expected_read_revision").is_none());
-                }
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0]["start_line"], next_start);
+            assert_eq!(remaining[0]["limit"], next_limit);
+            assert_eq!(remaining[0]["expected_read_revision"], revision);
+            for item in remaining.iter().skip(1) {
+                assert!(item.get("expected_read_revision").is_none());
+            }
+            for (offset, item) in remaining.iter().enumerate() {
+                assert_eq!(item["path"], format!("src/{}.rs", partial_index + offset));
             }
             assert_eq!(
                 model.output["items"][partial_index]["output"]["read_revision"],
@@ -1227,7 +1604,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_progress_primary_budget_recommends_bounded_budget_refinement() {
+    fn zero_progress_primary_budget_does_not_grow_budget_or_replay() {
         let huge_line = vec!["x".repeat(90 * 1024)];
         let projection = batch_projection(1, None);
         let output = apply_output_budget(
@@ -1243,23 +1620,7 @@ mod tests {
 
         let mut model = ToolResult::ok(output);
         add_actionable_read_continuations(&projection, &mut model);
-        let suggested = &model.output["suggested_call"];
-        assert_eq!(
-            suggested["arguments"]["max_result_bytes"],
-            MAX_SERIALIZED_OUTPUT_BYTES
-        );
-        let next = ToolCall::from_tool_name(
-            suggested["tool"].as_str().unwrap(),
-            suggested["arguments"].clone(),
-        )
-        .expect("budget refinement suggested_call must parse");
-        assert!(matches!(
-            next,
-            ToolCall::ReadFiles {
-                max_result_bytes: Some(bytes),
-                ..
-            } if bytes == MAX_SERIALIZED_OUTPUT_BYTES
-        ));
+        assert!(model.output.get("suggested_call").is_none());
     }
 
     #[test]
@@ -1363,7 +1724,7 @@ mod tests {
         let partial = &default["items"][0]["output"];
         let kept = partial["returned_lines"].as_u64().unwrap() as usize;
         assert!(kept > 0 && kept < lines.len());
-        assert!(default["next_index"].is_null());
+        assert_eq!(default["next_index"], 0);
         assert_eq!(default["truncation_reason"], "batch_response_budget");
         assert_eq!(partial["budget_truncated"], true);
         assert_eq!(partial["next_start_line"], kept + 1);
@@ -1598,5 +1959,150 @@ mod tests {
             };
             assert_eq!(max_result_bytes, Some(effective));
         }
+    }
+
+    #[test]
+    fn read_plan_coalesces_duplicate_and_nearby_ranges() {
+        let planned = plan_read_files(vec![
+            ReadFilesItem {
+                path: "src/lib.rs".to_string(),
+                start_line: Some(100),
+                limit: Some(50),
+                expected_read_revision: None,
+            },
+            ReadFilesItem {
+                path: "src/lib.rs".to_string(),
+                start_line: Some(100),
+                limit: Some(50),
+                expected_read_revision: None,
+            },
+            ReadFilesItem {
+                path: "src/lib.rs".to_string(),
+                start_line: Some(160),
+                limit: Some(20),
+                expected_read_revision: None,
+            },
+        ]);
+
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].item.start_line, Some(100));
+        assert_eq!(planned[0].item.limit, Some(80));
+        assert_eq!(planned[0].members.len(), 3);
+        assert_eq!(
+            planned[0]
+                .members
+                .iter()
+                .map(|member| member.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn read_plan_merges_ranges_transitively_after_sorting() {
+        let planned = plan_read_files(vec![
+            ReadFilesItem {
+                path: "src/lib.rs".to_string(),
+                start_line: Some(1),
+                limit: Some(20),
+                expected_read_revision: None,
+            },
+            ReadFilesItem {
+                path: "src/lib.rs".to_string(),
+                start_line: Some(55),
+                limit: Some(16),
+                expected_read_revision: None,
+            },
+            ReadFilesItem {
+                path: "src/lib.rs".to_string(),
+                start_line: Some(21),
+                limit: Some(34),
+                expected_read_revision: None,
+            },
+        ]);
+
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].item.start_line, Some(1));
+        assert_eq!(planned[0].item.limit, Some(70));
+        assert_eq!(planned[0].members.len(), 3);
+    }
+
+    #[test]
+    fn read_plan_benchmark_scenarios_reduce_runner_reads() {
+        let duplicate = (0..8)
+            .map(|_| ReadFilesItem {
+                path: "src/lib.rs".to_string(),
+                start_line: Some(100),
+                limit: Some(50),
+                expected_read_revision: None,
+            })
+            .collect::<Vec<_>>();
+        let adjacent = (0..8)
+            .map(|index| ReadFilesItem {
+                path: "src/lib.rs".to_string(),
+                start_line: Some(1 + index * 40),
+                limit: Some(40),
+                expected_read_revision: None,
+            })
+            .collect::<Vec<_>>();
+        let mixed = vec![
+            ("src/a.rs", 1, 40),
+            ("src/a.rs", 35, 40),
+            ("src/a.rs", 120, 40),
+            ("src/a.rs", 155, 40),
+            ("src/b.rs", 10, 30),
+            ("src/b.rs", 25, 30),
+            ("src/c.rs", 1, 20),
+            ("src/d.rs", 1, 20),
+        ]
+        .into_iter()
+        .map(|(path, start, limit)| ReadFilesItem {
+            path: path.to_string(),
+            start_line: Some(start),
+            limit: Some(limit),
+            expected_read_revision: None,
+        })
+        .collect::<Vec<_>>();
+
+        let duplicate_plans = plan_read_files(duplicate);
+        let adjacent_plans = plan_read_files(adjacent);
+        let mixed_plans = plan_read_files(mixed);
+
+        eprintln!(
+            "read_plan_benchmark duplicate=8->{} adjacent=8->{} mixed=8->{}",
+            duplicate_plans.len(),
+            adjacent_plans.len(),
+            mixed_plans.len()
+        );
+        assert_eq!(duplicate_plans.len(), 1);
+        assert_eq!(adjacent_plans.len(), 1);
+        assert_eq!(mixed_plans.len(), 5);
+    }
+
+    #[test]
+    fn read_plan_keeps_distant_or_differently_fenced_ranges_independent() {
+        let planned = plan_read_files(vec![
+            ReadFilesItem {
+                path: "src/lib.rs".to_string(),
+                start_line: Some(1),
+                limit: Some(20),
+                expected_read_revision: None,
+            },
+            ReadFilesItem {
+                path: "src/lib.rs".to_string(),
+                start_line: Some(200),
+                limit: Some(20),
+                expected_read_revision: None,
+            },
+            ReadFilesItem {
+                path: "src/lib.rs".to_string(),
+                start_line: Some(15),
+                limit: Some(20),
+                expected_read_revision: Some(7),
+            },
+        ]);
+
+        assert_eq!(planned.len(), 3);
+        assert!(planned.iter().all(|plan| plan.members.len() == 1));
     }
 }

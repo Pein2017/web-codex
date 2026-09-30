@@ -8,12 +8,12 @@ use webcodex_core::validation_evidence::{
     PARSER_KIND, PARSER_VERSION,
 };
 use webcodex_core::workflow_session_contract::{ExecutionPurpose, EXECUTION_PURPOSE_VALUES};
-use webcodex_tool_contracts::{is_known_tool_name, registered_tool_specs};
+use webcodex_tool_contracts::{is_known_tool_name, registered_tool_specs, ToolCall};
 use webcodex_tool_runtime_contracts::{
     tool_audit::{
         is_structured_validation_target_identity, session_log_arguments_for_tool_request,
     },
-    ToolCall,
+    ToolCallAuditProjection,
 };
 
 #[test]
@@ -81,12 +81,47 @@ fn rust_profile_selects_cargo_check_adapter_and_preserves_command() {
             .unwrap(),
         "cargo check --all-targets"
     );
+    let legacy_single = adapter
+        .build_command(ValidationCommandOptions {
+            package: Some("webcodex".to_string()),
+            ..ValidationCommandOptions::default()
+        })
+        .unwrap();
+    let canonical_single = adapter
+        .build_command(ValidationCommandOptions {
+            cargo_packages: Some(vec!["webcodex".to_string()]),
+            ..ValidationCommandOptions::default()
+        })
+        .unwrap();
+    assert_eq!(legacy_single, "cargo check --all-targets -p 'webcodex'");
+    assert_eq!(legacy_single, canonical_single);
     assert!(adapter
         .build_command(ValidationCommandOptions {
             features: Some("feat\0x".to_string()),
             ..ValidationCommandOptions::default()
         })
         .is_err());
+}
+
+#[test]
+fn cargo_check_builds_one_command_with_repeated_package_selectors() {
+    let adapter = validation_adapter_for_tool("cargo_check").expect("cargo_check adapter");
+    let command = adapter
+        .build_command(ValidationCommandOptions {
+            cargo_packages: Some(vec![
+                "package-a".to_string(),
+                "package-b".to_string(),
+                "package-c".to_string(),
+            ]),
+            ..ValidationCommandOptions::default()
+        })
+        .unwrap();
+
+    assert_eq!(
+        command,
+        "cargo check --all-targets -p 'package-a' -p 'package-b' -p 'package-c'"
+    );
+    assert_eq!(command.matches("cargo check").count(), 1);
 }
 
 #[test]
@@ -247,28 +282,7 @@ fn go_test_schema_and_audit_projection_are_bounded_and_explicit() {
         "unrecognized_private_field": "NEVER_PERSIST_GO_TEST_UNKNOWN"
     });
     let raw_audit = session_log_arguments_for_tool_request("go_test", &raw);
-    let target_id = raw_audit["validation_target_id"]
-        .as_str()
-        .expect("go_test audit projection should include validation_target_id");
-    assert!(
-        is_structured_validation_target_identity(target_id),
-        "unexpected go_test validation target identity: {target_id}"
-    );
-    let mut audit_without_target = raw_audit.clone();
-    audit_without_target
-        .as_object_mut()
-        .unwrap()
-        .remove("validation_target_id");
-    assert_eq!(
-        audit_without_target,
-        serde_json::json!({
-            "project": "agent:test:demo",
-            "cwd": "internal/control",
-            "packages_present": true,
-            "package_count": 2,
-            "timeout_secs": 90
-        })
-    );
+    assert_eq!(raw_audit, serde_json::json!({}));
     assert!(!raw_audit
         .to_string()
         .contains("NEVER_PERSIST_GO_TEST_UNKNOWN"));
@@ -283,7 +297,29 @@ fn go_test_schema_and_audit_projection_are_bounded_and_explicit() {
         }),
     )
     .unwrap();
-    assert_eq!(call.session_log_arguments(), raw_audit);
+    let typed_audit = call.session_log_arguments();
+    let target_id = typed_audit["validation_target_id"]
+        .as_str()
+        .expect("go_test audit projection should include validation_target_id");
+    assert!(
+        is_structured_validation_target_identity(target_id),
+        "unexpected go_test validation target identity: {target_id}"
+    );
+    let mut audit_without_target = typed_audit;
+    audit_without_target
+        .as_object_mut()
+        .unwrap()
+        .remove("validation_target_id");
+    assert_eq!(
+        audit_without_target,
+        serde_json::json!({
+            "project": "agent:test:demo",
+            "cwd": "internal/control",
+            "packages_present": true,
+            "package_count": 2,
+            "timeout_secs": 90
+        })
+    );
 }
 
 #[test]

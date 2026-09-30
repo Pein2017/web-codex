@@ -7,12 +7,13 @@ use super::contains_any;
 use super::detached_job::DetachedJobStore;
 #[cfg(windows)]
 use super::exit_diagnostics::RunnerExitDiagnostics;
+use super::job_manager::JobManager;
 use super::lsp::LspSupervisor;
 use super::projects::RunnerProjectCache;
 use super::shutdown::{
     ActivityTracker, BackgroundThreads, ShutdownCoordinator, ShutdownDeadline, ShutdownPhaseResult,
-    ShutdownReport, BACKGROUND_JOIN_BUDGET, DEFAULT_SHUTDOWN_BUDGET, JOB_DRAIN_BUDGET,
-    LSP_SHUTDOWN_BUDGET, PROVIDER_SHUTDOWN_BUDGET,
+    ShutdownReport, BACKGROUND_JOIN_BUDGET, BROWSER_SHUTDOWN_BUDGET, DEFAULT_SHUTDOWN_BUDGET,
+    JOB_DRAIN_BUDGET, LSP_SHUTDOWN_BUDGET, PROVIDER_SHUTDOWN_BUDGET,
 };
 use super::PersistentShellManager;
 use crate::runner_config::{
@@ -27,6 +28,7 @@ use crate::runner_protocol::{
 use crate::runner_protocol::{
     PROJECT_INVENTORY_PAGE_MAX_SERIALIZED_BYTES, PROJECT_INVENTORY_PAGE_MAX_SUMMARIES,
 };
+use webcodex_browser::BrowserSupervisor;
 
 mod project_inventory;
 mod result_submission;
@@ -34,7 +36,7 @@ mod websocket_connect;
 
 use crate::{
     build_register_request_with_provider_status, dispatch_request_with_outcome, handle_one_poll,
-    register, JobManager, PollingDispatchSupervisor, PollingRecoveryAction, RegisterRecoveryAction,
+    register, PollingDispatchSupervisor, PollingRecoveryAction, RegisterRecoveryAction,
 };
 #[cfg(test)]
 use crate::{CommandResult, RunnerHttpError, RunnerHttpErrorKind};
@@ -141,6 +143,7 @@ const POLLING_IDLE_BACKOFF_STEPS: [Duration; 3] = [
 const POLLING_LEASE_CONFLICT_MAX_WAIT: Duration = Duration::from_secs(75);
 const RUNNER_OFFLINE_PATH: &str = "/api/shell/agent/offline";
 fn send_provider_metadata(
+    transport: StreamTransport,
     tx: &tokio::sync::mpsc::Sender<RunnerEnvelope>,
     runtime: &ReloadableRunnerConfig,
     expected_generation: Option<u64>,
@@ -161,16 +164,17 @@ fn send_provider_metadata(
             return;
         };
         status.config_reload = config.reload_status();
-        if tx
-            .try_send(RunnerEnvelope::RuntimeMetadata {
+        if try_send_runner_stream_control(
+            transport,
+            tx,
+            RunnerEnvelope::RuntimeMetadata {
                 tool_providers: status,
                 mcp_gateway_providers: Some(runtime.mcp_gateway().provider_inventory()),
-            })
-            .is_err()
-        {
-            config.external_tools.release_status_update(revision);
-        } else {
+            },
+        ) {
             config.external_tools.mark_status_reported(revision);
+        } else {
+            config.external_tools.release_status_update(revision);
         }
     });
 }
@@ -178,6 +182,7 @@ fn send_provider_metadata(
 #[derive(Clone)]
 pub(crate) struct RunnerRuntimeState {
     lsp: LspSupervisor,
+    browser: BrowserSupervisor,
     config: Arc<ReloadableRunnerConfig>,
     jobs: JobManager,
     persistent_shells: PersistentShellManager,
@@ -200,9 +205,10 @@ impl RunnerRuntimeState {
         // Persistent shells reuse the same authenticated OpenSSH multiplex pool
         // as async jobs: one transport per (session, resource, generation),
         // never a second SSH configuration or connection pool.
-        let persistent_shells = PersistentShellManager::new(&cfg.shell, jobs.ssh_pool.clone());
+        let persistent_shells = PersistentShellManager::new(&cfg.shell, jobs.ssh_pool().clone());
         Self {
             lsp: LspSupervisor::default(),
+            browser: BrowserSupervisor::new(),
             config: Arc::new(ReloadableRunnerConfig::new(cfg.clone(), path)),
             jobs,
             persistent_shells,
@@ -229,6 +235,7 @@ impl RunnerRuntimeState {
         self.config.begin_shutdown();
         self.jobs.stop_accepting_work();
         self.persistent_shells.close_all("runner_shutdown");
+        self.browser.begin_shutdown();
         self.lsp.begin_shutdown_until(deadline);
     }
 
@@ -280,7 +287,7 @@ impl RunnerRuntimeState {
     }
 
     fn cleanup(&self, deadline: ShutdownDeadline) -> Vec<ShutdownPhaseResult> {
-        let mut phases = Vec::with_capacity(10);
+        let mut phases = Vec::with_capacity(11);
 
         let started = Instant::now();
         phases.push(if self.coordinator.signal_received() {
@@ -293,6 +300,7 @@ impl RunnerRuntimeState {
         self.config.begin_shutdown();
         self.jobs.stop_accepting_work();
         self.persistent_shells.close_all("runner_shutdown");
+        self.browser.begin_shutdown();
         self.lsp.begin_shutdown_until(deadline.instant());
         phases.push(ShutdownPhaseResult::completed(
             "stop_accepting_work",
@@ -324,8 +332,8 @@ impl RunnerRuntimeState {
 
         let started = Instant::now();
         let job_batch = self.jobs.signal_all_for_shutdown();
-        let active_jobs = job_batch.running;
-        let signal_failures = job_batch.failures;
+        let active_jobs = job_batch.running();
+        let signal_failures = job_batch.failures();
         phases.push(shutdown_phase(
             "active_jobs_signal",
             started,
@@ -342,9 +350,9 @@ impl RunnerRuntimeState {
         phases.push(shutdown_phase(
             "active_jobs_drain",
             started,
-            jobs.resources,
-            jobs.timed_out,
-            jobs.failures.saturating_sub(signal_failures),
+            jobs.resources(),
+            jobs.timed_out(),
+            jobs.failures().saturating_sub(signal_failures),
             "job_reap_failed",
         ));
 
@@ -366,6 +374,19 @@ impl RunnerRuntimeState {
             provider_timeouts,
             provider_failures,
             "provider_shutdown_failed",
+        ));
+
+        let started = Instant::now();
+        let browser = self
+            .browser
+            .shutdown_until(deadline.phase_deadline(BROWSER_SHUTDOWN_BUDGET));
+        phases.push(shutdown_phase(
+            "browser_runtimes_stop",
+            started,
+            browser.browsers,
+            browser.timed_out,
+            browser.failures,
+            "browser_shutdown_failed",
         ));
 
         let started = Instant::now();
@@ -489,7 +510,34 @@ fn install_shutdown_listener(
         .map_err(|_| "failed to start process shutdown signal listener".to_string())
 }
 
+#[cfg(windows)]
+const PARENT_PIPE_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+#[cfg(windows)]
 fn install_parent_liveness_listener(runtime: RunnerRuntimeState) -> Result<(), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_PIPE};
+
+    let stdin = std::io::stdin();
+    let handle = stdin.as_raw_handle() as usize;
+    if unsafe { GetFileType(handle as _) } == FILE_TYPE_PIPE {
+        let listener = spawn_windows_pipe_parent_liveness_listener(handle, runtime)?;
+        // The process owns stdin for its whole lifetime. The listener stops on
+        // pipe EOF/error or an already-requested Runner shutdown, so detaching
+        // the JoinHandle does not transfer ownership of any external resource.
+        drop(listener);
+        return Ok(());
+    }
+
+    install_blocking_parent_liveness_listener(runtime)
+}
+
+#[cfg(not(windows))]
+fn install_parent_liveness_listener(runtime: RunnerRuntimeState) -> Result<(), String> {
+    install_blocking_parent_liveness_listener(runtime)
+}
+
+fn install_blocking_parent_liveness_listener(runtime: RunnerRuntimeState) -> Result<(), String> {
     use std::io::Read;
 
     let listener = std::thread::Builder::new()
@@ -508,12 +556,74 @@ fn install_parent_liveness_listener(runtime: RunnerRuntimeState) -> Result<(), S
             }
         })
         .map_err(|_| "failed to start parent-liveness listener".to_string())?;
-    // This reader is intentionally detached. A blocking stdin read cannot be
-    // cancelled portably; joining it during an ordinary signal-driven shutdown
-    // would hang until the parent closed the lease. Process exit reclaims the
-    // detached thread, while EOF still triggers exact-generation shutdown.
+    // Non-pipe stdin may require a genuinely blocking read. Keep the legacy
+    // detached behavior for consoles and Unix streams; process exit reclaims
+    // the listener while EOF still triggers exact-generation shutdown.
     drop(listener);
     Ok(())
+}
+
+#[cfg(windows)]
+fn spawn_windows_pipe_parent_liveness_listener(
+    pipe_handle: usize,
+    runtime: RunnerRuntimeState,
+) -> Result<std::thread::JoinHandle<()>, String> {
+    use windows_sys::Win32::Storage::FileSystem::ReadFile;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    std::thread::Builder::new()
+        .name("webcodex-runner-parent-lease".to_string())
+        .spawn(move || {
+            let pipe = pipe_handle as windows_sys::Win32::Foundation::HANDLE;
+            let mut discard = [0_u8; 64];
+            loop {
+                if runtime.shutdown_requested() {
+                    return;
+                }
+
+                let mut available = 0_u32;
+                let peeked = unsafe {
+                    PeekNamedPipe(
+                        pipe,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null_mut(),
+                        &mut available,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if peeked == 0 {
+                    // Preserve the historical lease contract: any stdin read
+                    // failure is equivalent to parent EOF and requests Runner
+                    // shutdown. Broken anonymous pipes land here without a
+                    // blocking ReadFile on the Windows startup path.
+                    runtime.request_shutdown_signal();
+                    return;
+                }
+
+                if available == 0 {
+                    std::thread::sleep(PARENT_PIPE_POLL_INTERVAL);
+                    continue;
+                }
+
+                let to_read = available.min(discard.len() as u32);
+                let mut bytes_read = 0_u32;
+                let read = unsafe {
+                    ReadFile(
+                        pipe,
+                        discard.as_mut_ptr(),
+                        to_read,
+                        &mut bytes_read,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if read == 0 || bytes_read == 0 {
+                    runtime.request_shutdown_signal();
+                    return;
+                }
+            }
+        })
+        .map_err(|_| "failed to start parent-liveness listener".to_string())
 }
 
 fn send_polling_offline_best_effort(client: &Client, cfg: &RunnerConfig, runner_instance_id: &str) {
@@ -1112,6 +1222,205 @@ impl StreamTransport {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunnerStreamMetricOutcome {
+    Success,
+    Closed,
+    Backpressure,
+    TransportError,
+    Timeout,
+}
+
+impl RunnerStreamMetricOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Closed => "closed",
+            Self::Backpressure => "backpressure",
+            Self::TransportError => "transport_error",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+fn observe_runtime_metric_fail_open(observe: impl FnOnce()) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(observe));
+}
+
+macro_rules! runtime_metric_info {
+    ($($fields:tt)*) => {
+        observe_runtime_metric_fail_open(|| tracing::info!($($fields)*))
+    };
+}
+
+fn bounded_stream_envelope_kind(kind: &str) -> &'static str {
+    match kind {
+        "request" => "request",
+        "result" => "result",
+        "job_update" => "job_update",
+        "persistent_shell_result" => "persistent_shell_result",
+        "ping" => "ping",
+        "pong" => "pong",
+        "project_inventory_page" | "project_inventory_status" => "project_inventory",
+        "runtime_metadata" => "provider_metadata",
+        "goodbye" => "goodbye",
+        _ => "control",
+    }
+}
+
+fn successful_stream_duration(
+    outcome: RunnerStreamMetricOutcome,
+    duration: Option<Duration>,
+) -> Option<Duration> {
+    (outcome == RunnerStreamMetricOutcome::Success)
+        .then_some(duration)
+        .flatten()
+}
+
+fn observe_runner_stream_incoming_envelope(
+    transport: StreamTransport,
+    envelope_kind: &'static str,
+) {
+    let envelope_kind = bounded_stream_envelope_kind(envelope_kind);
+    runtime_metric_info!(
+        metric = "runner_stream_incoming_envelopes_total",
+        value = 1_u64,
+        transport = transport.name(),
+        envelope_kind,
+        "runtime_metric"
+    );
+}
+
+fn observe_runner_stream_request_dispatch_wait(transport: StreamTransport, duration: Duration) {
+    runtime_metric_info!(
+        metric = "runner_stream_request_dispatch_wait_seconds",
+        value = duration.as_secs_f64(),
+        transport = transport.name(),
+        "runtime_metric"
+    );
+}
+
+fn observe_runner_request_duration(transport: &'static str, duration_ms: u64) {
+    runtime_metric_info!(
+        metric = "runner_request_duration_seconds",
+        value = duration_ms as f64 / 1000.0,
+        transport,
+        "runtime_metric"
+    );
+}
+
+fn observe_runner_stream_outgoing_channel(
+    transport: StreamTransport,
+    envelope_kind: &'static str,
+    wait: Option<Duration>,
+    backpressured: bool,
+    outcome: RunnerStreamMetricOutcome,
+) {
+    let envelope_kind = bounded_stream_envelope_kind(envelope_kind);
+    let successful_wait = successful_stream_duration(outcome, wait);
+    runtime_metric_info!(
+        metric = "runner_stream_outgoing_channel_events_total",
+        value = 1_u64,
+        transport = transport.name(),
+        envelope_kind,
+        outcome = outcome.as_str(),
+        "runtime_metric"
+    );
+    if backpressured {
+        runtime_metric_info!(
+            metric = "runner_stream_outgoing_backpressure_total",
+            value = 1_u64,
+            transport = transport.name(),
+            envelope_kind,
+            "runtime_metric"
+        );
+    }
+    if let Some(wait) = successful_wait {
+        runtime_metric_info!(
+            metric = "runner_stream_outgoing_channel_wait_seconds",
+            value = wait.as_secs_f64(),
+            transport = transport.name(),
+            envelope_kind,
+            "runtime_metric"
+        );
+    }
+}
+fn try_send_runner_stream_control(
+    transport: StreamTransport,
+    tx: &tokio::sync::mpsc::Sender<RunnerEnvelope>,
+    envelope: RunnerEnvelope,
+) -> bool {
+    let envelope_kind = envelope.kind();
+    match tx.try_send(envelope) {
+        Ok(()) => {
+            observe_runner_stream_outgoing_channel(
+                transport,
+                envelope_kind,
+                None,
+                false,
+                RunnerStreamMetricOutcome::Success,
+            );
+            true
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            observe_runner_stream_outgoing_channel(
+                transport,
+                envelope_kind,
+                None,
+                true,
+                RunnerStreamMetricOutcome::Backpressure,
+            );
+            false
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            observe_runner_stream_outgoing_channel(
+                transport,
+                envelope_kind,
+                None,
+                false,
+                RunnerStreamMetricOutcome::Closed,
+            );
+            false
+        }
+    }
+}
+
+fn observe_runner_stream_writer_send(
+    transport: StreamTransport,
+    envelope_kind: &'static str,
+    duration: Option<Duration>,
+    outcome: RunnerStreamMetricOutcome,
+) {
+    let envelope_kind = bounded_stream_envelope_kind(envelope_kind);
+    let successful_duration = successful_stream_duration(outcome, duration);
+    runtime_metric_info!(
+        metric = "runner_stream_outgoing_envelopes_total",
+        value = 1_u64,
+        transport = transport.name(),
+        envelope_kind,
+        outcome = outcome.as_str(),
+        "runtime_metric"
+    );
+    if let Some(duration) = successful_duration {
+        runtime_metric_info!(
+            metric = "runner_stream_writer_send_seconds",
+            value = duration.as_secs_f64(),
+            transport = transport.name(),
+            envelope_kind,
+            "runtime_metric"
+        );
+    }
+}
+
+fn observe_runner_stream_disconnect(transport: StreamTransport) {
+    runtime_metric_info!(
+        metric = "runner_stream_session_disconnects_total",
+        value = 1_u64,
+        transport = transport.name(),
+        "runtime_metric"
+    );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StreamSupervisorMode {
     Strict(StreamTransport),
     Auto,
@@ -1501,7 +1810,7 @@ fn run_polling_runner_with_shutdown(
                 &mut project_cache,
                 Some(shutdown.as_ref()),
                 runner_instance_id,
-                jobs.prepared_profiles.len(),
+                jobs.prepared_profiles().len(),
                 &jobs,
             ) {
                 Ok((projects_count, registered_jobs, registered_projects, _inventory_status)) => {
@@ -1674,6 +1983,7 @@ fn run_polling_runner_with_shutdown(
             project_inventory_page,
             runner_instance_id,
             &runtime.lsp,
+            &runtime.browser,
             &shutdown,
             &runtime.dispatches,
             &mut polling_dispatches,
@@ -2066,8 +2376,11 @@ fn handle_stream_envelope(
     project_inventory_refresh_tx: &tokio::sync::mpsc::Sender<()>,
     runtime: &RunnerRuntimeState,
 ) -> Option<String> {
+    let envelope_kind = envelope.kind();
+    observe_runner_stream_incoming_envelope(transport, envelope_kind);
     match envelope {
         RunnerEnvelope::Request { request } => {
+            let received_at = Instant::now();
             let sink = sink.clone();
             let config = Arc::clone(&runtime.config);
             let hot = config.snapshot();
@@ -2078,10 +2391,12 @@ fn handle_stream_envelope(
                 Err(error) => return Some(error),
             };
             let lsp = runtime.lsp.clone();
+            let browser = runtime.browser.clone();
             let dispatch_guard = runtime.dispatches.enter();
             let project_inventory_refresh_tx = project_inventory_refresh_tx.clone();
             tokio::task::spawn_blocking(move || {
                 let _dispatch_guard = dispatch_guard;
+                observe_runner_stream_request_dispatch_wait(transport, received_at.elapsed());
                 let dispatch_result = dispatch_request_with_outcome(
                     &sink,
                     &hot,
@@ -2090,6 +2405,7 @@ fn handle_stream_envelope(
                     &persistent_shells,
                     &project_registry_dir,
                     &lsp,
+                    &browser,
                     request,
                 );
                 if dispatch_result
@@ -2106,7 +2422,7 @@ fn handle_stream_envelope(
             None
         }
         RunnerEnvelope::Ping { ts } => {
-            let _ = out_tx.try_send(RunnerEnvelope::Pong { ts });
+            let _ = try_send_runner_stream_control(transport, out_tx, RunnerEnvelope::Pong { ts });
             None
         }
         RunnerEnvelope::Pong { .. } => None,
@@ -2238,7 +2554,7 @@ where
                     transport = transport.name(),
                     "webcodex-runner stream keepalive ping"
                 );
-                send_provider_metadata(&out_tx, &runtime.config, None);
+                send_provider_metadata(transport, &out_tx, &runtime.config, None);
                 // An acknowledgement can be dropped if the Server's outbound
                 // channel is saturated. Re-sending the exact pending page is
                 // idempotent and gives the sync a bounded periodic recovery path.
@@ -2248,21 +2564,49 @@ where
                 if project_inventory.retry_at().is_none() {
                     project_inventory.queue_pending(transport, &out_tx);
                 }
-                let _ = out_tx.try_send(RunnerEnvelope::Ping {
-                    ts: chrono::Utc::now().timestamp(),
-                });
+                let _ = try_send_runner_stream_control(
+                    transport,
+                    &out_tx,
+                    RunnerEnvelope::Ping {
+                        ts: chrono::Utc::now().timestamp(),
+                    },
+                );
             }
         }
     }
 
     if shutdown_requested {
-        let _ = tokio::time::timeout(
+        let queue_started = Instant::now();
+        match tokio::time::timeout(
             TRANSPORT_CONTROL_SEND_TIMEOUT,
             out_tx.send(RunnerEnvelope::Goodbye {
                 reason: Some("process shutdown".to_string()),
             }),
         )
-        .await;
+        .await
+        {
+            Ok(Ok(())) => observe_runner_stream_outgoing_channel(
+                transport,
+                "goodbye",
+                Some(queue_started.elapsed()),
+                false,
+                RunnerStreamMetricOutcome::Success,
+            ),
+            Ok(Err(_)) => observe_runner_stream_outgoing_channel(
+                transport,
+                "goodbye",
+                None,
+                false,
+                RunnerStreamMetricOutcome::Closed,
+            ),
+            Err(_) => observe_runner_stream_outgoing_channel(
+                transport,
+                "goodbye",
+                None,
+                false,
+                RunnerStreamMetricOutcome::Timeout,
+            ),
+        }
     } else if jobs.has_work() {
         tracing::warn!(
             transport = transport.name(),
@@ -2282,6 +2626,9 @@ where
         runtime
             .persistent_shells
             .close_all("runner_transport_disconnected");
+    }
+    if !shutdown_requested {
+        observe_runner_stream_disconnect(transport);
     }
     if let Some(error) = session_error {
         return Err(error);
@@ -2623,10 +2970,24 @@ async fn quic_session(
     try_queue_project_inventory_page(StreamTransport::Quic, &mut project_inventory_sync, &out_tx);
     let writer_task = tokio::spawn(async move {
         while let Some(env) = out_rx.recv().await {
+            let envelope_kind = env.kind();
             let graceful = matches!(env, RunnerEnvelope::Goodbye { .. });
+            let send_started = Instant::now();
             if write_quic_frame(&mut send, &env).await.is_err() {
+                observe_runner_stream_writer_send(
+                    StreamTransport::Quic,
+                    envelope_kind,
+                    None,
+                    RunnerStreamMetricOutcome::TransportError,
+                );
                 return StreamWriterExit::TransportFailed;
             }
+            observe_runner_stream_writer_send(
+                StreamTransport::Quic,
+                envelope_kind,
+                Some(send_started.elapsed()),
+                RunnerStreamMetricOutcome::Success,
+            );
             if graceful {
                 return if send.finish().is_ok() {
                     StreamWriterExit::GracefulClose
@@ -2810,13 +3171,33 @@ where
     );
     let writer_task = tokio::spawn(async move {
         while let Some(env) = out_rx.recv().await {
+            let envelope_kind = env.kind();
             let is_goodbye = matches!(env, RunnerEnvelope::Goodbye { .. });
+            let send_started = Instant::now();
             let Ok(json) = serde_json::to_string(&env) else {
+                observe_runner_stream_writer_send(
+                    StreamTransport::WebSocket,
+                    envelope_kind,
+                    None,
+                    RunnerStreamMetricOutcome::TransportError,
+                );
                 return StreamWriterExit::TransportFailed;
             };
             if sink.send(WsMessage::Text(json.into())).await.is_err() {
+                observe_runner_stream_writer_send(
+                    StreamTransport::WebSocket,
+                    envelope_kind,
+                    None,
+                    RunnerStreamMetricOutcome::TransportError,
+                );
                 return StreamWriterExit::TransportFailed;
             }
+            observe_runner_stream_writer_send(
+                StreamTransport::WebSocket,
+                envelope_kind,
+                Some(send_started.elapsed()),
+                RunnerStreamMetricOutcome::Success,
+            );
             if is_goodbye {
                 // The session loop continues polling the split read half while
                 // awaiting this task, allowing tungstenite's close handshake to

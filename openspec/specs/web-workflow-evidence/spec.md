@@ -7,7 +7,7 @@ Make the existing Web workflow report bounded, honest workspace and validation e
 
 ### Requirement: Workspace baseline observations
 
-Fresh project Workflow Sessions SHALL retain a bounded startup Git path/status observation and SHALL preserve that baseline across resume and restart. Finish SHALL distinguish pre-existing dirty paths from later newly dirty, cleared and overlapping paths without claiming exclusive Session authorship or unchanged content for overlapping paths.
+Fresh project Workflow Sessions SHALL retain a bounded startup Git path/status observation and SHALL preserve that baseline across resume and restart. Finish SHALL distinguish pre-existing dirty paths from later newly dirty, cleared and overlapping paths without claiming exclusive Session authorship or unchanged content for overlapping paths. Existing canonical local v2 Session rows containing this optional baseline SHALL remain restorable when adopting upstream continuity changes; Session identity, events, messages and baseline MUST NOT be silently discarded because retired context metadata is removed.
 
 #### Scenario: Shell changes a previously clean path
 
@@ -25,14 +25,18 @@ Fresh project Workflow Sessions SHALL retain a bounded startup Git path/status o
 - **WHEN** startup or finish inspection fails, is truncated, changes HEAD/target, or the restored Session lacks a baseline
 - **THEN** the result explicitly reports the evidence limitation and does not infer absent paths as clean or cleared
 
+#### Scenario: Restore an existing local v2 row
+- **WHEN** a frozen pre-upgrade canonical Session row contains a workspace baseline and retired context revision metadata
+- **THEN** restoration retains its identity, events, messages and baseline, and subsequent serialization follows upstream behavior by omitting retired context revision metadata
+
 ### Requirement: Validation truth and recovery
 
-Closeout SHALL preserve actual validation outcome separately from invocation misuse and expected negatives. A matching later successful assertion SHALL supersede its earlier failed assertion; unrelated successes and expected negative results SHALL NOT resolve it. Recognized pytest terminal summaries SHALL contribute bounded counts through existing execution evidence; missing or incomplete summaries SHALL NOT invent counts or success.
+Closeout SHALL preserve actual validation outcome separately from invocation misuse and expected negatives. A matching later successful assertion SHALL supersede its earlier failed assertion; unrelated successes and expected negative results SHALL NOT resolve it. Recognized pytest terminal summaries SHALL contribute bounded counts through existing execution evidence; missing or incomplete summaries SHALL NOT invent counts or success. Execution success and current-source freshness SHALL remain independent: native unproven source evidence MUST NOT be promoted to a current-workspace validation certificate.
 
 #### Scenario: Repair and revalidate
 
 - **WHEN** an assertion fails and the same assertion subsequently passes
-- **THEN** current validation reflects the later passing evidence while historical failure remains inspectable
+- **THEN** execution evidence reflects the later passing result while historical failure remains inspectable
 
 #### Scenario: Failure remains unresolved
 
@@ -44,6 +48,12 @@ Closeout SHALL preserve actual validation outcome separately from invocation mis
 - **WHEN** completed test execution supplies a supported pytest terminal summary
 - **THEN** its counts are detected without claiming a report-reader executed tests
 - **AND** malformed, missing or insufficient output remains unknown rather than a fabricated pass
+
+#### Scenario: Execution pass does not certify current source
+
+- **WHEN** matching real pytest executions resolve the historical failure but native source freshness remains unproven
+- **THEN** closeout retains the pass/count evidence and resolved failure while current evidence remains unproven with an explicit source limitation
+- **AND** the disposable smoke checks this distinction instead of demanding a fabricated current-source PASS
 
 ### Requirement: Existing MCP path is demonstrably usable
 

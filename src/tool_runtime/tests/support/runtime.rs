@@ -5,6 +5,9 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
 
+pub(in crate::tool_runtime::tests) const CODING_WORKFLOW_FIXTURE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(50);
+
 pub(in crate::tool_runtime::tests) const SAMPLE_PROJECT: &str = "agent:oe:private-drop";
 pub(in crate::tool_runtime::tests) const UNIT_TOOL_FIXTURES: &[&str] = &[
     "list_tools",
@@ -56,14 +59,38 @@ pub(in crate::tool_runtime::tests) fn sample_tool_args_for_spec(spec: &ToolSpec)
         "work_on_project" => {
             args.insert("project".to_string(), json!(SAMPLE_PROJECT));
         }
-        "update_goal" => {
+        "update_goal" | "checkpoint_goal" => {
             args.insert("expected_revision".to_string(), json!(1));
         }
         "observe_jobs" => {
             args.insert("items".to_string(), json!([{"job_id": "job_123"}]));
         }
+        "search_and_read" => {
+            args.insert("query".to_string(), json!({"pattern": "fn main"}));
+        }
         "plugin_tool" => {
             args.insert("action".to_string(), json!("list"));
+        }
+        "browser_observe" => {
+            args.insert("action".to_string(), json!("targets"));
+        }
+        "browser_act" => {
+            args.insert("action".to_string(), json!("launch"));
+            args.insert("client_id".to_string(), json!("oe"));
+        }
+        "computer_observe" => {
+            args.insert("action".to_string(), json!("targets"));
+        }
+        "computer_control" => {
+            args.insert("action".to_string(), json!("launch_application"));
+            args.insert("client_id".to_string(), json!("oe"));
+            args.insert(
+                "application_id".to_string(),
+                json!("application_qqqqqqqqqqqqqqqq"),
+            );
+        }
+        "project_artifact" => {
+            args.insert("action".to_string(), json!("metadata"));
         }
         "ssh_resource" => {
             args.insert("action".to_string(), json!("list"));
@@ -76,16 +103,19 @@ pub(in crate::tool_runtime::tests) fn sample_tool_args_for_spec(spec: &ToolSpec)
 
 pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
     match field {
-        "project" => json!(SAMPLE_PROJECT),
+        "project" | "source_project" => json!(SAMPLE_PROJECT),
+        "destination_project" => json!("agent:fixture:destination"),
         "command" => json!("true"),
         "executable" => json!("git"),
         "language" => json!("sh"),
+        "source" => json!("text(\"ok\")"),
         "script" => json!("true"),
         "patch" => json!("diff --git a/a b/a\n"),
         "paths" => json!(["old.txt"]),
         "items" => json!([{"path": "src/lib.rs"}]),
         "queries" => json!([{"pattern": "fn main"}]),
-        "path" => json!("src/lib.rs"),
+        "path" | "source_path" => json!("src/lib.rs"),
+        "destination_path" => json!("artifacts/copied.bin"),
         "old" | "old_text" => json!("a"),
         "new" | "new_text" => json!("b"),
         "pattern" => json!("fn main"),
@@ -93,10 +123,9 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "content" => json!("fn main() {}\n"),
         "instruction" => json!("implement the requested change"),
         "objective" => json!("Preserve durable high-level intent without execution authority."),
+        "summary" => json!("Recovery-worthy checkpoint summary"),
         "title" => json!("Durable agent work"),
-        "include_project_instructions"
-        | "include_workflow_guidance"
-        | "include_extension_catalog" => json!(false),
+        "include_extension_catalog" => json!(false),
         "content_base64" => json!("AA=="),
         "openaiFileIdRefs" => json!([{
             "download_url": "https://files.oaiusercontent.com/test",
@@ -144,6 +173,8 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "provider_id" => json!("codex"),
         "run_id" => json!("wc_agent_run_sample_1234"),
         "shell_id" => json!("wc_shell_123"),
+        "adapter_id" | "event_id" => json!("a".repeat(64)),
+        "observed_tool" => json!("Bash"),
         "session_id" => json!(format!("wc_sess_{}", "1".repeat(32))),
         "checkpoint_id" => json!("wc_ckpt_1234"),
         "confirm" => json!(true),
@@ -168,7 +199,10 @@ pub(in crate::tool_runtime::tests) fn sample_field_value(field: &str) -> Value {
         "completion_key" => json!("sample-completion-key"),
         "expected_assignment_fence" => json!(format!("wsa2_{}", "A".repeat(22))),
         "message_id" => json!("wc_msg_0001"),
+        "peer_id" => json!(format!("wc_peer_{}", "a".repeat(32))),
         "execution_context" => json!({}),
+        "skill_id" => json!("wc_skill_EREREREREREREREREREREQ"),
+        "expected_definition_revision" => json!("a".repeat(64)),
         other => panic!("missing sample value for required field {other}"),
     }
 }
@@ -196,17 +230,14 @@ pub(in crate::tool_runtime::tests) fn required_fields(spec: &ToolSpec) -> Vec<St
         .unwrap_or_default()
 }
 
-pub(in crate::tool_runtime::tests) fn seed_model_facing_recovery_events(
+pub(in crate::tool_runtime::tests) fn seed_recovery_events(
     runtime: &ToolRuntime,
     session_id: &str,
     project: &str,
     count: usize,
-) -> u64 {
-    use crate::tool_runtime::sessions::{
-        SessionContextRevisionAck, SessionTransport, ToolCallRecorderMetadata,
-    };
+) {
+    use crate::tool_runtime::sessions::{SessionTransport, ToolCallRecorderMetadata};
 
-    let mut revision = 0u64;
     for index in 0..count {
         let start = runtime.sessions.record_tool_call_started_with_metadata(
             Some(session_id),
@@ -214,16 +245,13 @@ pub(in crate::tool_runtime::tests) fn seed_model_facing_recovery_events(
             "run_process",
             &json!({"project": project, "executable": "true"}),
             Some(project.to_string()),
-            ToolCallRecorderMetadata {
-                ack_session_context_revision: SessionContextRevisionAck::Revision(revision),
-                ..Default::default()
-            },
+            ToolCallRecorderMetadata::default(),
             crate::tool_runtime::sessions::session_tool_contract("run_process"),
         );
         let evidence = format!("event-{index:02}-{}", "x".repeat(760));
-        let recorded = runtime
+        runtime
             .sessions
-            .record_model_facing_tool_call_finished(
+            .record_tool_call_finished(
                 start,
                 true,
                 &json!({
@@ -243,23 +271,18 @@ pub(in crate::tool_runtime::tests) fn seed_model_facing_recovery_events(
                 None,
                 None,
             )
-            .expect("seeded model-facing recovery event");
-        revision = recorded.context_revision;
+            .expect("seeded recovery event");
     }
-    revision
 }
 
-pub(in crate::tool_runtime::tests) fn seed_large_changed_path_recovery_events(
+pub(in crate::tool_runtime::tests) fn seed_large_changed_path_events(
     runtime: &ToolRuntime,
     session_id: &str,
     project: &str,
     count: usize,
-) -> u64 {
-    use crate::tool_runtime::sessions::{
-        SessionContextRevisionAck, SessionTransport, ToolCallRecorderMetadata,
-    };
+) {
+    use crate::tool_runtime::sessions::{SessionTransport, ToolCallRecorderMetadata};
 
-    let mut revision = runtime.sessions.context_revision(session_id).unwrap_or(0);
     for index in 0..count {
         let paths = (0..8)
             .map(|path_index| {
@@ -275,25 +298,14 @@ pub(in crate::tool_runtime::tests) fn seed_large_changed_path_recovery_events(
             "delete_project_files",
             &json!({"project": project, "paths": paths}),
             Some(project.to_string()),
-            ToolCallRecorderMetadata {
-                ack_session_context_revision: SessionContextRevisionAck::Revision(revision),
-                ..Default::default()
-            },
+            ToolCallRecorderMetadata::default(),
             crate::tool_runtime::sessions::session_tool_contract("delete_project_files"),
         );
-        let recorded = runtime
+        runtime
             .sessions
-            .record_model_facing_tool_call_finished(
-                start,
-                true,
-                &json!({"deleted_count": 8}),
-                None,
-                None,
-            )
+            .record_tool_call_finished(start, true, &json!({"deleted_count": 8}), None, None)
             .expect("seeded large changed-path recovery event");
-        revision = recorded.context_revision;
     }
-    revision
 }
 
 pub(in crate::tool_runtime::tests) fn local_project_config(path: &str) -> ProjectConfig {

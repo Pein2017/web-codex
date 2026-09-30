@@ -1,9 +1,8 @@
 use serde_json::{json, Value};
-use webcodex_core::pytest_test_count::{
-    is_supported_pytest_command_summary, parse_pytest_terminal_test_counts,
-};
 use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
-use webcodex_core::runtime_contract::MAX_JOB_OBSERVATION_WAIT_SECS;
+use webcodex_core::runtime_contract::{
+    MAX_JOB_OBSERVATION_WAIT_SECS, MODEL_JOB_CONTINUATION_WAIT_SECS,
+};
 use webcodex_core::workflow_session_contract::is_validation_like_execution_purpose;
 
 use super::helpers::{
@@ -34,24 +33,21 @@ pub(crate) fn is_terminal_job_status(status: &str) -> bool {
 
 pub(crate) fn detected_job_summary(
     command_summary: Option<&str>,
-    execution_source: Option<&str>,
     purpose: Option<&str>,
     status: &str,
     exit_code: Option<i64>,
     stdout: &str,
     stderr: &str,
-    truncated: bool,
 ) -> Value {
     detected_job_summary_with_activity(
         command_summary,
-        execution_source,
         purpose,
         status,
         exit_code,
         stdout,
         stderr,
+        false,
         None,
-        truncated,
     )
 }
 
@@ -97,23 +93,74 @@ fn activity_progress_projection(activity: &ShellJobActivity) -> Value {
     })
 }
 
+/// Only admission metadata can establish pytest identity for a durable Job.
+pub(crate) fn attach_pytest_job_metadata(
+    detected: &mut Value,
+    pytest: bool,
+    status: &str,
+    exit_code: Option<i64>,
+    stdout: &str,
+    stderr: &str,
+    truncated: bool,
+) {
+    if !pytest {
+        return;
+    }
+    for field in [
+        "tests_detected",
+        "tests_run_count",
+        "tests_passed",
+        "tests_failed",
+        "zero_tests_run",
+    ] {
+        detected.as_object_mut().unwrap().remove(field);
+    }
+    if truncated || exit_code.is_none() || !matches!(status, "completed" | "failed") {
+        return;
+    }
+    if let Some(metadata) =
+        webcodex_core::pytest_test_count::parse_pytest_terminal_test_counts(stdout, stderr)
+    {
+        attach_pytest_counts(detected, metadata);
+    }
+}
+
+pub(crate) fn attach_pytest_counts(
+    detected: &mut Value,
+    metadata: webcodex_core::pytest_test_count::PytestTestRunMetadata,
+) {
+    detected["tests_detected"] = json!(metadata.tests_detected);
+    for (field, count) in [
+        ("tests_run_count", metadata.tests_run_count),
+        ("tests_passed", metadata.tests_passed),
+        ("tests_failed", metadata.tests_failed),
+    ] {
+        if let Some(count) = count {
+            detected[field] = json!(count);
+        }
+    }
+    if let Some(zero) = metadata.zero_tests_run {
+        detected["zero_tests_run"] = json!(zero);
+    }
+}
+
 pub(crate) fn detected_job_summary_with_activity(
     command_summary: Option<&str>,
-    execution_source: Option<&str>,
     purpose: Option<&str>,
     status: &str,
     exit_code: Option<i64>,
     stdout: &str,
     stderr: &str,
+    analysis_truncated: bool,
     activity: Option<&ShellJobActivity>,
-    truncated: bool,
 ) -> Value {
     let normalized = command_summary
         .unwrap_or_default()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    let kind = if normalized.starts_with("cargo test") {
+    let cargo_test = normalized == "cargo test" || normalized.starts_with("cargo test ");
+    let kind = if cargo_test {
         "test"
     } else if normalized.starts_with("cargo check") {
         "check"
@@ -186,28 +233,7 @@ pub(crate) fn detected_job_summary_with_activity(
             detected["progress"] = progress;
         }
     }
-    if kind == "test"
-        && execution_source == Some("run_process")
-        && is_supported_pytest_command_summary(&normalized)
-    {
-        // A tail cannot prove the complete terminal summary if either stream
-        // was truncated. Never convert an unseen pytest run into Cargo's
-        // tests_detected=false just because the parsers recognize different
-        // harness grammars.
-        let finished = matches!(
-            lifecycle,
-            Some(RunnerJobLifecycle::Completed | RunnerJobLifecycle::Failed)
-        ) && exit_code.is_some();
-        if finished && !truncated {
-            if let Some(metadata) = parse_pytest_terminal_test_counts(stdout, stderr) {
-                detected["tests_detected"] = json!(metadata.tests_detected);
-                detected["tests_run_count"] = json!(metadata.tests_run_count);
-                detected["tests_passed"] = json!(metadata.tests_passed);
-                detected["tests_failed"] = json!(metadata.tests_failed);
-                detected["zero_tests_run"] = json!(metadata.zero_tests_run);
-            }
-        }
-    } else if kind == "test" && !is_supported_pytest_command_summary(&normalized) {
+    if kind == "test" {
         let combined = format!("{stdout}\n{stderr}");
         let metadata = super::cargo::parse_cargo_test_run_metadata(&combined);
         detected["tests_detected"] = json!(metadata.tests_detected);
@@ -215,223 +241,264 @@ pub(crate) fn detected_job_summary_with_activity(
         detected["zero_tests_run"] = json!(metadata.zero_tests_run);
         detected["tests_passed"] = json!(metadata.tests_passed);
         detected["tests_failed"] = json!(metadata.tests_failed);
+        if cargo_test
+            && outcome == "passed"
+            && metadata.tests_detected
+            && metadata.tests_run_count == Some(0)
+            && metadata.zero_tests_run == Some(true)
+        {
+            detected["outcome"] = json!("inconclusive");
+        }
+        if cargo_test {
+            let diagnostics = webcodex_core::validation_evidence::parse_cargo_test_diagnostics(
+                stdout,
+                stderr,
+                analysis_truncated,
+            );
+            if !diagnostics.failed_test_details.is_empty() || metadata.tests_failed.unwrap_or(0) > 0
+            {
+                detected["failed_test_details"] = json!(diagnostics
+                    .failed_test_details
+                    .iter()
+                    .map(|detail| json!({"name": detail.name}))
+                    .collect::<Vec<_>>());
+                detected["failed_test_details_truncated"] =
+                    json!(diagnostics.failed_test_details_truncated);
+            }
+        }
     }
     detected
 }
 
-/// Retain sparse, typed pytest facts from the bounded *original* synchronous
-/// Runner result before the Session ledger's privacy-filtered 800-char excerpt
-/// is derived. No stdout/stderr body or invented fallback becomes ledger truth.
-pub(crate) fn attach_pytest_terminal_metadata(output: &mut Value) {
-    let command = output
-        .get("command_summary")
-        .or_else(|| output.get("process_summary"))
-        .or_else(|| output.get("script_summary"))
-        .and_then(Value::as_str);
-    if output.get("execution_source").and_then(Value::as_str) != Some("run_process")
-        || output.get("purpose").and_then(Value::as_str) != Some("test")
-        || output.get("execution_state").and_then(Value::as_str) != Some("completed")
-        || output.get("exit_code").and_then(Value::as_i64).is_none()
-        || output.get("stdout_truncated").and_then(Value::as_bool) != Some(false)
-        || output.get("stderr_truncated").and_then(Value::as_bool) != Some(false)
-        || !command.is_some_and(is_supported_pytest_command_summary)
-    {
-        return;
-    }
-    let stdout = output
-        .get("stdout_tail")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let stderr = output
-        .get("stderr_tail")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if let Some(metadata) = parse_pytest_terminal_test_counts(stdout, stderr) {
-        output["tests_detected"] = json!(metadata.tests_detected);
-        if let Some(run) = metadata.tests_run_count {
-            output["tests_run_count"] = json!(run);
-        }
-        if let Some(passed) = metadata.tests_passed {
-            output["tests_passed"] = json!(passed);
-        }
-        if let Some(failed) = metadata.tests_failed {
-            output["tests_failed"] = json!(failed);
-        }
-        if let Some(zero) = metadata.zero_tests_run {
-            output["zero_tests_run"] = json!(zero);
-        }
-    }
-}
-
 #[cfg(test)]
 mod detected_summary_tests {
-    use super::{
-        attach_pytest_terminal_metadata, detected_job_summary, detected_job_summary_with_activity,
-    };
+    use super::{detected_job_summary, detected_job_summary_with_activity};
+
+    #[test]
+    fn pytest_counts_require_admitted_identity_and_complete_terminal_stream() {
+        for (status, exit, truncated, summary, count) in [
+            (
+                "completed",
+                Some(0),
+                false,
+                "2 passed, 1 skipped in 0.12s",
+                Some(2),
+            ),
+            (
+                "failed",
+                Some(1),
+                false,
+                "2 passed, 1 failed, 1 error in 0.12s",
+                Some(3),
+            ),
+            ("completed", Some(0), true, "2 passed in 0.12s", None),
+            ("running", None, false, "2 passed in 0.12s", None),
+            ("lost", None, false, "2 passed in 0.12s", None),
+            ("completed", Some(0), false, "2 skipped in 0.12s", None),
+            ("completed", Some(0), false, "2 passed in bad", None),
+            (
+                "completed",
+                Some(0),
+                false,
+                "2 passed in 0.12s\n3 passed in 0.13s",
+                None,
+            ),
+        ] {
+            let mut detected = detected_job_summary(
+                Some("untrusted preview"),
+                Some("test"),
+                status,
+                exit,
+                summary,
+                "",
+            );
+            super::attach_pytest_job_metadata(
+                &mut detected,
+                true,
+                status,
+                exit,
+                summary,
+                "",
+                truncated,
+            );
+            assert_eq!(detected["tests_run_count"].as_u64(), count, "{detected}");
+            if count.is_some() {
+                assert_eq!(detected["tests_passed"], 2);
+                assert_eq!(detected["zero_tests_run"], false);
+                assert_eq!(
+                    detected["outcome"],
+                    if exit == Some(0) { "passed" } else { "failed" }
+                );
+            }
+        }
+        // A shell/script preview and output that both look like pytest do not
+        // acquire the admission-only marker or its count semantics.
+        let mut spoof = serde_json::json!({"kind": "test", "outcome": "passed"});
+        super::attach_pytest_job_metadata(
+            &mut spoof,
+            false,
+            "completed",
+            Some(0),
+            "2 passed in 0.12s",
+            "",
+            false,
+        );
+        assert!(spoof.get("tests_run_count").is_none());
+    }
     use crate::runner_protocol::{
         ShellJobActivity, ShellJobActivityPhase, ShellJobActivitySource, ShellJobActivityState,
     };
-    use serde_json::json;
+
+    #[test]
+    fn generic_cargo_failed_identities_are_bounded_advisory_and_truthful_when_incomplete() {
+        let stdout = (0..25).map(|index| format!("test cases::failure_{index} ... FAILED\n")).collect::<String>()
+            + "test result: FAILED. 0 passed; 25 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n";
+        let detected = detected_job_summary_with_activity(
+            Some("cargo test --lib"),
+            None,
+            "failed",
+            Some(101),
+            &stdout,
+            "",
+            false,
+            None,
+        );
+        assert_eq!(detected["tests_failed"], 25);
+        assert_eq!(
+            detected["failed_test_details"].as_array().unwrap().len(),
+            webcodex_core::validation_evidence::MAX_FAILED_TESTS
+        );
+        assert_eq!(
+            detected["failed_test_details"][0]["name"],
+            "cases::failure_0"
+        );
+        assert_eq!(detected["failed_test_details_truncated"], true);
+        assert!(detected.get("validation_target_id").is_none());
+        assert!(detected.get("test_count_evidence").is_none());
+        for captured in [false, true] {
+            let stdout = if captured { "test cases::captured ... FAILED\n" } else { "" }.to_string()
+                + "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.1s\n";
+            let detected = detected_job_summary_with_activity(
+                Some("cargo test"),
+                None,
+                "failed",
+                Some(101),
+                &stdout,
+                "",
+                true,
+                None,
+            );
+            assert_eq!(
+                detected["failed_test_details"].as_array().unwrap().len(),
+                usize::from(captured)
+            );
+            assert_eq!(detected["failed_test_details_truncated"], true);
+        }
+        for command in ["cargo testing", "echo cargo test", "custom"] {
+            let detected = detected_job_summary_with_activity(
+                Some(command),
+                Some("test"),
+                "failed",
+                Some(1),
+                &stdout,
+                "",
+                false,
+                None,
+            );
+            assert!(detected.get("failed_test_details").is_none());
+        }
+    }
+
+    #[test]
+    fn generic_cargo_test_zero_tests_are_inconclusive_without_changing_process_success() {
+        let zero = detected_job_summary(
+            Some("cargo test --lib __webcodex_no_such_test_filter__"),
+            Some("test"),
+            "completed",
+            Some(0),
+            "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s\n",
+            "",
+        );
+        assert_eq!(zero["tests_detected"], true);
+        assert_eq!(zero["tests_run_count"], 0);
+        assert_eq!(zero["zero_tests_run"], true);
+        assert_eq!(zero["outcome"], "inconclusive");
+
+        let passed = detected_job_summary(
+            Some("cargo test --lib focused"),
+            Some("test"),
+            "completed",
+            Some(0),
+            "running 1 test\ntest focused ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n",
+            "",
+        );
+        assert_eq!(passed["tests_run_count"], 1);
+        assert_eq!(passed["zero_tests_run"], false);
+        assert_eq!(passed["outcome"], "passed");
+
+        let failed = detected_job_summary(
+            Some("cargo test --lib focused"),
+            Some("test"),
+            "failed",
+            Some(101),
+            "running 1 test\ntest focused ... FAILED\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n",
+            "",
+        );
+        assert_eq!(failed["outcome"], "failed");
+
+        let timed_out = detected_job_summary(
+            Some("cargo test --lib focused"),
+            Some("test"),
+            "timed_out",
+            None,
+            "running 0 tests\n",
+            "",
+        );
+        assert_eq!(timed_out["outcome"], "timed_out");
+
+        let cancelled = detected_job_summary(
+            Some("cargo test --lib focused"),
+            Some("test"),
+            "cancelled",
+            None,
+            "running 0 tests\n",
+            "",
+        );
+        assert_eq!(cancelled["outcome"], "cancelled");
+    }
 
     #[test]
     fn cargo_progress_is_advisory_and_command_scoped() {
         let locked = detected_job_summary(
             Some("cargo check -p webcodex"),
-            None,
             Some("validation"),
             "running",
             None,
             "",
             "Blocking waiting for file lock on build directory\n",
-            false,
         );
         assert_eq!(locked["progress"]["state"], "waiting");
         assert_eq!(locked["progress"]["reason_code"], "cargo_build_lock");
 
         let compiling = detected_job_summary(
             Some("cargo test -p webcodex"),
-            None,
             Some("test"),
             "running",
             None,
             "",
             "   Compiling webcodex v0.3.9\n",
-            false,
         );
         assert_eq!(compiling["progress"]["reason_code"], "cargo_compiling");
 
         let unrelated = detected_job_summary(
             Some("custom-tool"),
-            None,
             Some("operation"),
             "running",
             None,
             "Blocking waiting for file lock on build directory\n",
             "",
-            false,
         );
         assert!(unrelated.get("progress").is_none());
-    }
-
-    #[test]
-    fn completed_pytest_job_detects_terminal_counts_without_marking_collected_skips_as_run() {
-        let pytest = detected_job_summary(
-            Some("python -m pytest tests/test_api.py -q"),
-            Some("run_process"),
-            Some("test"),
-            "completed",
-            Some(0),
-            "..s [100%]\n=================== 2 passed, 1 skipped in 0.12s ===================\n",
-            "",
-            false,
-        );
-        assert_eq!(pytest["outcome"], "passed");
-        assert_eq!(pytest["tests_detected"], true);
-        assert_eq!(pytest["tests_run_count"], 2);
-        assert_eq!(pytest["tests_passed"], 2);
-        assert_eq!(pytest["tests_failed"], 0);
-        assert_eq!(pytest["zero_tests_run"], false);
-
-        let unrelated = detected_job_summary(
-            Some("python -m unittest discover"),
-            Some("run_process"),
-            Some("test"),
-            "completed",
-            Some(0),
-            "2 passed in 0.12s\n",
-            "",
-            false,
-        );
-        assert_ne!(unrelated["tests_detected"], true);
-        assert!(unrelated["tests_run_count"].is_null());
-    }
-
-    #[test]
-    fn pytest_job_count_remains_unknown_for_truncation_or_unfinished_execution() {
-        let complete_failure = detected_job_summary(
-            Some("python3 -B -m pytest -q"),
-            Some("run_process"),
-            Some("test"),
-            "failed",
-            Some(1),
-            "==== 1 failed, 2 passed, 1 error in 0.12s ====\n",
-            "",
-            false,
-        );
-        assert_eq!(complete_failure["outcome"], "failed");
-        assert_eq!(complete_failure["tests_detected"], true);
-        assert_eq!(complete_failure["tests_passed"], 2);
-        assert_eq!(complete_failure["tests_failed"], 1);
-
-        for (status, exit_code, truncated) in [
-            ("failed", Some(1), true),
-            ("running", None, false),
-            ("lost", None, false),
-        ] {
-            let unknown = detected_job_summary(
-                Some("python3 -B -m pytest -q"),
-                Some("run_process"),
-                Some("test"),
-                status,
-                exit_code,
-                "==== 2 passed in 0.12s ====\n",
-                "",
-                truncated,
-            );
-            assert!(unknown.get("tests_detected").is_none(), "{unknown}");
-            assert!(unknown.get("tests_run_count").is_none(), "{unknown}");
-        }
-    }
-
-    #[test]
-    fn completed_synchronous_pytest_retains_typed_counts_before_ledger_excerpt_shortening() {
-        let mut output = json!({
-            "execution_source": "run_process",
-            "purpose": "test",
-            "execution_state": "completed",
-            "exit_code": 0,
-            "process_summary": "python3 -B -m pytest -q",
-            "stdout_tail": format!("{}\n=== 581 passed in 109.10s (0:01:49) ===\n", "progress".repeat(110)),
-            "stderr_tail": "",
-            "stdout_truncated": false,
-            "stderr_truncated": false,
-        });
-        attach_pytest_terminal_metadata(&mut output);
-        assert_eq!(output["tests_detected"], true);
-        assert_eq!(output["tests_run_count"], 581);
-        assert_eq!(output["tests_passed"], 581);
-        assert_eq!(output["tests_failed"], 0);
-        assert_eq!(output["zero_tests_run"], false);
-
-        output["stdout_truncated"] = json!(true);
-        for key in [
-            "tests_detected",
-            "tests_run_count",
-            "tests_passed",
-            "tests_failed",
-            "zero_tests_run",
-        ] {
-            output.as_object_mut().unwrap().remove(key);
-        }
-        attach_pytest_terminal_metadata(&mut output);
-        assert!(output.get("tests_run_count").is_none());
-
-        output["stdout_truncated"] = json!(false);
-        output["execution_source"] = json!("run_shell");
-        attach_pytest_terminal_metadata(&mut output);
-        assert!(output.get("tests_detected").is_none());
-
-        let shell = detected_job_summary(
-            Some("python3 -B -m pytest -q"),
-            Some("run_shell"),
-            Some("test"),
-            "completed",
-            Some(0),
-            "=== 581 passed in 109.10s (0:01:49) ===\n",
-            "",
-            false,
-        );
-        assert!(shell.get("tests_run_count").is_none());
     }
 
     #[test]
@@ -443,14 +510,13 @@ mod detected_summary_tests {
         };
         let detected = detected_job_summary_with_activity(
             Some("cargo check -p webcodex"),
-            None,
             Some("validation"),
             "running",
             None,
             "",
             "Checking webcodex v0.3.9\n",
-            Some(&activity),
             false,
+            Some(&activity),
         );
         assert_eq!(detected["progress"]["state"], "waiting");
         assert_eq!(
@@ -866,6 +932,47 @@ pub(crate) fn agent_job_summary_value(job: &ShellJobInfo) -> Value {
     })
 }
 
+impl ToolRuntime {
+    /// Runtime-only model projection for Job inventory. The base summary remains
+    /// the canonical compact execution metadata used by internal reconciliation.
+    fn model_job_summary_value(&self, job: &ShellJobInfo) -> Value {
+        let mut summary = agent_job_summary_value(job);
+        let generic_validation = job
+            .structured_execution
+            .as_ref()
+            .and_then(|metadata| metadata.validation_identity.as_deref())
+            .is_some()
+            && job
+                .purpose
+                .as_deref()
+                .is_some_and(is_validation_like_execution_purpose);
+        if job.validation.is_none() && !generic_validation {
+            return summary;
+        }
+        let source_state = match job.project_id.as_deref().filter(|value| !value.is_empty()) {
+            Some(project) => self.validation_sources.observe(
+                project,
+                job.validation
+                    .as_ref()
+                    .and_then(|metadata| metadata.source_fence.as_ref()),
+            ),
+            None => webcodex_core::validation_source::ValidationSourceState::default(),
+        };
+        summary["validation"] = json!({
+            "source_state": {
+                "freshness": source_state.freshness,
+                "observed_mutation_fence": source_state.observed_mutation_fence,
+            }
+        });
+        summary
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_job_summary_value_for_test(&self, job: &ShellJobInfo) -> Value {
+        self.model_job_summary_value(job)
+    }
+}
+
 pub(crate) fn job_observation_continuation_semantics() -> Value {
     super::ContinuationSemantics::new(
         super::ContinuationKind::Observe,
@@ -883,7 +990,7 @@ pub(crate) fn observe_job_continuation(job_id: &str, observation_token: Option<&
         "observe_jobs",
         json!({
             "items": [item],
-            "wait_secs": MAX_JOB_OBSERVATION_WAIT_SECS,
+            "wait_secs": MODEL_JOB_CONTINUATION_WAIT_SECS,
             "wake_on": "terminal",
         }),
     )
@@ -1191,7 +1298,7 @@ fn stop_job_output(
 }
 
 fn active_job_brief(summary: &Value) -> Value {
-    json!({
+    let mut brief = json!({
         "job_id": summary.get("job_id").cloned().unwrap_or(Value::Null),
         "kind": summary.get("kind").cloned().unwrap_or_else(|| json!("shell")),
         "status": summary.get("status").cloned().unwrap_or(Value::Null),
@@ -1199,18 +1306,27 @@ fn active_job_brief(summary: &Value) -> Value {
         "started_at": summary.get("started_at").cloned().unwrap_or(Value::Null),
         "created_at": summary.get("created_at").cloned().unwrap_or(Value::Null),
         "executor": summary.get("executor").cloned().unwrap_or(Value::Null),
-    })
+    });
+    if let Some(validation) = summary.get("validation") {
+        brief["validation"] = validation.clone();
+    }
+    brief
 }
 
 fn active_job_continuation_brief(summary: &Value) -> Value {
-    json!({
+    let mut brief = json!({
         "job_id": summary.get("job_id").cloned().unwrap_or(Value::Null),
         "status": summary.get("status").cloned().unwrap_or(Value::Null),
         "kind": summary.get("kind").cloned().unwrap_or_else(|| json!("shell")),
-    })
+    });
+    if let Some(validation) = summary.get("validation") {
+        brief["validation"] = validation.clone();
+    }
+    brief
 }
 
 impl ToolRuntime {
+    #[cfg(test)]
     pub(crate) async fn run_job_for_auth(
         &self,
         project: String,
@@ -1235,6 +1351,7 @@ impl ToolRuntime {
         .await
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run_job_for_auth_with_contract(
         &self,
@@ -1345,22 +1462,25 @@ impl ToolRuntime {
         } else {
             "configured"
         });
-        let dispatched_command = match shell {
-            Some(shell) => match explicit_shell_dispatch_command(&command, shell.as_str()) {
-                Ok(command) => command,
-                Err(error) => {
-                    return ToolResult::err(command_rejected_message(
-                        error,
-                        "use run_script for large or quote-dense explicit-shell program text.",
-                    ))
+        let dispatched_command = match (remote, shell) {
+            (true, Some(shell)) => {
+                match explicit_shell_dispatch_command(&command, shell.as_str()) {
+                    Ok(command) => command,
+                    Err(error) => {
+                        return ToolResult::err(command_rejected_message(
+                            error,
+                            "use run_script for substantially larger typed program text.",
+                        ))
+                    }
                 }
-            },
-            None => command.clone(),
+            }
+            _ => command.clone(),
         };
         match self
                 .runner_registry
                 .start_job_with_metadata_for_access(
                     ShellJobOpRequest {
+                        login: false,
                         op: "start".to_string(),
                         client_id: Some(client_id),
                         cwd: effective_cwd,
@@ -1381,6 +1501,11 @@ impl ToolRuntime {
                         project_cwd: Some(resolved_cwd.clone()),
                         purpose: Some(declared_purpose.as_str().to_string()),
                         shell: Some(actual_shell.to_string()),
+                        explicit_shell: if !remote && validation_steps.is_empty() {
+                            shell
+                        } else {
+                            None
+                        },
                         validation_steps,
                         validation: None,
                         visibility: crate::runner_http::ShellJobVisibility::Public,
@@ -1545,6 +1670,10 @@ impl ToolRuntime {
                         {
                             validation["validation_target_id"] = json!(target_id);
                         }
+                        validation["source_state"] = json!(self.validation_sources.observe(
+                            job.project_id.as_deref().unwrap_or_default(),
+                            validation_metadata.and_then(|metadata| metadata.source_fence.as_ref()),
+                        ));
                         output["validation"] = validation;
                     }
                 }
@@ -1615,18 +1744,26 @@ impl ToolRuntime {
                 let stderr = stderr.unwrap_or_default();
                 let command_summary = job.command_preview.clone();
                 let purpose = job.purpose.clone().unwrap_or_else(|| "other".to_string());
-                let detected_summary = detected_job_summary_with_activity(
+                let mut detected_summary = detected_job_summary_with_activity(
                     Some(&command_summary),
-                    job.structured_execution
-                        .as_ref()
-                        .map(|metadata| metadata.execution_source.as_str()),
                     Some(&purpose),
                     &job.status,
                     job.exit_code.map(i64::from),
                     &wait.analysis_stdout,
                     &wait.analysis_stderr,
+                    wait.analysis_truncated,
                     job.activity.as_ref(),
-                    wait.stdout_truncated || wait.stderr_truncated,
+                );
+                attach_pytest_job_metadata(
+                    &mut detected_summary,
+                    job.structured_execution
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.pytest),
+                    &job.status,
+                    job.exit_code.map(i64::from),
+                    &wait.analysis_stdout,
+                    &wait.analysis_stderr,
+                    wait.analysis_truncated,
                 );
                 let validation_tool = job
                     .validation
@@ -1653,6 +1790,14 @@ impl ToolRuntime {
                         .and_then(|metadata| metadata.require_tests),
                     job.validation.as_ref().and_then(|metadata| metadata.no_run),
                 );
+                if let Some(validation) = validation.as_mut() {
+                    validation["source_state"] = json!(self.validation_sources.observe(
+                        job.project_id.as_deref().unwrap_or_default(),
+                        job.validation
+                            .as_ref()
+                            .and_then(|metadata| metadata.source_fence.as_ref()),
+                    ));
+                }
                 if let (Some(validation), Some(target_id)) = (
                     validation.as_mut(),
                     job.validation
@@ -1793,7 +1938,7 @@ impl ToolRuntime {
                     .map(|status| status == &job.status)
                     .unwrap_or(true)
             })
-            .map(agent_job_summary_value)
+            .map(|job| self.model_job_summary_value(job))
             .collect();
 
         summaries.sort_by(|a, b| {
@@ -2052,7 +2197,7 @@ impl ToolRuntime {
             if !webcodex_runner_registry::job_status_is_active(&job.status) {
                 continue;
             }
-            let summary = agent_job_summary_value(&job);
+            let summary = self.model_job_summary_value(&job);
             if continuation_session_id.is_some()
                 && job.session_id.as_deref() == continuation_session_id
             {
@@ -2142,34 +2287,6 @@ impl ToolRuntime {
             output["active_job"] = continuation_candidates.pop().unwrap_or(Value::Null);
         }
         output
-    }
-
-    /// Hidden REST compatibility wrapper for stopping a runtime Job by id.
-    /// Registered Project Jobs are Runner-owned, so this delegates directly to
-    /// the Runner Job registry and never attempts Server-local process control.
-    pub async fn stop_job(&self, job_id: String, auth: Option<&AuthContext>) -> ToolResult {
-        if !is_safe_job_id(&job_id) {
-            return ToolResult::err("invalid job id");
-        }
-        match self
-            .runner_registry
-            .stop_job_for_auth(
-                crate::runner_http::runner_access_from_auth(auth).as_ref(),
-                &job_id,
-                crate::runner_http::requested_by_from_auth(auth),
-            )
-            .await
-        {
-            Ok(job) => ToolResult::ok(json!({
-                "job_id": job.job_id,
-                "project": job.project_id,
-                "status": job.status,
-            })),
-            Err(error) if error.contains("unknown shell job") => {
-                ToolResult::err(format!("unknown job: {job_id}"))
-            }
-            Err(error) => ToolResult::err(error),
-        }
     }
 }
 
@@ -2744,6 +2861,7 @@ mod recovery_projection_tests {
             error: None,
             command_execution_state: None,
             structured_execution: Some(ShellJobStructuredExecutionMetadata {
+                pytest: false,
                 execution_source: "run_process".to_string(),
                 language: None,
                 script_bytes: None,

@@ -1175,6 +1175,7 @@ mod tests {
 
     fn request(action: &str, shell_id: &str, command: Option<&str>) -> RunnerRequest {
         RunnerRequest {
+            login: false,
             request_id: format!("req-{action}"),
             client_id: "agent-1".to_string(),
             kind: "persistent_shell".to_string(),
@@ -1189,6 +1190,7 @@ mod tests {
             end_line: None,
             create_dirs: false,
             command: command.unwrap_or_default().to_string(),
+            shell: None,
             process: None,
             script: None,
             stdin: None,
@@ -1568,6 +1570,8 @@ mod windows_tests {
 
     fn request(action: &str, shell_id: &str, command: Option<&str>) -> RunnerRequest {
         RunnerRequest {
+            login: false,
+            shell: None,
             request_id: format!("req-{action}"),
             client_id: "msi".to_string(),
             kind: "persistent_shell".to_string(),

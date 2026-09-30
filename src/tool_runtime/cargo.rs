@@ -7,10 +7,12 @@ use super::helpers::{
     sync_timeout_out_of_range_result, validate_project_relative_path,
     DEFAULT_CARGO_CHECK_TIMEOUT_SECS, DEFAULT_CARGO_FMT_TIMEOUT_SECS,
     DEFAULT_CARGO_TEST_TIMEOUT_SECS, MAX_VALIDATION_TIMEOUT_SECS, MIN_VALIDATION_TIMEOUT_SECS,
-    SYNC_VALIDATION_WAIT_SECS,
 };
 use super::shell::{command_execution_state_name, ProjectCommandOutput};
-use super::structured_execution::structured_job_observation;
+use super::structured_execution::{
+    recover_hidden_structured_job, structured_job_observation, HiddenStructuredJobWait,
+    StructuredExecutionBudget, StructuredJobHandoffFailure, STRUCTURED_EXECUTION_SYNC_WAIT_SECS,
+};
 use super::tool_result::ToolResult;
 use super::validation_profile::{
     validation_adapter_for_tool, ValidationAdapter, ValidationCommandOptions,
@@ -18,13 +20,14 @@ use super::validation_profile::{
 };
 use super::ToolRuntime;
 use crate::auth::AuthContext;
-use crate::runner_http::ShellJobStartMetadata;
+use crate::runner_http::{RunnerFeature, ShellJobStartMetadata};
 use crate::runner_protocol::{
     ShellCommandExecutionState, ShellJobOpRequest, ShellJobValidationMetadata,
     ShellJobValidationStep,
 };
 use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
 use webcodex_core::runtime_contract::STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS;
+use webcodex_core::validation_source::ValidationSourceFence;
 use webcodex_core::workflow_session_contract::ExecutionPurpose;
 use webcodex_validation::execution_purpose_for_validation_kind;
 pub(crate) use webcodex_validation::parse_cargo_test_run_metadata;
@@ -32,7 +35,7 @@ pub(crate) use webcodex_validation::parse_cargo_test_run_metadata;
 const CARGO_STDIO_TAIL_CHARS: usize = 12_000;
 const CARGO_VALIDATION_FAILURE_KIND: &str = "validation_failed";
 const VALIDATION_FAILURE_GUIDANCE: &str =
-    "command was started; inspect bounded validation evidence, fix the reported issue, then rerun the same structured validation tool.";
+    "this result is terminal and has no active Job continuation; inspect bounded validation evidence, fix the reported issue, then run a new structured validation.";
 
 fn test_count_assertion_failure_message(tool_name: &str, payload: &Value) -> String {
     if tool_name == "cargo_test"
@@ -44,6 +47,13 @@ fn test_count_assertion_failure_message(tool_name: &str, payload: &Value) -> Str
         return "cargo_test test-count assertion was not proven; inspect test_count_assertion and rerun with a scope that executes enough tests.".to_string();
     }
     "structured test-count assertion was not proven; inspect test_count_assertion and rerun with a scope that executes enough tests.".to_string()
+}
+
+fn terminal_test_count_assertion_failure_message(tool_name: &str, payload: &Value) -> String {
+    format!(
+        "structured validation command completed with validation failure; {VALIDATION_FAILURE_GUIDANCE} {}",
+        test_count_assertion_failure_message(tool_name, payload)
+    )
 }
 
 fn cargo_fmt_check_is_stable_diff(
@@ -152,10 +162,10 @@ struct ValidationBudget {
 /// `timeout_secs` is the total runtime budget of the command, not the tool
 /// call's synchronous wait. Positive values above the supported ceilings are
 /// caller preferences and are clamped before dispatch. Explicit
-/// `sync_wait_secs` is likewise clamped to both 60 seconds and the effective
-/// total budget. When omitted, compatibility keeps
-/// `min(SYNC_VALIDATION_WAIT_SECS, effective_timeout)`; equal grace and total
-/// budget leaves no Cargo handoff headroom.
+/// `sync_wait_secs` is likewise clamped to the shared Host-safe model-facing
+/// ceiling and the effective total budget. When omitted, use the same canonical
+/// early-handoff default as ordinary structured execution, bounded by the
+/// effective total timeout.
 fn resolve_validation_budget(
     tool_name: &str,
     timeout_secs: Option<u64>,
@@ -177,13 +187,13 @@ fn resolve_validation_budget(
             return Err(validation_sync_wait_rejection(
                 tool_name,
                 format!("{tool_name} sync_wait_secs must be at least 1"),
-                "pass a positive sync_wait_secs, or omit it for the existing synchronous grace.",
+                "pass a positive sync_wait_secs, or omit it for the Runtime early-handoff default.",
             ));
         }
         Some(sync_wait) => sync_wait
             .min(STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS)
             .min(effective_timeout_secs),
-        None => SYNC_VALIDATION_WAIT_SECS.min(effective_timeout_secs),
+        None => STRUCTURED_EXECUTION_SYNC_WAIT_SECS.min(effective_timeout_secs),
     };
     Ok(ValidationBudget {
         effective_timeout_secs,
@@ -196,7 +206,35 @@ mod validation_budget_tests {
     use super::*;
 
     #[test]
-    fn oversized_validation_preferences_are_clamped_and_zero_is_rejected() {
+    fn validation_budget_uses_early_handoff_default_and_preserves_explicit_clamps() {
+        for (tool_name, default_timeout_secs) in [
+            ("cargo_check", DEFAULT_CARGO_CHECK_TIMEOUT_SECS),
+            ("cargo_test", DEFAULT_CARGO_TEST_TIMEOUT_SECS),
+            ("cargo_fmt", DEFAULT_CARGO_FMT_TIMEOUT_SECS),
+            ("go_test", DEFAULT_CARGO_TEST_TIMEOUT_SECS),
+        ] {
+            let default =
+                resolve_validation_budget(tool_name, None, None, default_timeout_secs).unwrap();
+            assert_eq!(default.effective_timeout_secs, default_timeout_secs);
+            assert_eq!(default.sync_wait_secs, STRUCTURED_EXECUTION_SYNC_WAIT_SECS);
+        }
+
+        let short = resolve_validation_budget("cargo_check", Some(3), None, 600).unwrap();
+        assert_eq!(short.effective_timeout_secs, 3);
+        assert_eq!(short.sync_wait_secs, 3);
+
+        let explicit = resolve_validation_budget("cargo_check", Some(600), Some(45), 600).unwrap();
+        assert_eq!(explicit.effective_timeout_secs, 600);
+        assert_eq!(explicit.sync_wait_secs, 45);
+
+        let host_boundary =
+            resolve_validation_budget("cargo_check", Some(600), Some(60), 600).unwrap();
+        assert_eq!(host_boundary.effective_timeout_secs, 600);
+        assert_eq!(
+            host_boundary.sync_wait_secs,
+            STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS
+        );
+
         let oversized =
             resolve_validation_budget("cargo_check", Some(4_000), Some(600), 600).unwrap();
         assert_eq!(
@@ -400,8 +438,8 @@ impl ToolRuntime {
                     ))
                 }
             };
-            let resolved = match self.resolve_project_input_for_auth(&project, auth).await {
-                Ok(resolved) => resolved,
+            let config = match self.resolve_project(&project).await {
+                Ok(config) => config,
                 Err(e) => {
                     return ToolResult::err(command_rejected_message(
                         e.to_message(),
@@ -409,8 +447,6 @@ impl ToolRuntime {
                     ))
                 }
             };
-            let project_id = resolved.resolved_id.clone();
-            let config = resolved.config;
             let adapter = validation_adapter_for_tool("cargo_fmt")
                 .expect("Rust validation profile must register cargo_fmt");
             let check_command = adapter
@@ -421,12 +457,7 @@ impl ToolRuntime {
                 .expect("cargo_fmt check command builder is infallible");
             let started = Instant::now();
             let check_output = match self
-                .run_project_command_capture(
-                    &project_id,
-                    check_command.clone(),
-                    timeout,
-                    cwd.clone(),
-                )
+                .run_project_command_capture(&project, check_command.clone(), timeout, cwd.clone())
                 .await
             {
                 Ok(output) => output,
@@ -443,7 +474,7 @@ impl ToolRuntime {
             if already_formatted {
                 let mut result = self
                     .build_cargo_result(
-                        &project_id,
+                        &project,
                         &check_command,
                         cwd.as_deref(),
                         &config,
@@ -465,7 +496,7 @@ impl ToolRuntime {
             if !cargo_fmt_check_is_stable_diff(adapter, &check_output) {
                 let mut result = self
                     .build_cargo_result(
-                        &project_id,
+                        &project,
                         &check_command,
                         cwd.as_deref(),
                         &config,
@@ -496,7 +527,7 @@ impl ToolRuntime {
             if remaining_budget < Duration::from_secs(1) {
                 let mut result = self
                     .build_cargo_result(
-                        &project_id,
+                        &project,
                         &check_command,
                         cwd.as_deref(),
                         &config,
@@ -528,7 +559,7 @@ impl ToolRuntime {
                 })
                 .expect("cargo_fmt command builder is infallible");
             let mutation_output = match self
-                .run_project_command_capture(&project_id, command.clone(), remaining, cwd.clone())
+                .run_project_command_capture(&project, command.clone(), remaining, cwd.clone())
                 .await
             {
                 Ok(output) => output,
@@ -543,7 +574,7 @@ impl ToolRuntime {
             let mutation_exit_code = mutation_output.exit_code;
             let mut result = self
                 .build_cargo_result(
-                    &project_id,
+                    &project,
                     &command,
                     cwd.as_deref(),
                     &config,
@@ -588,6 +619,7 @@ impl ToolRuntime {
                     no_default_features: None,
                     features: None,
                     package: None,
+                    cargo_packages: None,
                     no_run: None,
                     require_tests: None,
                     minimum_tests: None,
@@ -616,6 +648,11 @@ impl ToolRuntime {
         package: Option<String>,
         timeout_secs: Option<u64>,
     ) -> ToolResult {
+        let packages =
+            match crate::runner_protocol::normalize_cargo_packages(package.as_deref(), None) {
+                Ok(packages) => packages,
+                Err(error) => return ToolResult::err(error),
+            };
         self.cargo_check_with_context_inner(
             project,
             cwd,
@@ -623,7 +660,7 @@ impl ToolRuntime {
             all_features,
             no_default_features,
             features,
-            package,
+            packages,
             timeout_secs,
             None,
             None,
@@ -642,7 +679,7 @@ impl ToolRuntime {
         all_features: Option<bool>,
         no_default_features: Option<bool>,
         features: Option<String>,
-        package: Option<String>,
+        packages: Option<Vec<String>>,
         timeout_secs: Option<u64>,
         sync_wait_secs: Option<u64>,
         session_id: Option<String>,
@@ -656,7 +693,7 @@ impl ToolRuntime {
             all_features,
             no_default_features,
             features,
-            package,
+            packages,
             timeout_secs,
             sync_wait_secs,
             session_id,
@@ -675,7 +712,7 @@ impl ToolRuntime {
         all_features: Option<bool>,
         no_default_features: Option<bool>,
         features: Option<String>,
-        package: Option<String>,
+        packages: Option<Vec<String>>,
         timeout_secs: Option<u64>,
         sync_wait_secs: Option<u64>,
         session_id: Option<String>,
@@ -694,7 +731,8 @@ impl ToolRuntime {
                 all_features,
                 no_default_features,
                 features,
-                package,
+                package: None,
+                cargo_packages: packages,
                 no_run: None,
                 require_tests: None,
                 minimum_tests: None,
@@ -827,6 +865,7 @@ impl ToolRuntime {
                 no_default_features,
                 features,
                 package,
+                cargo_packages: None,
                 no_run,
                 require_tests,
                 minimum_tests,
@@ -876,6 +915,7 @@ impl ToolRuntime {
                 no_default_features: None,
                 features: None,
                 package: None,
+                cargo_packages: None,
                 no_run: None,
                 require_tests: None,
                 minimum_tests: None,
@@ -942,7 +982,7 @@ impl ToolRuntime {
                 "no_run": request.no_run,
                 "require_tests": request.require_tests,
                 "min_tests": request.minimum_tests,
-                "packages": request.go_packages.as_ref(),
+                "packages": request.cargo_packages.as_ref().or(request.go_packages.as_ref()),
             }),
         );
         let options = ValidationCommandOptions {
@@ -954,6 +994,7 @@ impl ToolRuntime {
             no_default_features: request.no_default_features,
             features: request.features,
             package: request.package,
+            cargo_packages: request.cargo_packages,
             no_run: request.no_run,
             go_packages: request.go_packages,
         };
@@ -970,18 +1011,52 @@ impl ToolRuntime {
                 ))
             }
         };
+        let requires_multi_package_cargo_check = tool_name == "cargo_check"
+            && crate::runner_protocol::normalize_cargo_packages(
+                options.package.as_deref(),
+                options.cargo_packages.as_deref(),
+            )
+            .is_ok_and(|packages| packages.is_some_and(|packages| packages.len() > 1));
         // Pre-execution validation happens before any execution is created, so
         // a rejection never leaves a Job or a running process behind.
         let resolved = match self
             .resolve_project_input_for_auth(&request.project, request.auth)
             .await
         {
-            Ok(resolved) => resolved,
+            Ok(config) => config,
             Err(e) => return ToolResult::err(command_rejected_message(
                 e.to_message(),
                 "verify the project id with list_projects, then retry with a registered project.",
             )),
         };
+        let source_project = resolved.resolved_id;
+        let runner_client_id = resolved.config.client_id.clone();
+        let resolved = resolved.config;
+        if requires_multi_package_cargo_check {
+            let access = crate::runner_http::runner_access_from_auth(request.auth);
+            let runner = match self
+                .runner_registry
+                .get_runner_semantic_view_checked_for_auth(&runner_client_id, access.as_ref())
+                .await
+            {
+                Ok(runner) => runner,
+                Err(error) => {
+                    return ToolResult::err(command_rejected_message(
+                        error,
+                        "verify the target Runner is connected and authorized, then retry.",
+                    ))
+                }
+            };
+            if !runner.supports(RunnerFeature::StructuredCargoCheckPackages) {
+                return ToolResult::err(command_rejected_message(
+                    format!(
+                        "capability_unavailable: structured_cargo_check_packages_unavailable: runner {} does not support repeated Cargo check package selectors",
+                        runner_client_id
+                    ),
+                    "upgrade the target Runner or use the legacy single-package selector.",
+                ));
+            }
+        }
         let purpose = execution_purpose_for_validation_kind(adapter.validation_kind());
         let timeout_secs = budget.effective_timeout_secs;
         let sync_wait_secs = budget.sync_wait_secs;
@@ -994,7 +1069,8 @@ impl ToolRuntime {
         if let Some(result) = reject_structured_validation_ssh_resource(ssh_resource.as_deref()) {
             return result;
         }
-        if tool_name == "go_test" || sync_wait_secs < timeout_secs {
+        let source_fence = self.validation_sources.capture(&source_project);
+        let mut result = if tool_name == "go_test" || sync_wait_secs < timeout_secs {
             // The effective synchronous grace is shorter than the total
             // validation budget, so there is headroom to expose the same
             // execution as a Job. The agent path enqueues exactly one
@@ -1002,8 +1078,8 @@ impl ToolRuntime {
             // hands off if it is still running.
             self.run_readonly_validation_agent(
                 tool_name,
-                &resolved.resolved_id,
-                &resolved.config,
+                &source_project,
+                &resolved,
                 cwd.as_deref(),
                 &command,
                 adapter,
@@ -1013,6 +1089,7 @@ impl ToolRuntime {
                 sync_wait_secs,
                 session_id,
                 validation_target_id,
+                source_fence.clone(),
                 request.minimum_tests,
                 request.require_tests,
                 request.no_run,
@@ -1028,7 +1105,7 @@ impl ToolRuntime {
             // boundary. The command still starts exactly once.
             let output = match self
                     .run_project_command_capture(
-                        &resolved.resolved_id,
+                        &request.project,
                         command.clone(),
                         timeout_secs,
                         cwd.clone(),
@@ -1044,10 +1121,10 @@ impl ToolRuntime {
                     }
                 };
             self.build_cargo_result(
-                &resolved.resolved_id,
+                &request.project,
                 &command,
                 cwd.as_deref(),
-                &resolved.config,
+                &resolved,
                 adapter,
                 output,
                 timeout_secs,
@@ -1060,7 +1137,11 @@ impl ToolRuntime {
                 request.no_run,
             )
             .await
-        }
+        };
+        result.output["source_state"] = json!(self
+            .validation_sources
+            .observe(&source_project, source_fence.as_ref()));
+        result
     }
 
     /// Agent-backed read-only validation. Enqueues exactly one validation
@@ -1082,6 +1163,7 @@ impl ToolRuntime {
         sync_wait_secs: u64,
         session_id: Option<String>,
         validation_target_id: Option<String>,
+        source_fence: Option<ValidationSourceFence>,
         minimum_tests: Option<u64>,
         require_tests: Option<bool>,
         no_run: Option<bool>,
@@ -1128,6 +1210,7 @@ impl ToolRuntime {
             .runner_registry
             .start_job_with_metadata_for_access(
                 ShellJobOpRequest {
+                    login: false,
                     op: "start".to_string(),
                     client_id: Some(client_id),
                     cwd: Some(effective_cwd),
@@ -1148,6 +1231,7 @@ impl ToolRuntime {
                     project_cwd: Some(resolved_cwd.clone()),
                     purpose: Some(purpose.as_str().to_string()),
                     shell: Some(actual_shell.to_string()),
+                    explicit_shell: None,
                     validation_steps: vec![step.clone()],
                     validation: Some(ShellJobValidationMetadata {
                         tool: tool_name.to_string(),
@@ -1157,6 +1241,7 @@ impl ToolRuntime {
                         sync_wait_secs,
                         adapter: adapter.tool_identity().to_string(),
                         validation_target_id: validation_target_id.clone(),
+                        source_fence,
                         minimum_tests,
                         require_tests,
                         no_run,
@@ -1250,7 +1335,7 @@ impl ToolRuntime {
                 let result = self
                     .validation_terminal_result(job_id, adapter, &observed_status, handoff)
                     .await;
-                guard.disarm();
+                guard.disarm_if_returnable(&result);
                 return result;
             }
             if std::time::Instant::now() >= deadline {
@@ -1262,13 +1347,17 @@ impl ToolRuntime {
         // deadline; promote_hidden_job deliberately leaves such a record hidden
         // so the original Cargo call can still return its structured terminal
         // result instead of handing off an already-finished Job.
-        let promoted = match self.runner_registry.promote_hidden_job(&job_id).await {
+        let promoted = match self
+            .runner_registry
+            .promote_hidden_job(handoff.auth.as_ref(), &job_id)
+            .await
+        {
             Ok(job) => job,
-            Err(error) => {
-                return ToolResult::err(command_rejected_message(
-                    error,
-                    "use list_jobs only to recover Job identity/state when the handoff itself failed; do not retry the validation until the original execution is proven safe to retry.",
-                ));
+            Err(_) => {
+                return Box::pin(
+                    self.recover_validation_handoff(job_id, adapter, handoff, &mut guard),
+                )
+                .await;
             }
         };
         let latest_status = promoted.status.clone();
@@ -1276,38 +1365,36 @@ impl ToolRuntime {
             let result = self
                 .validation_terminal_result(job_id, adapter, &latest_status, handoff)
                 .await;
-            guard.disarm();
+            guard.disarm_if_returnable(&result);
             return result;
         }
-        let observation = match structured_job_observation(
-            &self.runner_registry,
-            handoff.auth.as_ref(),
-            &job_id,
-        )
-        .await
-        {
-            Ok(observation) => observation,
-            Err(error) => {
-                return ToolResult::err(command_rejected_message(
-                    error,
-                    "observe the exact returned Job directly when its job_id is retained; use list_jobs only if that identity is no longer available before deciding whether any retry is safe.",
-                ));
-            }
-        };
+        let observation =
+            match structured_job_observation(&self.runner_registry, handoff.auth.as_ref(), &job_id)
+                .await
+            {
+                Ok(observation) => observation,
+                Err(_) => {
+                    return Box::pin(
+                        self.recover_validation_handoff(job_id, adapter, handoff, &mut guard),
+                    )
+                    .await;
+                }
+            };
         let latest_status = observation.job.status.clone();
         if crate::tool_runtime::jobs::is_terminal_job_status(&latest_status) {
             let result = self
                 .validation_terminal_result(job_id, adapter, &latest_status, handoff)
                 .await;
-            guard.disarm();
+            guard.disarm_if_returnable(&result);
             return result;
         }
         let observation_token = match observation.job.observation_token.clone() {
             Some(token) => token,
             None => {
-                return ToolResult::err(
-                    "promoted validation job has no canonical observation token".to_string(),
-                );
+                return Box::pin(
+                    self.recover_validation_handoff(job_id, adapter, handoff, &mut guard),
+                )
+                .await;
             }
         };
         let (execution_state, command_started) = validation_handoff_execution_state(
@@ -1316,14 +1403,13 @@ impl ToolRuntime {
         );
         let detected_summary = crate::tool_runtime::jobs::detected_job_summary_with_activity(
             Some(&handoff.command_summary),
-            Some(&handoff.execution_source),
             Some(&handoff.purpose),
             &latest_status,
             observation.job.exit_code.map(i64::from),
             &observation.stdout_tail,
             &observation.stderr_tail,
-            observation.job.activity.as_ref(),
             observation.stdout_truncated || observation.stderr_truncated,
+            observation.job.activity.as_ref(),
         );
         let continuation = crate::tool_runtime::jobs::observe_job_continuation(
             &handoff.job_id,
@@ -1362,6 +1448,37 @@ impl ToolRuntime {
         ToolResult::ok(payload)
     }
 
+    /// Recover while the initiating cleanup guard still owns the hidden record.
+    /// This calls only the same canonical visibility transition and observations.
+    /// Callers box this cold future so terminal parsing/recovery does not inflate
+    /// every ordinary dispatch future (including unrelated observations).
+    async fn recover_validation_handoff(
+        &self,
+        job_id: String,
+        adapter: &'static dyn ValidationAdapter,
+        handoff: ValidationHandoff,
+        guard: &mut ValidationCleanupGuard,
+    ) -> ToolResult {
+        let result = match recover_hidden_structured_job(
+            &self.runner_registry,
+            handoff.auth.as_ref(),
+            &job_id,
+        )
+        .await
+        {
+            Ok(HiddenStructuredJobWait::Terminal { job, .. }) => {
+                self.validation_terminal_result(job_id, adapter, &job.status, handoff)
+                    .await
+            }
+            Ok(HiddenStructuredJobWait::Continued { .. }) => {
+                unreachable!("recovery never fabricates a successful handoff observation")
+            }
+            Err(failure) => validation_handoff_failure_result(failure, &handoff),
+        };
+        guard.disarm_if_returnable(&result);
+        result
+    }
+
     /// Build a terminal structured validation result from a Job's final state.
     async fn validation_terminal_result(
         &self,
@@ -1392,7 +1509,15 @@ impl ToolRuntime {
                     stderr_source_truncated,
                 )
             }
-            Err(_) => (None, String::new(), String::new(), true, true),
+            Err(_) => {
+                let failure = StructuredJobHandoffFailure::unresolved(
+                    &self.runner_registry,
+                    handoff.auth.as_ref(),
+                    &job_id,
+                )
+                .await;
+                return validation_handoff_failure_result(failure, &handoff);
+            }
         };
         let (stdout_tail, bounded_stdout_truncated) = bounded_tail(&stdout, CARGO_STDIO_TAIL_CHARS);
         let (stderr_tail, bounded_stderr_truncated) = bounded_tail(&stderr, CARGO_STDIO_TAIL_CHARS);
@@ -1465,9 +1590,9 @@ impl ToolRuntime {
             let error = if timed_out {
                 command_timeout_message(handoff.effective_timeout_secs, &stdout_tail, &stderr_tail)
             } else if process_passed {
-                test_count_assertion_failure_message(adapter.tool_identity(), &payload)
+                terminal_test_count_assertion_failure_message(adapter.tool_identity(), &payload)
             } else {
-                format!("structured validation command failed; {VALIDATION_FAILURE_GUIDANCE}")
+                format!("structured validation command completed with validation failure; {VALIDATION_FAILURE_GUIDANCE}")
             };
             let result = ToolResult {
                 success: false,
@@ -1619,9 +1744,9 @@ impl ToolRuntime {
                     "process_exit"
                 });
                 let error = if process_passed {
-                    test_count_assertion_failure_message(adapter.tool_identity(), &payload)
+                    terminal_test_count_assertion_failure_message(adapter.tool_identity(), &payload)
                 } else {
-                    format!("structured validation command failed; {VALIDATION_FAILURE_GUIDANCE}")
+                    format!("structured validation command completed with validation failure; {VALIDATION_FAILURE_GUIDANCE}")
                 };
                 ToolResult {
                     success: false,
@@ -1645,6 +1770,7 @@ struct ValidationRunRequest<'a> {
     no_default_features: Option<bool>,
     features: Option<String>,
     package: Option<String>,
+    cargo_packages: Option<Vec<String>>,
     no_run: Option<bool>,
     require_tests: Option<bool>,
     minimum_tests: Option<u64>,
@@ -1674,6 +1800,22 @@ struct ValidationHandoff {
     auth: Option<webcodex_runner_registry::RunnerAccess>,
 }
 
+fn validation_handoff_failure_result(
+    failure: StructuredJobHandoffFailure,
+    handoff: &ValidationHandoff,
+) -> ToolResult {
+    let mut result = failure.into_tool_result(
+        &handoff.project,
+        StructuredExecutionBudget {
+            effective_timeout_secs: handoff.effective_timeout_secs,
+            sync_wait_secs: handoff.sync_wait_secs,
+        },
+    );
+    result.output["project"] = json!(handoff.project);
+    result.output["passed"] = json!(false);
+    result
+}
+
 /// Build the canonical structured validation step for a read-only validation tool
 /// from the same options the synchronous adapter would have used.
 fn validation_step(
@@ -1690,6 +1832,11 @@ fn validation_step(
             vec!["fmt".to_string(), "--".to_string(), "--check".to_string()],
         ),
         "cargo_check" => {
+            let packages = crate::runner_protocol::normalize_cargo_packages(
+                options.package.as_deref(),
+                options.cargo_packages.as_deref(),
+            )
+            .map_err(|reason| format!("packages {reason}"))?;
             let mut args = vec!["check".to_string()];
             if options.all_targets.unwrap_or(true) {
                 args.push("--all-targets".to_string());
@@ -1701,10 +1848,15 @@ fn validation_step(
                 args.push("--no-default-features".to_string());
             }
             push_paired_arg(&mut args, "--features", options.features.as_deref())?;
-            push_paired_arg(&mut args, "-p", options.package.as_deref())?;
+            for package in packages.into_iter().flatten() {
+                push_paired_arg(&mut args, "-p", Some(&package))?;
+            }
             ("check", "cargo", args)
         }
         "cargo_test" => {
+            if options.cargo_packages.is_some() {
+                return Err("cargo_test does not accept cargo_check packages".to_string());
+            }
             let mut args = vec!["test".to_string()];
             if let Some(filter) = options.filter.as_deref() {
                 // Whitespace-only filter means "no filter", matching the
@@ -1823,6 +1975,12 @@ impl ValidationCleanupGuard {
             job_id,
             auth,
             armed: true,
+        }
+    }
+
+    fn disarm_if_returnable(&mut self, result: &ToolResult) {
+        if result.output["terminal"] == true || result.output["promoted_to_job"] == true {
+            self.disarm();
         }
     }
 

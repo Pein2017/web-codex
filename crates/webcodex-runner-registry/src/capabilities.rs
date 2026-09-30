@@ -9,6 +9,8 @@ use webcodex_core::runner_protocol::{self as wire, RunnerCapabilities};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RunnerFeature {
     Shell,
+    ExplicitShellSelection,
+    BashLoginShell,
     FileRead,
     FileWrite,
     ArtifactExportChunkRead,
@@ -17,10 +19,10 @@ pub enum RunnerFeature {
     ApplyTextEditOccurrence,
     ApplyTextEditLocalGuardWithoutSha,
     ApplyTextEditLineScope,
+    ApplyTextEditExpectedMatchCount,
     ApplyPatch,
     ApplyPatchMatchMetadata,
     ApplyPatchMatchingMode,
-    ApplyPatchStrictMatching,
     Git,
     Jobs,
     AsyncJobs,
@@ -32,6 +34,7 @@ pub enum RunnerFeature {
     StructuredCargoTestCountAssertion,
     StructuredCargoTestExecutionPolicy,
     StructuredCargoTestLib,
+    StructuredCargoCheckPackages,
     StructuredGoTestJson,
     StructuredGoTestTool,
     StructuredGoTestPackages,
@@ -39,6 +42,7 @@ pub enum RunnerFeature {
     StructuredScriptPayload,
     StructuredScriptJavascript,
     StructuredScriptTypescript,
+    StructuredScriptPython,
     InternalPosixScript,
     StructuredExecutionJobs,
     DetachedProcessJobs,
@@ -48,7 +52,11 @@ pub enum RunnerFeature {
     ProjectPathRegistration,
     ManagedWorktree,
     SkillRuntime,
+    SkillResourceExecution,
     SkillManagement,
+    BrowserObserve,
+    BrowserControl,
+    BrowserLaunch,
     ComputerObserve,
     ComputerApplicationDiscovery,
     ComputerApplicationLaunch,
@@ -64,6 +72,7 @@ pub enum RunnerFeature {
     NativeToolPlugins,
     ManagedSshResources,
     RunnerConfigControl,
+    InstructionRuntime,
     ComputerControl,
     ComputerScrollToElement,
     ComputerKeyInput,
@@ -73,6 +82,8 @@ pub enum RunnerFeature {
 
 const ALL_RUNNER_FEATURES: &[RunnerFeature] = &[
     RunnerFeature::Shell,
+    RunnerFeature::ExplicitShellSelection,
+    RunnerFeature::BashLoginShell,
     RunnerFeature::FileRead,
     RunnerFeature::FileWrite,
     RunnerFeature::ArtifactExportChunkRead,
@@ -81,10 +92,10 @@ const ALL_RUNNER_FEATURES: &[RunnerFeature] = &[
     RunnerFeature::ApplyTextEditOccurrence,
     RunnerFeature::ApplyTextEditLocalGuardWithoutSha,
     RunnerFeature::ApplyTextEditLineScope,
+    RunnerFeature::ApplyTextEditExpectedMatchCount,
     RunnerFeature::ApplyPatch,
     RunnerFeature::ApplyPatchMatchMetadata,
     RunnerFeature::ApplyPatchMatchingMode,
-    RunnerFeature::ApplyPatchStrictMatching,
     RunnerFeature::Git,
     RunnerFeature::Jobs,
     RunnerFeature::AsyncJobs,
@@ -96,6 +107,7 @@ const ALL_RUNNER_FEATURES: &[RunnerFeature] = &[
     RunnerFeature::StructuredCargoTestCountAssertion,
     RunnerFeature::StructuredCargoTestExecutionPolicy,
     RunnerFeature::StructuredCargoTestLib,
+    RunnerFeature::StructuredCargoCheckPackages,
     RunnerFeature::StructuredGoTestJson,
     RunnerFeature::StructuredGoTestTool,
     RunnerFeature::StructuredGoTestPackages,
@@ -103,6 +115,7 @@ const ALL_RUNNER_FEATURES: &[RunnerFeature] = &[
     RunnerFeature::StructuredScriptPayload,
     RunnerFeature::StructuredScriptJavascript,
     RunnerFeature::StructuredScriptTypescript,
+    RunnerFeature::StructuredScriptPython,
     RunnerFeature::InternalPosixScript,
     RunnerFeature::StructuredExecutionJobs,
     RunnerFeature::DetachedProcessJobs,
@@ -112,7 +125,11 @@ const ALL_RUNNER_FEATURES: &[RunnerFeature] = &[
     RunnerFeature::ProjectPathRegistration,
     RunnerFeature::ManagedWorktree,
     RunnerFeature::SkillRuntime,
+    RunnerFeature::SkillResourceExecution,
     RunnerFeature::SkillManagement,
+    RunnerFeature::BrowserObserve,
+    RunnerFeature::BrowserControl,
+    RunnerFeature::BrowserLaunch,
     RunnerFeature::ComputerObserve,
     RunnerFeature::ComputerApplicationDiscovery,
     RunnerFeature::ComputerApplicationLaunch,
@@ -128,6 +145,7 @@ const ALL_RUNNER_FEATURES: &[RunnerFeature] = &[
     RunnerFeature::NativeToolPlugins,
     RunnerFeature::ManagedSshResources,
     RunnerFeature::RunnerConfigControl,
+    RunnerFeature::InstructionRuntime,
     RunnerFeature::ComputerControl,
     RunnerFeature::ComputerScrollToElement,
     RunnerFeature::ComputerKeyInput,
@@ -155,6 +173,8 @@ impl RunnerFeature {
     pub const fn as_wire_name(self) -> &'static str {
         match self {
             Self::Shell => wire::RUNNER_CAPABILITY_SHELL,
+            Self::ExplicitShellSelection => wire::RUNNER_CAPABILITY_EXPLICIT_SHELL_SELECTION,
+            Self::BashLoginShell => wire::RUNNER_CAPABILITY_BASH_LOGIN_SHELL,
             Self::FileRead => wire::RUNNER_CAPABILITY_FILE_READ,
             Self::FileWrite => wire::RUNNER_CAPABILITY_FILE_WRITE,
             Self::ArtifactExportChunkRead => wire::RUNNER_CAPABILITY_ARTIFACT_EXPORT_CHUNK_READ,
@@ -167,10 +187,12 @@ impl RunnerFeature {
                 wire::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LOCAL_GUARD_WITHOUT_SHA
             }
             Self::ApplyTextEditLineScope => wire::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE,
+            Self::ApplyTextEditExpectedMatchCount => {
+                wire::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_EXPECTED_MATCH_COUNT
+            }
             Self::ApplyPatch => wire::RUNNER_CAPABILITY_APPLY_PATCH,
             Self::ApplyPatchMatchMetadata => wire::RUNNER_CAPABILITY_APPLY_PATCH_MATCH_METADATA,
             Self::ApplyPatchMatchingMode => wire::RUNNER_CAPABILITY_APPLY_PATCH_MATCHING_MODE,
-            Self::ApplyPatchStrictMatching => wire::RUNNER_CAPABILITY_APPLY_PATCH_STRICT_MATCHING,
             Self::Git => wire::RUNNER_CAPABILITY_GIT,
             Self::Jobs => wire::RUNNER_CAPABILITY_JOBS,
             Self::AsyncJobs => wire::RUNNER_CAPABILITY_ASYNC_JOBS,
@@ -186,6 +208,9 @@ impl RunnerFeature {
                 wire::RUNNER_CAPABILITY_STRUCTURED_CARGO_TEST_EXECUTION_POLICY
             }
             Self::StructuredCargoTestLib => wire::RUNNER_CAPABILITY_STRUCTURED_CARGO_TEST_LIB,
+            Self::StructuredCargoCheckPackages => {
+                wire::RUNNER_CAPABILITY_STRUCTURED_CARGO_CHECK_PACKAGES
+            }
             Self::StructuredGoTestJson => wire::RUNNER_CAPABILITY_STRUCTURED_GO_TEST_JSON,
             Self::StructuredGoTestTool => wire::RUNNER_CAPABILITY_STRUCTURED_GO_TEST_TOOL,
             Self::StructuredGoTestPackages => wire::RUNNER_CAPABILITY_STRUCTURED_GO_TEST_PACKAGES,
@@ -197,6 +222,7 @@ impl RunnerFeature {
             Self::StructuredScriptTypescript => {
                 wire::RUNNER_CAPABILITY_STRUCTURED_SCRIPT_TYPESCRIPT
             }
+            Self::StructuredScriptPython => wire::RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PYTHON,
             Self::InternalPosixScript => wire::RUNNER_CAPABILITY_INTERNAL_POSIX_SCRIPT,
             Self::StructuredExecutionJobs => wire::RUNNER_CAPABILITY_STRUCTURED_EXECUTION_JOBS,
             Self::DetachedProcessJobs => wire::RUNNER_CAPABILITY_DETACHED_PROCESS_JOBS,
@@ -206,7 +232,11 @@ impl RunnerFeature {
             Self::ProjectPathRegistration => wire::RUNNER_CAPABILITY_PROJECT_PATH_REGISTRATION,
             Self::ManagedWorktree => wire::RUNNER_CAPABILITY_MANAGED_WORKTREE,
             Self::SkillRuntime => wire::RUNNER_CAPABILITY_SKILL_RUNTIME,
+            Self::SkillResourceExecution => wire::RUNNER_CAPABILITY_SKILL_RESOURCE_EXECUTION,
             Self::SkillManagement => wire::RUNNER_CAPABILITY_SKILL_MANAGEMENT,
+            Self::BrowserObserve => wire::RUNNER_CAPABILITY_BROWSER_OBSERVE,
+            Self::BrowserControl => wire::RUNNER_CAPABILITY_BROWSER_CONTROL,
+            Self::BrowserLaunch => wire::RUNNER_CAPABILITY_BROWSER_LAUNCH,
             Self::ComputerObserve => wire::RUNNER_CAPABILITY_COMPUTER_OBSERVE,
             Self::ComputerApplicationDiscovery => {
                 wire::RUNNER_CAPABILITY_COMPUTER_APPLICATION_DISCOVERY
@@ -226,6 +256,7 @@ impl RunnerFeature {
             Self::NativeToolPlugins => wire::RUNNER_CAPABILITY_NATIVE_TOOL_PLUGINS,
             Self::ManagedSshResources => wire::RUNNER_CAPABILITY_MANAGED_SSH_RESOURCES,
             Self::RunnerConfigControl => wire::RUNNER_CAPABILITY_RUNNER_CONFIG_CONTROL,
+            Self::InstructionRuntime => wire::RUNNER_CAPABILITY_INSTRUCTION_RUNTIME,
             Self::ComputerControl => wire::RUNNER_CAPABILITY_COMPUTER_CONTROL,
             Self::ComputerScrollToElement => wire::RUNNER_CAPABILITY_COMPUTER_SCROLL_TO_ELEMENT,
             Self::ComputerKeyInput => wire::RUNNER_CAPABILITY_COMPUTER_KEY_INPUT,
@@ -237,6 +268,8 @@ impl RunnerFeature {
     pub(crate) fn from_wire_name(name: &str) -> Option<Self> {
         Some(match name {
             wire::RUNNER_CAPABILITY_SHELL => Self::Shell,
+            wire::RUNNER_CAPABILITY_EXPLICIT_SHELL_SELECTION => Self::ExplicitShellSelection,
+            wire::RUNNER_CAPABILITY_BASH_LOGIN_SHELL => Self::BashLoginShell,
             wire::RUNNER_CAPABILITY_FILE_READ => Self::FileRead,
             wire::RUNNER_CAPABILITY_FILE_WRITE => Self::FileWrite,
             wire::RUNNER_CAPABILITY_ARTIFACT_EXPORT_CHUNK_READ => Self::ArtifactExportChunkRead,
@@ -249,10 +282,12 @@ impl RunnerFeature {
                 Self::ApplyTextEditLocalGuardWithoutSha
             }
             wire::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_LINE_SCOPE => Self::ApplyTextEditLineScope,
+            wire::RUNNER_CAPABILITY_APPLY_TEXT_EDIT_EXPECTED_MATCH_COUNT => {
+                Self::ApplyTextEditExpectedMatchCount
+            }
             wire::RUNNER_CAPABILITY_APPLY_PATCH => Self::ApplyPatch,
             wire::RUNNER_CAPABILITY_APPLY_PATCH_MATCH_METADATA => Self::ApplyPatchMatchMetadata,
             wire::RUNNER_CAPABILITY_APPLY_PATCH_MATCHING_MODE => Self::ApplyPatchMatchingMode,
-            wire::RUNNER_CAPABILITY_APPLY_PATCH_STRICT_MATCHING => Self::ApplyPatchStrictMatching,
             wire::RUNNER_CAPABILITY_GIT => Self::Git,
             wire::RUNNER_CAPABILITY_JOBS => Self::Jobs,
             wire::RUNNER_CAPABILITY_ASYNC_JOBS => Self::AsyncJobs,
@@ -268,6 +303,9 @@ impl RunnerFeature {
                 Self::StructuredCargoTestExecutionPolicy
             }
             wire::RUNNER_CAPABILITY_STRUCTURED_CARGO_TEST_LIB => Self::StructuredCargoTestLib,
+            wire::RUNNER_CAPABILITY_STRUCTURED_CARGO_CHECK_PACKAGES => {
+                Self::StructuredCargoCheckPackages
+            }
             wire::RUNNER_CAPABILITY_STRUCTURED_GO_TEST_JSON => Self::StructuredGoTestJson,
             wire::RUNNER_CAPABILITY_STRUCTURED_GO_TEST_TOOL => Self::StructuredGoTestTool,
             wire::RUNNER_CAPABILITY_STRUCTURED_GO_TEST_PACKAGES => Self::StructuredGoTestPackages,
@@ -279,6 +317,7 @@ impl RunnerFeature {
             wire::RUNNER_CAPABILITY_STRUCTURED_SCRIPT_TYPESCRIPT => {
                 Self::StructuredScriptTypescript
             }
+            wire::RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PYTHON => Self::StructuredScriptPython,
             wire::RUNNER_CAPABILITY_INTERNAL_POSIX_SCRIPT => Self::InternalPosixScript,
             wire::RUNNER_CAPABILITY_STRUCTURED_EXECUTION_JOBS => Self::StructuredExecutionJobs,
             wire::RUNNER_CAPABILITY_DETACHED_PROCESS_JOBS => Self::DetachedProcessJobs,
@@ -288,7 +327,11 @@ impl RunnerFeature {
             wire::RUNNER_CAPABILITY_PROJECT_PATH_REGISTRATION => Self::ProjectPathRegistration,
             wire::RUNNER_CAPABILITY_MANAGED_WORKTREE => Self::ManagedWorktree,
             wire::RUNNER_CAPABILITY_SKILL_RUNTIME => Self::SkillRuntime,
+            wire::RUNNER_CAPABILITY_SKILL_RESOURCE_EXECUTION => Self::SkillResourceExecution,
             wire::RUNNER_CAPABILITY_SKILL_MANAGEMENT => Self::SkillManagement,
+            wire::RUNNER_CAPABILITY_BROWSER_OBSERVE => Self::BrowserObserve,
+            wire::RUNNER_CAPABILITY_BROWSER_CONTROL => Self::BrowserControl,
+            wire::RUNNER_CAPABILITY_BROWSER_LAUNCH => Self::BrowserLaunch,
             wire::RUNNER_CAPABILITY_COMPUTER_OBSERVE => Self::ComputerObserve,
             wire::RUNNER_CAPABILITY_COMPUTER_APPLICATION_DISCOVERY => {
                 Self::ComputerApplicationDiscovery
@@ -308,6 +351,7 @@ impl RunnerFeature {
             wire::RUNNER_CAPABILITY_NATIVE_TOOL_PLUGINS => Self::NativeToolPlugins,
             wire::RUNNER_CAPABILITY_MANAGED_SSH_RESOURCES => Self::ManagedSshResources,
             wire::RUNNER_CAPABILITY_RUNNER_CONFIG_CONTROL => Self::RunnerConfigControl,
+            wire::RUNNER_CAPABILITY_INSTRUCTION_RUNTIME => Self::InstructionRuntime,
             wire::RUNNER_CAPABILITY_COMPUTER_CONTROL => Self::ComputerControl,
             wire::RUNNER_CAPABILITY_COMPUTER_SCROLL_TO_ELEMENT => Self::ComputerScrollToElement,
             wire::RUNNER_CAPABILITY_COMPUTER_KEY_INPUT => Self::ComputerKeyInput,
@@ -342,24 +386,32 @@ impl RunnerFeature {
             | Self::ProjectLifecycle
             | Self::ProjectPathRegistration => RunnerFeatureInference::GenerationEligible,
             Self::Shell
+            | Self::ExplicitShellSelection
+            | Self::BashLoginShell
             | Self::Git
             | Self::StructuredScriptJavascript
             | Self::StructuredScriptTypescript
+            | Self::StructuredScriptPython
             | Self::StructuredCargoTestExecutionPolicy
             | Self::StructuredCargoTestLib
+            | Self::StructuredCargoCheckPackages
             | Self::ApplyTextEditLineScope
+            | Self::ApplyTextEditExpectedMatchCount
             | Self::ApplyTextEditLocalGuardWithoutSha
             | Self::ApplyPatch
             | Self::ApplyPatchMatchMetadata
             | Self::ApplyPatchMatchingMode
-            | Self::ApplyPatchStrictMatching
             | Self::SshShell
             | Self::PersistentShell
             | Self::SshPersistentShell
             | Self::DetachedProcessJobs
             | Self::ManagedWorktree
             | Self::SkillRuntime
+            | Self::SkillResourceExecution
             | Self::SkillManagement
+            | Self::BrowserObserve
+            | Self::BrowserControl
+            | Self::BrowserLaunch
             | Self::ComputerObserve
             | Self::ComputerApplicationDiscovery
             | Self::ComputerApplicationLaunch
@@ -375,6 +427,7 @@ impl RunnerFeature {
             | Self::NativeToolPlugins
             | Self::ManagedSshResources
             | Self::RunnerConfigControl
+            | Self::InstructionRuntime
             | Self::ComputerControl
             | Self::ComputerScrollToElement
             | Self::ComputerKeyInput
@@ -386,6 +439,8 @@ impl RunnerFeature {
     fn advertised_by(self, capabilities: &RunnerCapabilities) -> bool {
         match self {
             Self::Shell => capabilities.shell,
+            Self::ExplicitShellSelection => capabilities.explicit_shell_selection,
+            Self::BashLoginShell => capabilities.bash_login_shell,
             Self::FileRead => capabilities.file_read,
             Self::FileWrite => capabilities.file_write,
             Self::ArtifactExportChunkRead => capabilities.artifact_export_chunk_read,
@@ -398,10 +453,12 @@ impl RunnerFeature {
                 capabilities.apply_text_edit_local_guard_without_sha
             }
             Self::ApplyTextEditLineScope => capabilities.apply_text_edit_line_scope,
+            Self::ApplyTextEditExpectedMatchCount => {
+                capabilities.apply_text_edit_expected_match_count
+            }
             Self::ApplyPatch => capabilities.apply_patch,
             Self::ApplyPatchMatchMetadata => capabilities.apply_patch_match_metadata,
             Self::ApplyPatchMatchingMode => capabilities.apply_patch_matching_mode,
-            Self::ApplyPatchStrictMatching => capabilities.apply_patch_strict_matching,
             Self::Git => capabilities.git,
             Self::Jobs => capabilities.jobs,
             Self::AsyncJobs => capabilities.async_jobs,
@@ -417,6 +474,7 @@ impl RunnerFeature {
                 capabilities.structured_cargo_test_execution_policy
             }
             Self::StructuredCargoTestLib => capabilities.structured_cargo_test_lib,
+            Self::StructuredCargoCheckPackages => capabilities.structured_cargo_check_packages,
             Self::StructuredGoTestJson => capabilities.structured_go_test_json,
             Self::StructuredGoTestTool => capabilities.structured_go_test_tool,
             Self::StructuredGoTestPackages => capabilities.structured_go_test_packages,
@@ -424,6 +482,7 @@ impl RunnerFeature {
             Self::StructuredScriptPayload => capabilities.structured_script_payload,
             Self::StructuredScriptJavascript => capabilities.structured_script_javascript,
             Self::StructuredScriptTypescript => capabilities.structured_script_typescript,
+            Self::StructuredScriptPython => capabilities.structured_script_python,
             Self::InternalPosixScript => capabilities.internal_posix_script,
             Self::StructuredExecutionJobs => capabilities.structured_execution_jobs,
             Self::DetachedProcessJobs => capabilities.detached_process_jobs,
@@ -433,7 +492,11 @@ impl RunnerFeature {
             Self::ProjectPathRegistration => capabilities.project_path_registration,
             Self::ManagedWorktree => capabilities.managed_worktree,
             Self::SkillRuntime => capabilities.skill_runtime,
+            Self::SkillResourceExecution => capabilities.skill_resource_execution,
             Self::SkillManagement => capabilities.skill_management,
+            Self::BrowserObserve => capabilities.browser_observe,
+            Self::BrowserControl => capabilities.browser_control,
+            Self::BrowserLaunch => capabilities.browser_launch,
             Self::ComputerObserve => capabilities.computer_observe,
             Self::ComputerApplicationDiscovery => capabilities.computer_application_discovery,
             Self::ComputerApplicationLaunch => capabilities.computer_application_launch,
@@ -449,6 +512,7 @@ impl RunnerFeature {
             Self::NativeToolPlugins => capabilities.native_tool_plugins,
             Self::ManagedSshResources => capabilities.managed_ssh_resources,
             Self::RunnerConfigControl => capabilities.runner_config_control,
+            Self::InstructionRuntime => capabilities.instruction_runtime,
             Self::ComputerControl => capabilities.computer_control,
             Self::ComputerScrollToElement => capabilities.computer_scroll_to_element,
             Self::ComputerKeyInput => capabilities.computer_key_input,

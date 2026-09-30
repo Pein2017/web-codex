@@ -18,19 +18,18 @@
 //! Polling remains a fully supported fallback transport.
 
 use crate::runner_http::{RunnerRegistry, RunnerTransport};
-use crate::runner_protocol::{RunnerEnvelope, RunnerRegisterRequest};
+use crate::runner_protocol::{RunnerEnvelope, RunnerRegisterRequest, RUNNER_ENVELOPE_MAX_BYTES};
 use futures_util::{SinkExt, StreamExt};
 use salvo::prelude::*;
 use salvo::websocket::{Message, WebSocket, WebSocketUpgrade};
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 
-/// Maximum WebSocket text message size. Runner requests/results carry shell
-/// output which can be sizeable; 8 MiB matches the registry output cap head
-/// room while still bounding memory.
-const WS_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
+/// Maximum WebSocket text message size. Keep it aligned with the shared
+/// transport-neutral Runner envelope budget.
+const WS_MAX_MESSAGE_SIZE: usize = RUNNER_ENVELOPE_MAX_BYTES;
 /// Deadline for the Runner to send its first `Register` envelope after the
 /// handshake. Prevents half-open connections from holding registry state.
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(15);
@@ -180,12 +179,32 @@ async fn handle_runner_ws(
         let mut sink = sink;
         let mut out_rx = out_rx;
         while let Some(env) = out_rx.recv().await {
+            let envelope_kind = env.kind();
+            let send_started = Instant::now();
             let Ok(json) = env.to_json() else {
+                crate::runner_http::observe_server_stream_writer_send(
+                    RunnerTransport::WebSocket,
+                    envelope_kind,
+                    None,
+                    crate::runner_http::RunnerStreamMetricOutcome::TransportError,
+                );
                 return crate::runner_session::WriterExit::TransportFailed;
             };
             if sink.send(Message::text(json)).await.is_err() {
+                crate::runner_http::observe_server_stream_writer_send(
+                    RunnerTransport::WebSocket,
+                    envelope_kind,
+                    None,
+                    crate::runner_http::RunnerStreamMetricOutcome::TransportError,
+                );
                 return crate::runner_session::WriterExit::TransportFailed;
             }
+            crate::runner_http::observe_server_stream_writer_send(
+                RunnerTransport::WebSocket,
+                envelope_kind,
+                Some(send_started.elapsed()),
+                crate::runner_http::RunnerStreamMetricOutcome::Success,
+            );
         }
         if sink.close().await.is_err() {
             crate::runner_session::WriterExit::TransportFailed
@@ -206,7 +225,7 @@ async fn handle_runner_ws(
             connection_id: &connection_id,
             notify,
             cancel,
-            transport_label: "websocket",
+            transport: RunnerTransport::WebSocket,
         },
         out_tx,
         reader,
@@ -369,6 +388,8 @@ mod tests {
                 capabilities: crate::test_support::current_runner_capabilities(
                     RunnerCapabilities {
                         shell: true,
+                        explicit_shell_selection: false,
+                        bash_login_shell: false,
                         file_read: true,
                         file_write: true,
                         artifact_export_chunk_read: false,
@@ -376,11 +397,11 @@ mod tests {
                         structured_file_delete: true,
                         apply_text_edit_occurrence: false,
                         apply_text_edit_line_scope: false,
+                        apply_text_edit_expected_match_count: false,
                         apply_text_edit_local_guard_without_sha: false,
                         apply_patch: false,
                         apply_patch_match_metadata: false,
                         apply_patch_matching_mode: false,
-                        apply_patch_strict_matching: false,
                         git: false,
                         jobs: true,
                         async_jobs: true,
@@ -392,6 +413,7 @@ mod tests {
                         structured_cargo_test_count_assertion: true,
                         structured_cargo_test_execution_policy: true,
                         structured_cargo_test_lib: true,
+                        structured_cargo_check_packages: true,
                         structured_go_test_json: true,
                         structured_go_test_tool: true,
                         structured_go_test_packages: true,
@@ -399,6 +421,7 @@ mod tests {
                         structured_script_payload: false,
                         structured_script_javascript: false,
                         structured_script_typescript: false,
+                        structured_script_python: false,
                         internal_posix_script: false,
                         structured_execution_jobs: false,
                         detached_process_jobs: false,
@@ -408,7 +431,11 @@ mod tests {
                         project_path_registration: false,
                         managed_worktree: false,
                         skill_runtime: false,
+                        skill_resource_execution: false,
                         skill_management: false,
+                        browser_observe: false,
+                        browser_control: false,
+                        browser_launch: false,
                         computer_observe: false,
                         computer_application_discovery: false,
                         computer_application_launch: false,
@@ -429,6 +456,7 @@ mod tests {
                         native_tool_plugins: false,
                         managed_ssh_resources: false,
                         runner_config_control: false,
+                        instruction_runtime: false,
                     },
                 ),
                 policy: Some(RunnerPolicySummary::default()),
@@ -635,6 +663,7 @@ mod tests {
         let (request_id, mut result_rx) = registry
             .enqueue_run(
                 ShellRunRequest {
+                    login: false,
                     client_id: "shared-a".to_string(),
                     cwd: None,
                     command: "echo shared-a".to_string(),
@@ -801,6 +830,7 @@ mod tests {
         let (request_id, rx) = registry
             .enqueue_run(
                 ShellRunRequest {
+                    login: false,
                     client_id: "ws-roundtrip".to_string(),
                     cwd: None,
                     command: "echo hi".to_string(),
@@ -1163,6 +1193,7 @@ mod tests {
                 let (request_id, rx) = registry
                     .enqueue_run(
                         ShellRunRequest {
+                            login: false,
                             client_id: "ws-slow".to_string(),
                             cwd: None,
                             command: "echo hi".to_string(),
@@ -1240,6 +1271,7 @@ mod tests {
         let job = registry
             .start_job(
                 ShellJobOpRequest {
+                    login: false,
                     op: "start".to_string(),
                     client_id: Some("ws-lost".to_string()),
                     cwd: None,
@@ -1471,6 +1503,7 @@ mod tests {
         let job = registry
             .start_job(
                 ShellJobOpRequest {
+                    login: false,
                     op: "start".to_string(),
                     client_id: Some("ws-stale-disc".to_string()),
                     cwd: None,
@@ -1649,6 +1682,7 @@ mod tests {
         let (request_id, _rx) = registry
             .enqueue_run(
                 ShellRunRequest {
+                    login: false,
                     client_id: "ws-steal".to_string(),
                     cwd: None,
                     command: "echo hi".to_string(),

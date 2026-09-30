@@ -11,29 +11,16 @@ use crate::tool_runtime::model_ergonomics_telemetry::ModelErgonomicsCompletion;
 use crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD;
 use crate::tool_runtime::{
     ListToolsOptions, ToolCall, ToolRuntime, TOOL_CALL_PARAMS_FIELD, TOOL_CALL_TOOL_FIELD,
-    TOOL_CALL_WRAPPER_FIELDS,
 };
 use salvo::prelude::*;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
 mod import_http;
-mod jobs;
-mod project_files;
 mod projects;
-mod runner_config;
 
 pub use import_http::import_conversation_files_to_project;
-pub use jobs::{job_stop, job_tail, jobs_list, projects_run_job, projects_run_shell};
-pub use project_files::{
-    projects_apply_unified_diff, projects_discard_untracked, projects_git_restore_paths,
-    projects_git_status, projects_list_files,
-};
-pub use projects::{
-    projects_create, projects_list, projects_register, projects_resolve_or_register,
-    projects_unregister,
-};
-pub use runner_config::{runner_config_check, runner_config_reload};
+pub use projects::projects_resolve_or_register;
 
 fn runtime(depot: &Depot) -> Option<Arc<ToolRuntime>> {
     depot.obtain::<Arc<ToolRuntime>>().ok().cloned()
@@ -157,6 +144,7 @@ fn prepare_action_tools_call_response(
     project: Option<String>,
     result: crate::tool_runtime::ToolResult,
     model_ergonomics: Option<&ModelErgonomicsCompletion>,
+    correlation: &crate::tool_runtime::ToolCallCorrelation,
 ) -> (StatusCode, crate::tool_runtime::ToolResult) {
     let status = if result.success {
         StatusCode::OK
@@ -171,6 +159,9 @@ fn prepare_action_tools_call_response(
         .and_then(|record| serde_json::to_value(record).ok())
     {
         summary["model_ergonomics"] = telemetry;
+    }
+    if let Some(composition) = correlation.code_mode_composition_audit_summary() {
+        summary["code_mode_composition"] = composition;
     }
     let mut event = ActionAuditRecord::new(tool.to_string(), response.success, status)
         .error(response.error.clone())
@@ -254,10 +245,10 @@ pub async fn tools_call(req: &mut Request, depot: &mut Depot, res: &mut Response
         guard.handler_returned(500, estimated, Some(false), None, "error_runtime_missing");
         return;
     };
-    // Parse the body as a raw JSON value so we can apply the params/arguments
-    // precedence rule explicitly and emit field-aware errors that include the
-    // tool name. We never echo the raw body back, so tokens/headers/env never
-    // leak through error messages.
+    // Parse the body as a raw JSON value so we can enforce the explicit
+    // tool/params envelope and emit field-aware errors that include the tool
+    // name. We never echo the raw body back, so tokens/headers/env never leak
+    // through error messages.
     let body: Value = match req.parse_json().await {
         Ok(body) => body,
         Err(e) => {
@@ -416,6 +407,7 @@ pub async fn tools_call(req: &mut Request, depot: &mut Depot, res: &mut Response
                 outcome.project,
                 result,
                 model_ergonomics.as_ref(),
+                &outcome.correlation,
             );
             let response_value = guard
                 .enabled()
@@ -489,25 +481,19 @@ fn tool_call_trace_effective_arguments(tool: &str, params: &Value) -> Value {
     }
 }
 
-/// Extract `(tool, params)` from the legacy generic REST `/api/tools/call` body.
+/// Extract `(tool, params)` from the generic REST `/api/tools/call` body.
 ///
-/// Accepted shapes (all route to the same tool dispatch):
+/// Accepted shapes:
 /// - `{"tool":"list_tools"}`
 /// - `{"tool":"list_tools","params":null}`
 /// - `{"tool":"show_changes","params":{"project":"agent:c:p"}}`
-/// - `{"tool":"show_changes","project":"agent:c:p"}`
-/// - `{"tool":"git_status","project":"agent:c:p","recording_session_id":"wc_sess_..."}`
+/// - `{"tool":"git_status","params":{"project":"agent:c:p"},"recording_session_id":"wc_sess_..."}`
 ///
-/// Non-null `params` take precedence over legacy flattened REST fields. A null
-/// `params` wrapper is treated as absent. When `params` is absent/null, every
-/// top-level field except `tool` and reserved metadata like
-/// `recording_session_id` is collected into the params object for REST
-/// compatibility. GPT Actions do not use this envelope. The retired `arguments`
-/// wrapper is rejected explicitly.
-/// Top-level `session_id` is not reserved here; it remains a normal flattened
-/// tool argument for tools such as `session_summary`. Returns a human-readable
-/// error string (never including the raw body) when the body is not a JSON
-/// object or `tool` is missing/not a non-empty string.
+/// `params` is the only tool-argument container. Top-level
+/// `recording_session_id` remains request metadata and is not injected into
+/// tool arguments. Unknown top-level fields fail with migration guidance. The
+/// retired `arguments` wrapper is rejected explicitly. Returns a human-readable
+/// error string (never including the raw body) when the body is invalid.
 fn extract_tool_call(body: &Value) -> Result<(String, Value), String> {
     let obj = body
         .as_object()
@@ -526,31 +512,35 @@ fn extract_tool_call(body: &Value) -> Result<(String, Value), String> {
         }
     };
     if obj.contains_key("arguments") {
-        return Err("field 'arguments' is no longer supported; use 'params' or flattened top-level tool arguments".to_string());
+        return Err(
+            "field 'arguments' is no longer supported; move tool arguments under 'params'"
+                .to_string(),
+        );
     }
-    // Non-null params take precedence over legacy flattened REST fields. Some
-    // clients emit optional object properties as explicit nulls, which must not
-    // erase valid flattened compatibility arguments.
-    let params = if let Some(params) = obj
+    let mut unexpected = obj
+        .keys()
+        .filter(|key| {
+            key.as_str() != TOOL_CALL_TOOL_FIELD
+                && key.as_str() != TOOL_CALL_PARAMS_FIELD
+                && key.as_str() != TOOL_CALL_RECORDING_SESSION_ID_FIELD
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    unexpected.sort();
+    if !unexpected.is_empty() {
+        let fields = unexpected
+            .iter()
+            .map(|field| format!("'{field}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "unexpected top-level field(s) {fields}; move tool arguments under 'params'"
+        ));
+    }
+    let params = obj
         .get(TOOL_CALL_PARAMS_FIELD)
-        .filter(|params| !params.is_null())
-    {
-        params.clone()
-    } else {
-        let mut flattened = serde_json::Map::new();
-        for (key, value) in obj {
-            if !TOOL_CALL_WRAPPER_FIELDS.contains(&key.as_str())
-                && key != TOOL_CALL_RECORDING_SESSION_ID_FIELD
-            {
-                flattened.insert(key.clone(), value.clone());
-            }
-        }
-        if flattened.is_empty() {
-            Value::Null
-        } else {
-            Value::Object(flattened)
-        }
-    };
+        .cloned()
+        .unwrap_or(Value::Null);
     Ok((tool, params))
 }
 
@@ -633,7 +623,7 @@ fn gpt_action_admit_target(path_tool: &str, target: &str) -> Result<(), String> 
             "runtime tool '{target}' is not available through GPT Actions"
         ));
     }
-    let route = crate::model_surface::adaptive_runtime_gateway_target_route(target);
+    let route = crate::model_surface::gpt_action_gateway_target_route(target);
     if path_tool == crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME {
         return match route {
             AdaptiveRuntimeGatewayTargetRoute::Gateway => Ok(()),
@@ -660,6 +650,24 @@ fn gpt_action_admit_target(path_tool: &str, target: &str) -> Result<(), String> 
         | AdaptiveRuntimeGatewayTargetRoute::Unknown => Err(format!(
             "runtime tool '{target}' is not a direct GPT Action"
         )),
+    }
+}
+
+fn gpt_action_suggested_tool_call_route(
+    target: &str,
+) -> crate::model_surface::SuggestedToolCallRoute {
+    use crate::model_surface::{AdaptiveRuntimeGatewayTargetRoute, SuggestedToolCallRoute};
+
+    if !webcodex_tool_contracts::gpt_action_tool_supported(target) {
+        return SuggestedToolCallRoute::Unavailable;
+    }
+    match crate::model_surface::gpt_action_gateway_target_route(target) {
+        AdaptiveRuntimeGatewayTargetRoute::Direct => SuggestedToolCallRoute::Direct,
+        AdaptiveRuntimeGatewayTargetRoute::Gateway => SuggestedToolCallRoute::Gateway(
+            crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
+        ),
+        AdaptiveRuntimeGatewayTargetRoute::Recursive
+        | AdaptiveRuntimeGatewayTargetRoute::Unknown => SuggestedToolCallRoute::Unavailable,
     }
 }
 
@@ -783,12 +791,20 @@ pub async fn gpt_action_invoke(req: &mut Request, depot: &mut Depot, res: &mut R
             let result = outcome
                 .result
                 .expect("tool kernel outcome without error must include result");
-            let (status, response) = prepare_action_tools_call_response(
+            let (status, mut response) = prepare_action_tools_call_response(
                 &audit,
                 &tool,
                 outcome.project,
                 result,
                 outcome.model_ergonomics.as_ref(),
+                &outcome.correlation,
+            );
+            // ActionAudit above records canonical ToolRuntime truth. Only the
+            // response copy is projected to the callable Adaptive Action route.
+            crate::model_surface::project_tool_result_suggested_calls(
+                &tool,
+                &mut response,
+                &gpt_action_suggested_tool_call_route,
             );
             res.status_code(status);
             res.render(Json(response));
@@ -823,6 +839,32 @@ pub async fn runtime_status(req: &mut Request, depot: &mut Depot, res: &mut Resp
     let auth = depot.obtain::<crate::auth::AuthContext>().ok().cloned();
     let result = runtime.dispatch_with_auth(call, auth.as_ref()).await;
     render_result(res, &audit, "runtime_status", None, result);
+}
+
+#[cfg(test)]
+mod job_action_routing_tests {
+    use super::*;
+
+    #[test]
+    fn stop_job_actions_admission_and_followup_use_definition_owned_gateway_policy() {
+        let gateway = crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME;
+        assert!(gpt_action_admit_target(gateway, "stop_job").is_ok());
+        assert!(gpt_action_admit_target("stop_job", "stop_job").is_err());
+        assert_eq!(
+            gpt_action_suggested_tool_call_route("stop_job"),
+            crate::model_surface::SuggestedToolCallRoute::Gateway(gateway)
+        );
+        for definition in webcodex_tool_contracts::model_visible_tool_definitions() {
+            if definition.gpt_action_exposure()
+                == webcodex_tool_contracts::ToolGptActionExposure::GatewayOnly
+            {
+                assert!(gpt_action_admit_target(gateway, definition.name).is_ok());
+                assert!(gpt_action_admit_target(definition.name, definition.name).is_err());
+            }
+        }
+        assert!(gpt_action_admit_target(gateway, "cancel_job").is_err());
+        assert!(gpt_action_admit_target(gateway, gateway).is_err());
+    }
 }
 
 #[cfg(test)]

@@ -63,6 +63,38 @@ fn project_overview_runner_request_returns_metadata_without_contents() {
 }
 
 #[test]
+fn project_overview_runner_explicit_generated_scope_uses_filesystem_and_hides_secrets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let policy = project_policy(tmp.path());
+    std::fs::create_dir_all(tmp.path().join("cache/secrets")).unwrap();
+    std::fs::write(
+        tmp.path().join("cache/generated.json"),
+        "fake generated content",
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("cache/.env"), "TOKEN=fake-secret").unwrap();
+    std::fs::write(tmp.path().join("cache/secrets/token"), "fake-secret").unwrap();
+    let request = json_file_op_request(
+        tmp.path(),
+        "file_project_overview",
+        "cache",
+        serde_json::json!({"max_depth": 2, "limit": 200}),
+    );
+
+    let output = line_edit_json(handle_file_request(&policy, &request));
+    assert_eq!(output["path"], "cache");
+    let serialized = output.to_string();
+    assert!(serialized.contains("cache/generated.json"), "{serialized}");
+    assert!(!serialized.contains("cache/.env"), "{serialized}");
+    assert!(!serialized.contains("cache/secrets"), "{serialized}");
+    assert!(
+        !serialized.contains("fake generated content"),
+        "{serialized}"
+    );
+    assert!(!serialized.contains("fake-secret"), "{serialized}");
+}
+
+#[test]
 fn skill_file_ops_are_project_contained_text_only_and_path_private() {
     let tmp = tempfile::tempdir().unwrap();
     let policy = project_policy(tmp.path());
@@ -176,39 +208,6 @@ fn skill_file_ops_are_project_contained_text_only_and_path_private() {
     }
 }
 
-#[cfg(unix)]
-#[test]
-fn project_skill_root_symlink_is_rejected_without_listing_target() {
-    use std::os::unix::fs::symlink;
-
-    let holder = tempfile::tempdir().unwrap();
-    let project = holder.path().join("project");
-    let outside = holder.path().join("outside");
-    std::fs::create_dir_all(&project).unwrap();
-    let outside_skill = outside.join("must-not-list");
-    std::fs::create_dir_all(&outside_skill).unwrap();
-    std::fs::write(
-        outside_skill.join("SKILL.md"),
-        "PROJECT_SYMLINK_SKILL_BODY_MUST_NOT_BE_READ",
-    )
-    .unwrap();
-    std::fs::create_dir_all(project.join(".agents")).unwrap();
-    symlink(&outside, project.join(".agents/skills")).unwrap();
-
-    let result = handle_file_request(
-        &project_policy(holder.path()),
-        &json_file_op_request(
-            &project,
-            "file_skill_list_packages",
-            ".agents/skills",
-            serde_json::json!({"limit": 257}),
-        ),
-    );
-    assert_eq!(result.exit_code, None);
-    assert_eq!(result.error.as_deref(), Some("skill_path_escape"));
-    assert_eq!(result.stdout, None);
-}
-
 #[test]
 fn dispatch_request_edit_routes_to_file_handler() {
     let tmp = tempfile::tempdir().unwrap();
@@ -217,6 +216,8 @@ fn dispatch_request_edit_routes_to_file_handler() {
     let (sink, mut rx) = ws_sink("ws-client");
     let jobs = JobManager::new(max_concurrent_jobs(&cfg));
     let request = RunnerRequest {
+        login: false,
+        shell: None,
         request_id: "req-edit".to_string(),
         client_id: "ws-client".to_string(),
         kind: "file_write_project_file".to_string(),

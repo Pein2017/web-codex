@@ -1,4 +1,5 @@
 pub(crate) mod artifacts;
+pub(crate) mod browser;
 #[cfg(feature = "workspace-checkpoints")]
 pub(crate) mod checkpoints;
 pub(crate) mod coding_agent;
@@ -11,6 +12,7 @@ pub(crate) mod dispatch;
 pub(crate) mod exit_diagnostics;
 pub(crate) mod external_tools;
 pub(crate) mod files;
+pub(crate) mod job_manager;
 pub(crate) mod lsp;
 pub(crate) mod managed_ssh;
 pub(crate) mod mcp_gateway;
@@ -20,6 +22,7 @@ pub(crate) mod patches;
 pub(crate) mod persistent_shell;
 pub(crate) mod plugin;
 pub(crate) mod projects;
+pub(crate) mod runner_instructions;
 pub(crate) mod runner_skills;
 // Remote persistent shells always run POSIX sh/bash on the SSH target. Their
 // local child ownership is platform-specific: Unix uses a private process group,
@@ -39,14 +42,16 @@ pub(crate) mod util {
 }
 pub(crate) mod validation;
 
-pub(crate) use artifacts::handle_artifact_file_operation;
+pub(crate) use artifacts::handle_artifact_file_operation_with_store;
 #[cfg(test)]
 pub(crate) use artifacts::is_artifact_request_kind;
+pub(crate) use browser::handle_browser_operation;
 #[cfg(feature = "workspace-checkpoints")]
 pub(crate) use checkpoints::handle_checkpoint_file_request;
 #[cfg(all(test, feature = "workspace-checkpoints"))]
 pub(crate) use checkpoints::is_checkpoint_request_kind;
 pub(crate) use computer::handle_computer_operation;
+#[cfg(test)]
 pub(crate) use config::SshConfig;
 pub(crate) use config::{
     client_profile_runner_config, default_config_path, hostname, load_config, max_concurrent_jobs,
@@ -89,21 +94,24 @@ pub(crate) use projects::{
 pub(crate) use projects::{
     parse_runner_project_toml, runner_project_summary, validate_project_path_policy,
 };
-pub(crate) use runner_skills::handle_runner_skill_request;
+pub(crate) use runner_instructions::handle_runner_instruction_request;
+pub(crate) use runner_skills::{
+    handle_runner_skill_request, run_skill_resource_with_profiles_and_execution_state,
+};
+#[cfg(windows)]
+pub(crate) use shell::run_windows_native_single_file_search_with_profiles;
 pub(crate) use shell::{
-    configured_prepared_shell_job_command, configured_shell_job_command,
-    configured_validation_job_command, cwd_allowed, prepare_detached_process_launch,
-    resolve_prepared_shell_profile, run_internal_posix_script_with_profiles_and_execution_state,
+    configured_validation_job_command, explicit_shell_available,
+    run_internal_posix_script_with_profiles_and_execution_state,
     run_internal_search_script_with_profiles_and_execution_state,
-    run_process_with_profiles_and_execution_state,
-    run_process_with_profiles_and_execution_state_with_start_hook,
-    run_script_with_profiles_and_execution_state,
-    run_script_with_profiles_and_execution_state_with_start_hook,
-    run_shell_with_profiles_and_execution_state, PreparedShellProfile, PreparedShellProfileCache,
+    run_process_with_profiles_and_execution_state, run_script_with_profiles_and_execution_state,
+    run_shell_with_profiles_and_execution_state, PreparedShellProfile,
 };
 #[cfg(test)]
-pub(crate) use shell::{run_shell, run_shell_with_profiles};
-pub(crate) use ssh::{is_transport_failure, run_ssh_shell_with_execution_state, SshConnectionPool};
+pub(crate) use shell::{
+    cwd_allowed, run_shell, run_shell_with_profiles, PreparedShellProfileCache,
+};
+pub(crate) use ssh::{run_ssh_shell_with_execution_state, SshConnectionPool};
 pub(crate) use string_match::contains_any;
 #[cfg(all(test, unix))]
 pub(crate) use transport::install_reload_listener;

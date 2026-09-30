@@ -54,8 +54,6 @@ fn synthetic_contract(
         change_summary_like: false,
         project_write: write_like,
         path_hint,
-        accepts_context_ack: false,
-        advances_context_checkpoint: false,
     }
 }
 

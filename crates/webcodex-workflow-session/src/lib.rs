@@ -61,25 +61,25 @@ pub use handoff_brief::{
 };
 pub use model::{
     CodingSessionError, CodingSessionRequest, CompleteSessionMessageInput,
-    ListSessionMessagesFilter, PostSessionMessageInput, RecordedModelFacingToolCall,
-    ReplaceSessionMessageInput, SessionAckObservation, SessionCloseError,
-    SessionContextRevisionAck, SessionCreateOptions, SessionDiscussionCounts,
+    ListSessionMessagesFilter, PostSessionMessageInput, ReplaceSessionMessageInput,
+    SessionAckObservation, SessionCloseError, SessionCreateOptions, SessionDiscussionCounts,
     SessionDiscussionSummary, SessionEvent, SessionExecutionContext,
     SessionExecutionContextUpdateError, SessionGuardDenial, SessionGuards, SessionLifecycle,
-    SessionLifecycleDenial, SessionMessage, SessionMessageError, SessionMessageKind,
+    SessionLifecycleDenial, SessionMessage, SessionMessageDelivery, SessionMessageDeliveryOutcome,
+    SessionMessageDeliveryReplay, SessionMessageError, SessionMessageKind,
     SessionMessageObservationError, SessionMessagePriority, SessionMessageStatus, SessionSummary,
     SessionTransport, ToolCallExpectation, ToolCallRecorderMetadata,
     ToolCallSessionMessageResolution, ToolCallStart, WorkspaceBaseline, WorkspaceBaselineEntry,
     DEFAULT_MAX_EVENTS_PER_SESSION, DEFAULT_MAX_SESSIONS, MAX_CODING_INSTRUCTION_CHARS,
-    MAX_MESSAGE_COMPLETION_KEY_CHARS, MAX_MESSAGE_LIST_LIMIT, MAX_MESSAGE_RESOLUTION_CHARS,
+    MAX_MESSAGE_CHARS, MAX_MESSAGE_COMPLETION_KEY_CHARS, MAX_MESSAGE_DELIVERY_KEY_CHARS,
+    MAX_MESSAGE_LIST_LIMIT, MAX_MESSAGE_RESOLUTION_CHARS, MAX_MESSAGE_TAGS, MAX_MESSAGE_TAG_CHARS,
     MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS, MAX_TOOL_CALL_ACK_MESSAGE_IDS,
     MAX_WORKSPACE_BASELINE_ENTRIES, MAX_WORKSPACE_BASELINE_METADATA_BYTES,
-    MAX_WORKSPACE_BASELINE_PATH_BYTES, SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_INSTRUCTION,
-    SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_REASON, TOOL_ACCEPTED_EXIT_CODES_FIELD,
-    TOOL_ASSERTION_NAME_FIELD, TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD,
-    TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD, TOOL_CALL_RECORDING_SESSION_ID_FIELD,
-    TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD, TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE,
-    TOOL_RESULT_EXPECTATION_FIELD,
+    MAX_WORKSPACE_BASELINE_PATH_BYTES, SESSION_INBOX_ACK_REQUIRED_ATTENTION_INSTRUCTION,
+    SESSION_INBOX_ACK_REQUIRED_ATTENTION_REASON, TOOL_ACCEPTED_EXIT_CODES_FIELD,
+    TOOL_ASSERTION_NAME_FIELD, TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD,
+    TOOL_CALL_RECORDING_SESSION_ID_FIELD, TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD,
+    TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE, TOOL_RESULT_EXPECTATION_FIELD,
 };
 pub use store::SessionStore;
 pub use util::redact_and_bound_instruction;
@@ -90,7 +90,9 @@ pub const TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT: &str =
 #[cfg(test)]
 pub use events::session_input_summary_for_tool;
 #[cfg(test)]
-pub use model::{MAX_VALIDATION_EXCERPT_CHARS, TOOL_CALL_EXPECTATION_METADATA_FIELDS};
+pub use model::MAX_VALIDATION_EXCERPT_CHARS;
+#[cfg(test)]
+pub use webcodex_core::workflow_session_contract::TOOL_CALL_EXPECTATION_METADATA_FIELDS;
 
 #[cfg(feature = "root-test-support")]
 pub mod root_test_support {
@@ -100,7 +102,8 @@ pub mod root_test_support {
     };
     pub use crate::model::{
         PersistedSessionLedger, MAX_OBSERVED_PATHS_PER_EVENT, MAX_VALIDATION_EXCERPT_CHARS,
-        MESSAGE_ID_PREFIX, SESSION_LEDGER_VERSION, TOOL_CALL_EXPECTATION_METADATA_FIELDS,
+        MESSAGE_ID_PREFIX, SESSION_LEDGER_VERSION,
     };
     pub use crate::persistence::write_ledger_atomic;
+    pub use webcodex_core::workflow_session_contract::TOOL_CALL_EXPECTATION_METADATA_FIELDS;
 }

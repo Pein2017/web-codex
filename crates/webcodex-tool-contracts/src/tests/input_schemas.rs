@@ -241,7 +241,7 @@ fn git_diff_hunks_page_budget_schema_defers_bounds_to_runtime_clamp() {
 }
 
 #[test]
-fn git_diff_hunks_committed_cached_false_matches_omission_but_true_conflicts() {
+fn git_diff_hunks_schema_leaves_committed_range_relationships_to_runtime() {
     let specs = registered_tool_specs();
     let schema = &spec_named(&specs, "git_diff_hunks").input_schema;
     let base = "a".repeat(40);
@@ -255,16 +255,18 @@ fn git_diff_hunks_committed_cached_false_matches_omission_but_true_conflicts() {
     ] {
         assert!(test_support::validate_schema_instance(&request, schema).is_ok());
     }
+    // committed-range pairing/cached conflicts are semantic runtime rules, not
+    // structural JSON Schema rules. Runtime tests cover both failure modes.
     assert!(test_support::validate_schema_instance(
         &json!({"project":"demo","base_commit":base,"head_commit":head,"cached":true}),
         schema,
     )
-    .is_err());
+    .is_ok());
     assert!(test_support::validate_schema_instance(
         &json!({"project":"demo","base_commit":base,"cached":false}),
         schema,
     )
-    .is_err());
+    .is_ok());
     assert!(test_support::validate_schema_instance(
         &json!({"project":"demo","base_commit":base,"head_commit":head,"unknown":false}),
         schema,
@@ -320,6 +322,10 @@ fn sync_validation_and_run_shell_timeout_schema_defers_upper_bounds_to_runtime()
         let desc = sync_wait["description"].as_str().unwrap_or("");
         assert!(desc.contains("same execution"), "{name}: {desc}");
         assert!(
+            desc.contains("Runtime early-handoff default"),
+            "{name}: {desc}"
+        );
+        assert!(
             desc.contains("never extends timeout_secs"),
             "{name}: {desc}"
         );
@@ -335,15 +341,10 @@ fn sync_validation_and_run_shell_timeout_schema_defers_upper_bounds_to_runtime()
     assert_eq!(sync_wait["minimum"], 1);
     assert!(sync_wait.get("maximum").is_none());
     assert!(sync_wait.get("default").is_none());
+    let sync_wait_desc = sync_wait["description"].as_str().unwrap_or("");
     assert!(
-        cargo_fmt.input_schema["allOf"][0]["then"]["properties"]["timeout_secs"]
-            .get("maximum")
-            .is_none()
-    );
-    assert!(
-        cargo_fmt.input_schema["allOf"][0]["else"]["properties"]["timeout_secs"]
-            .get("maximum")
-            .is_none()
+        sync_wait_desc.contains("Runtime early-handoff default"),
+        "cargo_fmt: {sync_wait_desc}"
     );
     for valid in [
         serde_json::json!({"project": "agent:demo:repo", "check": false, "sync_wait_secs": 1}),
@@ -368,6 +369,17 @@ fn sync_validation_and_run_shell_timeout_schema_defers_upper_bounds_to_runtime()
     assert_eq!(timeout["minimum"], 1);
     assert!(timeout.get("maximum").is_none());
     assert_eq!(timeout["default"], 60);
+    let timeout_desc = timeout["description"].as_str().unwrap_or_default();
+    assert!(timeout_desc.contains("shared structured-execution ceiling"));
+    assert!(!timeout_desc.contains("120 are accepted and clamped"));
+    let sync_wait = &run_shell.input_schema["properties"]["sync_wait_secs"];
+    assert_eq!(sync_wait["type"], "integer");
+    assert_eq!(sync_wait["minimum"], 1);
+    assert!(sync_wait.get("maximum").is_none());
+    assert!(sync_wait.get("default").is_none());
+    let sync_desc = sync_wait["description"].as_str().unwrap_or_default();
+    assert!(sync_desc.contains("same-execution durable Job handoff"));
+    assert!(sync_desc.contains("not when the command is killed"));
 
     let search = spec_named(&specs, "search_project_texts");
     assert!(
@@ -375,6 +387,22 @@ fn sync_validation_and_run_shell_timeout_schema_defers_upper_bounds_to_runtime()
             .get("maximum")
             .is_none()
     );
+}
+
+#[test]
+fn cargo_check_schema_exposes_bounded_multi_package_selection() {
+    let specs = registered_tool_specs();
+    let schema = &spec_named(&specs, "cargo_check").input_schema;
+    let packages = &schema["properties"]["packages"];
+
+    assert_eq!(packages["type"], "array");
+    assert_eq!(packages["minItems"], 1);
+    assert!(packages["maxItems"].as_u64().is_some());
+    assert_eq!(packages["items"]["minLength"], 1);
+    assert_eq!(packages["items"]["maxLength"], 500);
+    assert!(packages["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("package")));
 }
 
 #[test]
@@ -439,7 +467,7 @@ fn raw_shell_tools_expose_the_shared_authored_command_bound() {
         let command = &spec.input_schema["properties"]["command"];
         assert_eq!(command["maxLength"], RAW_SHELL_COMMAND_MAX_BYTES, "{name}");
         let description = command["description"].as_str().unwrap_or_default();
-        assert!(description.contains("16000") || description.contains("16,000"));
+        assert!(description.contains("65536") || description.contains("65,536"));
     }
 }
 
@@ -520,12 +548,20 @@ fn run_script_schema_is_typed_bounded_and_hides_execution_infrastructure() {
     );
     assert_eq!(
         properties["language"]["enum"],
-        json!(["sh", "bash", "powershell", "javascript", "typescript"])
+        json!([
+            "sh",
+            "bash",
+            "powershell",
+            "python",
+            "javascript",
+            "typescript"
+        ])
     );
     let language_description = properties["language"]["description"]
         .as_str()
         .expect("run_script language description");
     for phrase in [
+        "temporary .py file",
         ".mjs ESM",
         ".mts ESM",
         "erasable type stripping",
@@ -553,6 +589,38 @@ fn run_script_schema_is_typed_bounded_and_hides_execution_infrastructure() {
     assert!(properties["timeout_secs"].get("maximum").is_none());
     assert_eq!(properties["timeout_secs"]["default"], 60);
     assert_eq!(spec.input_schema["additionalProperties"], false);
+}
+
+#[test]
+fn execution_timeout_schema_descriptions_keep_form_specific_lifetime_ceilings() {
+    let specs = registered_tool_specs();
+    for name in ["run_process", "run_script", "run_detached_process"] {
+        let timeout = &spec_named(&specs, name).input_schema["properties"]["timeout_secs"];
+        assert_eq!(timeout["minimum"], 1, "{name}");
+        assert_eq!(timeout["default"], 60, "{name}");
+        assert!(timeout.get("maximum").is_none(), "{name}");
+        let description = timeout["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name} timeout description"));
+        assert!(
+            description.contains("execution lifetime"),
+            "{name}: {description}"
+        );
+        assert!(description.contains("604800"), "{name}: {description}");
+        assert!(description.contains("7 days"), "{name}: {description}");
+    }
+
+    for name in ["run_shell", "run_skill_resource", "cargo_check"] {
+        let timeout = &spec_named(&specs, name).input_schema["properties"]["timeout_secs"];
+        let description = timeout["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name} timeout description"));
+        assert!(description.contains("3600"), "{name}: {description}");
+        assert!(
+            !description.contains("604800"),
+            "{name} must retain the one-hour ceiling: {description}"
+        );
+    }
 }
 
 #[test]
@@ -607,15 +675,30 @@ fn cargo_fmt_conditional_timeout_schema_matches_contract() {
         &json!({"project": "demo", "check": false, "timeout_secs": 121})
     ));
     assert!(validates(&json!({"project": "demo", "timeout_secs": 121})));
-    assert!(validates(
-        &json!({"project": "demo", "check": true, "result_expectation": "failure"})
-    ));
-    assert!(!validates(
-        &json!({"project": "demo", "check": false, "result_expectation": "failure"})
-    ));
-    assert!(!validates(
-        &json!({"project": "demo", "result_expectation": "observe"})
-    ));
+    for structurally_valid in [
+        json!({"project": "demo", "check": true, "result_expectation": "failure"}),
+        json!({"project": "demo", "check": false, "result_expectation": "failure"}),
+        json!({"project": "demo", "result_expectation": "observe"}),
+    ] {
+        assert!(validates(&structurally_valid));
+    }
+    // The recorder wrapper validator owns the action-dependent rule instead of
+    // encoding it as allOf/if/then in the Host schema.
+    assert!(ToolCall::from_tool_name(
+        "cargo_fmt",
+        json!({"project": "demo", "check": true, "result_expectation": "failure"}),
+    )
+    .is_ok());
+    assert!(ToolCall::from_tool_name(
+        "cargo_fmt",
+        json!({"project": "demo", "check": false, "result_expectation": "failure"}),
+    )
+    .is_err());
+    assert!(ToolCall::from_tool_name(
+        "cargo_fmt",
+        json!({"project": "demo", "result_expectation": "observe"}),
+    )
+    .is_err());
 }
 
 #[test]
@@ -770,6 +853,7 @@ fn bootstrap_agent_conversation_activation_key_is_inbox_only_contract() {
         "OMIT this field",
         "agent_task_attempt",
         "attention_event",
+        "agent_wait_events",
         "Endpoint carrier",
     ] {
         assert!(
@@ -784,6 +868,7 @@ fn bootstrap_agent_conversation_activation_key_is_inbox_only_contract() {
         "Inbox-style Wake",
         "agent_task_attempt",
         "attention_event",
+        "agent_wait_events",
         "omit it",
         "Endpoint carrier",
     ] {
@@ -824,7 +909,6 @@ fn heartbeat_agent_task_attempt_active_turn_proof_is_paired_and_server_timed() {
         heartbeat.input_schema["properties"]["active_turn_consume_token"]["pattern"],
         "^wc_wake_consume_[A-Za-z0-9_-]{21}[AQgw]$"
     );
-    assert_eq!(heartbeat.input_schema["allOf"].as_array().unwrap().len(), 2);
     let properties = heartbeat.input_schema["properties"].as_object().unwrap();
     for forbidden in [
         "lease_ms",
@@ -851,12 +935,12 @@ fn heartbeat_agent_task_attempt_active_turn_proof_is_paired_and_server_timed() {
 
     let mut wake_only = base.clone();
     wake_only["active_turn_wake_id"] = json!("wc_wake_VVVVVVVVVVVVVVVV".to_string());
-    assert!(test_support::validate_schema_instance(&wake_only, &heartbeat.input_schema).is_err());
+    assert!(test_support::validate_schema_instance(&wake_only, &heartbeat.input_schema).is_ok());
 
     let mut token_only = base.clone();
     token_only["active_turn_consume_token"] =
         json!("wc_wake_consume_ZmZmZmZmZmZmZmZmZmZmZg".to_string());
-    assert!(test_support::validate_schema_instance(&token_only, &heartbeat.input_schema).is_err());
+    assert!(test_support::validate_schema_instance(&token_only, &heartbeat.input_schema).is_ok());
 
     let mut paired = base.clone();
     paired["active_turn_wake_id"] = json!("wc_wake_VVVVVVVVVVVVVVVV".to_string());
@@ -869,6 +953,124 @@ fn heartbeat_agent_task_attempt_active_turn_proof_is_paired_and_server_timed() {
         invalid[forbidden] = json!(30 * 60_000);
         assert!(test_support::validate_schema_instance(&invalid, &heartbeat.input_schema).is_err());
     }
+}
+
+#[cfg(feature = "experimental-code-mode")]
+#[test]
+fn code_mode_exec_schema_keeps_authority_outer_bound_and_source_bounded() {
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "code_mode_exec");
+    let properties = spec.input_schema["properties"].as_object().unwrap();
+    assert_schema_fields!(
+        properties,
+        "code_mode_exec input schema",
+        present: ["project", "session_id", "source", "timeout_ms"],
+        absent: [
+            "recording_session_id",
+            "ack_session_context_revision",
+            "ack_session_message_ids",
+            "context_request",
+            "session_message_resolution",
+        ]
+    );
+    assert_eq!(
+        spec.input_schema["required"],
+        json!(["project", "session_id", "source"])
+    );
+    assert_eq!(properties["source"]["maxLength"], 65_536);
+    let valid = json!({
+        "project": "agent:special:demo",
+        "session_id": format!("wc_sess_{}", "1".repeat(32)),
+        "source": "text({hello: 'world'});",
+        "timeout_ms": 5_000,
+    });
+    assert!(test_support::validate_schema_instance(&valid, &spec.input_schema).is_ok());
+    let mut override_attempt = valid.clone();
+    override_attempt["recording_session_id"] = json!(format!("wc_sess_{}", "2".repeat(32)));
+    assert!(test_support::validate_schema_instance(&override_attempt, &spec.input_schema).is_err());
+}
+
+#[cfg(feature = "experimental-code-mode")]
+#[test]
+fn code_mode_effectful_schema_keeps_authority_outer_bound_and_deadline_explicit() {
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "code_mode_exec_effectful");
+    let properties = spec.input_schema["properties"].as_object().unwrap();
+    assert_schema_fields!(
+        properties,
+        "code_mode_exec_effectful input schema",
+        present: ["project", "session_id", "source", "timeout_ms"],
+        absent: [
+            "recording_session_id",
+            "ack_session_context_revision",
+            "ack_session_message_ids",
+            "context_request",
+            "session_message_resolution",
+        ]
+    );
+    assert_eq!(
+        spec.input_schema["required"],
+        json!(["project", "session_id", "source"])
+    );
+    assert_eq!(properties["source"]["maxLength"], 65_536);
+    assert!(properties["timeout_ms"]["description"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("decision deadline"));
+}
+
+#[cfg(feature = "experimental-code-mode")]
+#[test]
+fn code_mode_mutating_schema_keeps_authority_outer_bound_and_mutation_scope_narrow() {
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "code_mode_exec_mutating");
+    let properties = spec.input_schema["properties"].as_object().unwrap();
+    assert_schema_fields!(
+        properties,
+        "code_mode_exec_mutating input schema",
+        present: ["project", "session_id", "source", "timeout_ms"],
+        absent: [
+            "recording_session_id",
+            "ack_session_context_revision",
+            "ack_session_message_ids",
+            "context_request",
+            "session_message_resolution",
+            "state_changed",
+        ]
+    );
+    assert_eq!(
+        spec.input_schema["required"],
+        json!(["project", "session_id", "source"])
+    );
+    assert_eq!(properties["source"]["maxLength"], 65_536);
+    let source_description = properties["source"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(source_description.contains("at most one canonical apply_text_edits attempt"));
+    assert!(
+        source_description.contains("cargo_check/cargo_test only after a successful known edit")
+    );
+    assert!(source_description.contains("source_state"));
+    assert!(source_description.contains("never wait inside JS"));
+}
+
+#[test]
+fn coding_agent_start_keeps_recorder_provenance_out_of_business_input() {
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "coding_agent_start");
+    let properties = spec.input_schema["properties"].as_object().unwrap();
+    assert!(!properties.contains_key("recording_session_id"));
+    assert!(ToolCall::from_tool_name(
+        "coding_agent_start",
+        json!({
+            "project": "demo",
+            "provider_id": "codex",
+            "idempotency_key": "start-1",
+            "instruction": "inspect",
+            "recording_session_id": "wc_sess_0123456789abcdef0123456789abcdef"
+        }),
+    )
+    .is_err());
 }
 
 #[test]
@@ -904,4 +1106,194 @@ fn agent_continuation_bind_requires_canonical_view_fence_without_model_exposure(
     assert!(!registered_tool_specs()
         .iter()
         .any(|spec| spec.name == bind.name));
+}
+
+#[test]
+fn job_terminal_continuation_app_contract_is_exact_wait_plus_private_view_fence_only() {
+    let specs = crate::registry::job_terminal_continuation_app_tool_specs();
+    assert_eq!(specs.len(), 5);
+    let names = specs
+        .iter()
+        .map(|spec| spec.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "job_terminal_continuation_bind",
+            "job_terminal_continuation_state",
+            "job_terminal_continuation_prepare",
+            "job_terminal_continuation_finish",
+            "job_terminal_continuation_unbind",
+        ]
+    );
+    let binding_id = format!(
+        "wc_host_binding_{}",
+        webcodex_core::compact::encode([0xa1; 16])
+    );
+    let wait_id = format!("wc_job_wait_{}", webcodex_core::compact::encode([0xa2; 12]));
+    let attempt_id = format!(
+        "wc_job_delivery_{}",
+        webcodex_core::compact::encode([0xa3; 12])
+    );
+    for spec in &specs {
+        let properties = spec.input_schema["properties"].as_object().unwrap();
+        assert_eq!(
+            properties["wait_id"]["pattern"], "^wc_job_wait_[A-Za-z0-9_-]{16}$",
+            "{}",
+            spec.name
+        );
+        assert_eq!(
+            properties["binding_id"]["pattern"], "^wc_host_binding_[A-Za-z0-9_-]{21}[AQgw]$",
+            "{}",
+            spec.name
+        );
+        for forbidden in [
+            "client_window",
+            "openai_session",
+            "peer_id",
+            "principal_digest",
+            "session_id",
+            "job_id",
+            "project",
+        ] {
+            assert!(
+                !properties.contains_key(forbidden),
+                "{} unexpectedly accepts {forbidden}",
+                spec.name
+            );
+        }
+        assert!(!registered_tool_specs()
+            .iter()
+            .any(|registered| registered.name == spec.name));
+    }
+
+    let bind = specs
+        .iter()
+        .find(|spec| spec.name == "job_terminal_continuation_bind")
+        .unwrap();
+    assert!(test_support::validate_schema_instance(
+        &json!({"wait_id": wait_id, "binding_id": binding_id}),
+        &bind.input_schema,
+    )
+    .is_ok());
+    let finish = specs
+        .iter()
+        .find(|spec| spec.name == "job_terminal_continuation_finish")
+        .unwrap();
+    assert_eq!(
+        finish.input_schema["properties"]["attempt_id"]["pattern"],
+        "^wc_job_delivery_[A-Za-z0-9_-]{16}$"
+    );
+    assert!(test_support::validate_schema_instance(
+        &json!({
+            "wait_id": format!("wc_job_wait_{}", webcodex_core::compact::encode([0xa2; 12])),
+            "binding_id": format!("wc_host_binding_{}", webcodex_core::compact::encode([0xa1; 16])),
+            "attempt_id": attempt_id,
+            "outcome": "dispatch_accepted"
+        }),
+        &finish.input_schema,
+    )
+    .is_ok());
+
+    let registered = registered_tool_specs();
+    let present = spec_named(&registered, "present_job_terminal_continuation");
+    assert_eq!(present.input_schema["required"], json!(["wait_id"]));
+    assert_eq!(
+        present.input_schema["properties"]["wait_id"]["pattern"],
+        "^wc_job_wait_[A-Za-z0-9_-]{16}$"
+    );
+}
+
+#[test]
+fn skill_runtime_and_management_schemas_preserve_typed_bounds() {
+    let run = input_schema_for_tool("run_skill_resource");
+    assert_eq!(run["properties"]["path"]["pattern"], "^scripts/.+$");
+    let args_description = run["properties"]["args"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(args_description.contains("package/script execution identity"));
+    assert!(args_description.contains("requested Project cwd"));
+    assert!(!args_description.contains("stdin-reading"));
+    let cwd_description = run["properties"]["cwd"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(cwd_description.contains("business cwd"));
+    assert!(!cwd_description.contains("run_process"));
+
+    let list = input_schema_for_tool("skill_list");
+    assert_eq!(list["properties"]["project"]["minLength"], 1);
+    assert_eq!(list["properties"]["query"]["maxLength"], 200);
+    assert_eq!(list["properties"]["limit"]["maximum"], 64);
+    assert_eq!(
+        list["properties"]["expected_catalog_revision"]["pattern"],
+        "^wc_skillcat_[A-Za-z0-9_-]{43}$"
+    );
+
+    let read = input_schema_for_tool("skill_read_file");
+    assert_eq!(read["properties"]["project"]["minLength"], 1);
+    assert_eq!(
+        read["properties"]["skill_id"]["pattern"],
+        "^wc_skill_[A-Za-z0-9_-]{21}[AQgw]$"
+    );
+    assert_eq!(read["properties"]["path"]["maxLength"], 512);
+    assert_eq!(read["properties"]["start_line"]["minimum"], 1);
+    assert_eq!(read["properties"]["limit"]["maximum"], 400);
+    assert_eq!(
+        read["properties"]["expected_definition_revision"]["pattern"],
+        "^[0-9a-f]{64}$"
+    );
+
+    let versions = input_schema_for_tool("skill_versions");
+    assert_eq!(versions["properties"]["skill_key"]["maxLength"], 96);
+    assert_eq!(
+        versions["properties"]["skill_key"]["pattern"],
+        "^[A-Za-z0-9._-]+$"
+    );
+    assert_eq!(versions["properties"]["limit"]["maximum"], 64);
+
+    let install = input_schema_for_tool("skill_install");
+    assert_eq!(install["properties"]["artifact_path"]["maxLength"], 1024);
+    assert_eq!(
+        install["properties"]["expected_artifact_sha256"]["pattern"],
+        "^[0-9a-f]{64}$"
+    );
+    assert_eq!(install["properties"]["idempotency_key"]["maxLength"], 128);
+    assert_eq!(install["properties"]["activate"]["default"], false);
+
+    for name in ["skill_activate", "skill_remove_revision"] {
+        let schema = input_schema_for_tool(name);
+        assert_eq!(schema["properties"]["skill_key"]["maxLength"], 96, "{name}");
+        assert_eq!(
+            schema["properties"]["package_revision"]["pattern"], "^wc_skillpkg_[A-Za-z0-9_-]{43}$",
+            "{name}"
+        );
+        assert_eq!(
+            schema["properties"]["expected_state_revision"]["pattern"],
+            "^wc_skillstate_[A-Za-z0-9_-]{43}$",
+            "{name}"
+        );
+        assert_eq!(
+            schema["properties"]["idempotency_key"]["maxLength"], 128,
+            "{name}"
+        );
+    }
+}
+#[test]
+fn process_alias_and_python_are_host_visible_without_opening_objects() {
+    for name in ["run_process", "run_detached_process"] {
+        let schema = input_schema_for_tool(name);
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["argv"]["type"], "array");
+        assert_eq!(
+            schema["properties"]["argv"]["maxItems"],
+            schema["properties"]["args"]["maxItems"]
+        );
+        assert!(schema["properties"].get("arguments").is_none());
+    }
+    let schema = input_schema_for_tool("run_script");
+    let language = schema["properties"]["language"].to_string();
+    assert!(language.contains("python"));
+    assert!(!language.contains("python3"));
+    let shell = input_schema_for_tool("run_shell");
+    assert_eq!(shell["properties"]["login"]["type"], "boolean");
 }

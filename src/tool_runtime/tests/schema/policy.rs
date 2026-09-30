@@ -12,6 +12,11 @@ fn required_runner_capability_matches_metadata_risk_table() {
             RunnerCapabilityRequirement::StructuredProcess,
         ),
         (
+            "run_skill_resource",
+            ToolRisk::JobRun,
+            RunnerCapabilityRequirement::SkillResourceExecution,
+        ),
+        (
             "run_detached_process",
             ToolRisk::JobRun,
             RunnerCapabilityRequirement::DetachedProcess,
@@ -182,6 +187,11 @@ fn required_runner_capability_matches_metadata_risk_table() {
             RunnerCapabilityRequirement::FileRead,
         ),
         (
+            "skill_load",
+            ToolRisk::Read,
+            RunnerCapabilityRequirement::FileRead,
+        ),
+        (
             "lsp_status",
             ToolRisk::Read,
             RunnerCapabilityRequirement::LspReadOnlyNavigation,
@@ -243,6 +253,11 @@ fn required_runner_capability_matches_metadata_risk_table() {
         ),
         (
             "search_project_texts",
+            ToolRisk::Read,
+            RunnerCapabilityRequirement::Shell,
+        ),
+        (
+            "search_and_read",
             ToolRisk::Read,
             RunnerCapabilityRequirement::Shell,
         ),

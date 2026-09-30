@@ -3,7 +3,7 @@ use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
 use crate::model_surface::{
-    adaptive_runtime_gateway_target_route, AdaptiveRuntimeGatewayTargetRoute,
+    gpt_action_gateway_target_route, AdaptiveRuntimeGatewayTargetRoute,
     ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME,
 };
 use webcodex_tool_contracts::{
@@ -25,12 +25,8 @@ pub(crate) fn public_url() -> String {
 }
 
 #[handler]
-pub async fn openapi_json(depot: &mut Depot, res: &mut Response) {
-    let spec = match crate::connector_runtime::http::runtime(depot) {
-        Some(_) => crate::connector_runtime::surface::build_openapi_spec(public_url()),
-        None => build_openapi_spec(),
-    };
-    res.render(Json(spec));
+pub async fn openapi_json(res: &mut Response) {
+    res.render(Json(build_openapi_spec()));
 }
 
 pub(crate) fn build_openapi_spec() -> Value {
@@ -107,7 +103,7 @@ fn gateway_operation() -> Value {
     let mut targets = model_visible_tool_definitions()
         .filter(|definition| definition.supports_gpt_actions())
         .filter(|definition| {
-            adaptive_runtime_gateway_target_route(definition.name)
+            gpt_action_gateway_target_route(definition.name)
                 == AdaptiveRuntimeGatewayTargetRoute::Gateway
         })
         .map(|definition| definition.name)
@@ -223,13 +219,35 @@ fn action_request_schema(tool_name: &str, mut schema: Value) -> Value {
     if tool_name == "import_conversation_files_to_project" {
         project_gpt_action_file_params(&mut schema);
     }
+    if tool_name == "project_artifact" {
+        project_gpt_action_artifact_read_modes(&mut schema);
+    }
     project_schema_descriptions(schema)
 }
 
 /// GPT Actions and MCP receive host-file references in different host-owned
-/// wire shapes. This is the only business-schema shape overlay in the generic
-/// Action projection; the HTTP adapter rewrites it into the private canonical
-/// ToolCall host-file shape and separately supplies trusted Action provenance.
+/// wire shapes, and GPT Actions cannot carry MCP-native image or ResourceLink
+/// delivery. These are presentation overlays only; canonical ToolRuntime input
+/// validation and authority remain unchanged.
+fn project_gpt_action_artifact_read_modes(schema: &mut Value) {
+    if let Some(actions) = schema
+        .pointer_mut("/properties/action/enum")
+        .and_then(Value::as_array_mut)
+    {
+        actions.retain(|value| matches!(value.as_str(), Some("metadata" | "inspect")));
+    }
+    if let Some(variants) = schema.get_mut("oneOf").and_then(Value::as_array_mut) {
+        variants.retain(|variant| {
+            matches!(
+                variant
+                    .pointer("/properties/action/const")
+                    .and_then(Value::as_str),
+                Some("metadata" | "inspect")
+            )
+        });
+    }
+}
+
 fn project_gpt_action_file_params(schema: &mut Value) {
     let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) else {
         return;
@@ -361,12 +379,16 @@ mod tests {
     }
 
     #[test]
-    fn gpt_action_direct_surface_inherits_adaptive_direct_without_duplicate_rank() {
+    fn gpt_action_direct_surface_follows_adaptive_direct_with_definition_owned_exceptions() {
         let adaptive = webcodex_tool_contracts::adaptive_runtime_direct_tool_definitions();
         let expected = adaptive
             .iter()
             .copied()
-            .filter(|definition| definition.supports_gpt_actions())
+            .filter(|definition| {
+                definition.supports_gpt_actions()
+                    && definition.gpt_action_exposure()
+                        != webcodex_tool_contracts::ToolGptActionExposure::GatewayOnly
+            })
             .map(|definition| definition.name)
             .collect::<Vec<_>>();
         let actual = gpt_action_direct_tool_definitions()
@@ -381,6 +403,43 @@ mod tests {
         assert!(ranks.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(actual.contains(&"apply_text_edits"));
         assert!(!actual.contains(&"apply_patch"));
+        #[cfg(feature = "experimental-code-mode")]
+        for name in [
+            "code_mode_exec",
+            "code_mode_exec_effectful",
+            "code_mode_exec_mutating",
+        ] {
+            assert!(webcodex_tool_contracts::gpt_action_tool_supported(name));
+            assert!(!actual.contains(&name));
+        }
+    }
+
+    #[test]
+    fn stop_job_is_direct_runtime_but_gateway_only_action_without_operation_growth() {
+        let definition = webcodex_tool_contracts::lookup_tool_definition("stop_job").unwrap();
+        assert!(definition.adaptive_runtime_direct_rank().is_some());
+        assert_eq!(
+            definition.gpt_action_exposure(),
+            webcodex_tool_contracts::ToolGptActionExposure::GatewayOnly
+        );
+        assert!(webcodex_tool_contracts::gpt_action_tool_supported(
+            "stop_job"
+        ));
+        let gateway = gateway_operation();
+        let targets = gateway["requestBody"]["content"]["application/json"]["schema"]["properties"]
+            ["tool"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(
+            targets.contains(&json!("stop_job")),
+            "GatewayOnly tools must be parser-ready gateway targets"
+        );
+        let ids = operation_ids(&build_openapi_spec());
+        assert!(!ids.contains("stop_job"));
+        assert!(!ids.contains("cancel_job"));
+        assert!(ids.contains(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME));
+        assert!(ids.len() < GPT_ACTION_OPERATION_LIMIT);
+        assert_eq!(ids.len(), gpt_action_direct_tool_definitions().len() + 1);
     }
 
     #[test]
@@ -400,18 +459,7 @@ mod tests {
         assert!(ids.contains(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME));
         assert!(ids.len() < GPT_ACTION_OPERATION_LIMIT);
         assert!(ids.iter().all(|name| !name.chars().any(char::is_uppercase)));
-        for legacy in [
-            "listRuntimeTools",
-            "listProjects",
-            "getRuntimeStatus",
-            "getProjectGitStatus",
-            "listProjectFiles",
-            "applyUnifiedDiff",
-            "runProjectShellCommand",
-            "startProjectShellJob",
-            "getRuntimeJobTail",
-            "callRuntimeTool",
-        ] {
+        for legacy in ["listRuntimeTools", "getRuntimeStatus", "callRuntimeTool"] {
             assert!(!ids.contains(legacy));
         }
         for path in spec["paths"].as_object().unwrap().keys() {
@@ -429,7 +477,6 @@ mod tests {
             "present_goal_plan",
             "present_agent_continuation",
             "rotate_agent_continuation_endpoint",
-            "export_project_artifact",
             "present_work_result",
         ] {
             assert!(!webcodex_tool_contracts::gpt_action_tool_supported(tool));
@@ -445,7 +492,10 @@ mod tests {
             .map(|spec| (spec.name.clone(), spec))
             .collect::<BTreeMap<_, _>>();
         for definition in gpt_action_direct_tool_definitions() {
-            if definition.name == "import_conversation_files_to_project" {
+            if matches!(
+                definition.name,
+                "import_conversation_files_to_project" | "project_artifact"
+            ) {
                 continue;
             }
             let mut canonical = specs[definition.name].input_schema.clone();
@@ -457,6 +507,21 @@ mod tests {
             strip_descriptions(&mut action);
             assert_eq!(action, canonical, "{}", definition.name);
         }
+    }
+
+    #[test]
+    fn project_artifact_gpt_action_schema_excludes_mcp_only_delivery_modes() {
+        let generated = build_openapi_spec();
+        let schema = &generated["paths"][format!("{GPT_ACTION_PATH_PREFIX}project_artifact")]
+            ["post"]["requestBody"]["content"]["application/json"]["schema"];
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            json!(["metadata", "inspect"])
+        );
+        assert!(schema.get("allOf").is_none());
+        let serialized = serde_json::to_string(schema).unwrap();
+        assert!(!serialized.contains("\"image\""));
+        assert!(!serialized.contains("\"export\""));
     }
 
     #[test]

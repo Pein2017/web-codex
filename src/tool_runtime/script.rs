@@ -57,7 +57,7 @@ impl ToolRuntime {
         auth: Option<&AuthContext>,
     ) -> ToolResult {
         let budget =
-            match StructuredExecutionBudget::resolve_with_sync_wait(timeout_secs, sync_wait_secs) {
+            match StructuredExecutionBudget::resolve_script_with_sync_wait(timeout_secs, sync_wait_secs) {
             Ok(budget) => budget,
             Err(error) => {
                 return process_tool_failure_result(
@@ -114,11 +114,8 @@ impl ToolRuntime {
             }
             identity
         });
-        let resolved = match self
-            .resolve_project_input_for_auth(&project, auth)
-            .await
-        {
-            Ok(resolved) => resolved,
+        let resolved = match self.resolve_project_input_for_auth(&project, auth).await {
+            Ok(project) => project,
             Err(error) => {
                 return process_tool_failure_result(
                     command_rejected_message(
@@ -130,7 +127,7 @@ impl ToolRuntime {
                 )
             }
         };
-        let project_id = resolved.resolved_id.clone();
+        let project = resolved.resolved_id;
         let proj = resolved.config;
         let client_id = proj.client_id.clone();
         let effective_cwd = match resolve_runner_cwd(&proj, cwd.as_deref()) {
@@ -156,6 +153,7 @@ impl ToolRuntime {
                 .runner_registry
                 .start_job_with_metadata_for_access(
                     ShellJobOpRequest {
+                        login: false,
                         op: "start".to_string(),
                         client_id: Some(client_id),
                         cwd: Some(effective_cwd),
@@ -170,7 +168,7 @@ impl ToolRuntime {
                     },
                     "tool_runtime".to_string(),
                     ShellJobStartMetadata {
-                        project_id: Some(project_id),
+                        project_id: Some(project.clone()),
                         session_id,
                         project_cwd: Some(resolved_cwd.clone()),
                         purpose: Some(declared_purpose.as_str().to_string()),
@@ -252,14 +250,13 @@ impl ToolRuntime {
                     let detected_summary =
                         crate::tool_runtime::jobs::detected_job_summary_with_activity(
                             Some(&summary),
-                            Some("run_script"),
                             Some(declared_purpose.as_str()),
                             &observation.job.status,
                             observation.job.exit_code.map(i64::from),
                             &observation.stdout_tail,
                             &observation.stderr_tail,
-                            observation.job.activity.as_ref(),
                             observation.stdout_truncated || observation.stderr_truncated,
+                            observation.job.activity.as_ref(),
                         );
                     let continuation = crate::tool_runtime::jobs::observe_job_continuation(
                         &observation.job.job_id,
@@ -293,9 +290,7 @@ impl ToolRuntime {
                         "continuation": continuation,
                     }))
                 }
-                Err(error) => outcome_unknown_result(format!(
-                    "the durable script Job could not be observed during handoff: {error}"
-                )),
+                Err(failure) => return failure.into_tool_result(&project, budget),
             };
             if result.output["promoted_to_job"] != json!(true) {
                 add_structured_continuation_facts(
@@ -337,6 +332,7 @@ impl ToolRuntime {
                         match language {
                             ShellScriptLanguage::Javascript => "confirm the Runner is connected and advertises structured_script_payload plus structured_script_javascript, then retry only if target state proves no script started.",
                             ShellScriptLanguage::Typescript => "confirm the Runner is connected and advertises structured_script_payload plus structured_script_typescript, then retry only if target state proves no script started.",
+                            ShellScriptLanguage::Python => "confirm the Runner is connected and advertises structured_script_payload plus structured_script_python, then retry only if target state proves no script started.",
                             _ => "confirm the Runner is connected and advertises structured_script_payload, then retry only if target state proves no script started.",
                         },
                     ),
@@ -459,7 +455,6 @@ impl ToolRuntime {
             },
             async_handoff_available,
         );
-        super::jobs::attach_pytest_terminal_metadata(&mut result.output);
         result
     }
 }

@@ -520,12 +520,13 @@ pub(crate) fn handle_project_operation(
             "path": path,
             "description": description,
             "project_record_path": write_result.config_path.to_string_lossy(),
-            "projects_config_path": write_result.config_path.to_string_lossy(),
+
             "created_config": write_result.created_config,
             "overwritten": write_result.overwritten,
             "allow_patch": allow_patch,
             "registration_source": EXPLICIT_REGISTRATION_SOURCE,
             "revision": project_revision(&parse_runner_project_toml(&toml_content).expect("generated project TOML must parse")),
+            "root_fingerprint": project_root_fingerprint(&canonical),
             "operation": "register", "outcome": "registered", "changed": true, "recovered": false,
         });
         return ok_cmd(start, result);
@@ -722,7 +723,7 @@ pub(crate) fn handle_project_operation(
         "path": path,
         "description": description,
         "project_record_path": write_result.config_path.to_string_lossy(),
-        "projects_config_path": write_result.config_path.to_string_lossy(),
+
         "created_directory": created_directory,
         "created_config": write_result.created_config,
         "overwritten": write_result.overwritten,
@@ -730,6 +731,7 @@ pub(crate) fn handle_project_operation(
         "registration_source": EXPLICIT_REGISTRATION_SOURCE,
         "template": template,
         "revision": project_revision(&parse_runner_project_toml(&toml_content).expect("generated project TOML must parse")),
+        "root_fingerprint": path_buf.canonicalize().ok().filter(|path| path.is_dir()).as_deref().map(project_root_fingerprint),
         "git_initialized": git_initialized,
         "operation": "create", "outcome": "created", "changed": true, "recovered": false,
     });

@@ -10,9 +10,6 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use webcodex_core::audit_preview::command_preview;
-use webcodex_core::pytest_test_count::{
-    is_supported_pytest_command_summary, parse_pytest_terminal_test_counts,
-};
 use webcodex_core::validation_evidence::{
     ValidationDiagnostics, PARSER_KIND, PARSER_LIMITATIONS, PARSER_VERSION,
     VALIDATION_OUTPUT_METADATA_ABSENT_REASON,
@@ -47,6 +44,7 @@ pub struct ValidationEvent {
     /// Semantic validator/correctness result, independent from request-scoped
     /// evidence assertions such as cargo_test min_tests/require_tests.
     pub validation_passed: bool,
+    pub source_state: webcodex_core::validation_source::ValidationSourceState,
     /// Canonical closeout class derived from immutable execution/evidence facts.
     pub failure_class: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -266,10 +264,9 @@ fn current_validation_evidence_for_events(
         };
     }
 
-    // Attempt and mutation boundaries are durable ledger-order fences. A
-    // validation can prove the current workspace only when its exact execution
-    // start is after the effective fence; completing after the fence is not
-    // sufficient because the execution may have overlapped a content change.
+    // Ledger ordering selects candidates in this attempt, NOT current source
+    // proof. A source fence can reject a candidate, but v1 cannot rule out
+    // external/other-Control writes even when no canonical mutation crossed it.
     let canonical_finished_ids = canonical_tool_call_finished_events(&summary.events)
         .into_iter()
         .map(|event| event.event_id.as_str())
@@ -305,14 +302,18 @@ fn current_validation_evidence_for_events(
         let started_after_boundary = start_index.is_some_and(|index| {
             started_in_attempt && effective_boundary_index.is_none_or(|boundary| index > boundary)
         });
-        if started_after_boundary {
+        let source_stale = record.event.source_state.freshness
+            == webcodex_core::validation_source::ValidationFreshness::Stale;
+        if started_after_boundary && !source_stale {
             current_source_event_ids.insert(record.source_event_id.clone());
             if validation_event_is_failure(&record.event) {
                 current_failure_ids.insert(record.source_event_id.clone());
             }
-        } else if reset_index.is_some_and(|boundary| {
-            start_index.is_some_and(|index| index >= attempt.attempt_start && index <= boundary)
-        }) {
+        } else if (started_in_attempt && source_stale)
+            || reset_index.is_some_and(|boundary| {
+                start_index.is_some_and(|index| index >= attempt.attempt_start && index <= boundary)
+            })
+        {
             stale_validation_count += 1;
             if validation_event_is_failure(&record.event) {
                 stale_failure_count += 1;
@@ -331,7 +332,7 @@ fn current_validation_evidence_for_events(
         })
         .cloned()
         .collect::<Vec<_>>();
-    let current_validation = validation_summary_from_events(&current_events, limit);
+    let mut current_validation = validation_summary_from_events(&current_events, limit);
     let current_events_total = current_validation
         .get("events_total")
         .and_then(Value::as_u64)
@@ -367,7 +368,7 @@ fn current_validation_evidence_for_events(
     let (status, reason) = if current_events_total > 0 && unresolved_failure_count > 0 {
         ("failed", Some("current_validation_failures"))
     } else if current_events_total > 0 && successes > 0 {
-        ("passed", None)
+        ("unproven", Some("validation_source_unproven"))
     } else if current_events_total > 0 && expected_results > 0 {
         (
             "expected",
@@ -381,13 +382,36 @@ fn current_validation_evidence_for_events(
                 .and_then(Value::as_str)
                 .or(Some("validation_evidence_inconclusive")),
         )
-    } else if reset_index.is_some() && stale_validation_count > 0 {
-        ("stale", Some("validation_stale_after_changes"))
+    } else if stale_validation_count > 0 {
+        (
+            "stale",
+            Some(if reset_index.is_some() {
+                "validation_stale_after_changes"
+            } else {
+                "validation_source_fence_crossed"
+            }),
+        )
     } else if current_events_total == 0 {
         ("not_run", Some("no_validation_in_current_attempt"))
     } else {
         ("unknown", Some("current_validation_evidence_unknown"))
     };
+    let reason = reason.map(str::to_string);
+    // Historical execution successes remain in the ledger. They must not leak
+    // back into a current-workspace proof through the closeout projection.
+    if successes > 0 {
+        current_validation["successes"] = json!(0);
+        if status == "unproven" {
+            current_validation["status"] = json!("inconclusive");
+            current_validation["reason"] = json!("validation_source_unproven");
+        }
+        if current_validation["latest_status"] == "passed" {
+            current_validation["latest_status"] = json!("inconclusive");
+        }
+        if let Some(object) = current_validation.as_object_mut() {
+            object.remove("latest_success");
+        }
+    }
     let latest_status = current_validation
         .get("latest_status")
         .and_then(Value::as_str)
@@ -417,7 +441,7 @@ fn current_validation_evidence_for_events(
             "reason": reason,
             "latest_status": latest_status,
             "events_total": current_events_total,
-            "successes": successes,
+            "successes": 0,
             "failures": failures,
             "resolved_failure_count": resolved_failure_count,
             "expected_results": expected_results,
@@ -451,7 +475,9 @@ fn authoritative_validation_start_event_index(
                 .find(|(_, event)| {
                     event.kind == "tool_call_finished"
                         && event.job_id.as_deref() == Some(job_id)
-                        && event_is_job_acceptance_only(event)
+                        && same_job_execution(event, source)
+                        && (event_is_job_acceptance_only(event)
+                            || event_is_unknown_job_handoff(event))
                 })?;
             exact_tool_start_event_index(ledger_events, acceptance_index, acceptance)
         }
@@ -760,21 +786,6 @@ fn validation_event_is_proven_success(event: &ValidationEvent) -> bool {
     if generic_cargo_test_has_reliable_zero_test_evidence(event) {
         return false;
     }
-    // A known pytest command without one supported, complete terminal
-    // summary has an actual successful process result but not a proven test
-    // assertion. Do not turn missing/truncated output into imaginary tests.
-    if event.tool_name == "run_process"
-        && event.validation_kind == "test"
-        && event
-            .command_summary
-            .as_deref()
-            .is_some_and(is_supported_pytest_command_summary)
-        && (event.tests_detected != Some(true)
-            || !event.tests_run_count.is_some_and(|count| count > 0)
-            || event.zero_tests_run != Some(false))
-    {
-        return false;
-    }
     if !structured_test_requires_execution_proof(event) {
         return true;
     }
@@ -864,7 +875,7 @@ pub fn extract_validation_events(events: &[SessionEvent]) -> Vec<ValidationEvent
 
 fn extract_validation_event_records(events: &[SessionEvent]) -> Vec<ExtractedValidationEvent> {
     let mut started = Vec::new();
-    let mut validation_events = Vec::new();
+    let mut validation_events: Vec<ExtractedValidationEvent> = Vec::new();
     let mut terminal_jobs = HashSet::new();
     let canonical_finished_ids = canonical_tool_call_finished_events(events)
         .into_iter()
@@ -905,6 +916,30 @@ fn extract_validation_event_records(events: &[SessionEvent]) -> Vec<ExtractedVal
                     continue;
                 }
                 if let Some(validation_event) = validation_event_from_finished(event, Some(event)) {
+                    // Reconcile a failed handoff snapshot only with a terminal
+                    // observation of that exact Job execution. A successful new
+                    // Job with the same validation target is not proof about an
+                    // earlier unknown execution. The ledger itself stays intact;
+                    // only its bounded evidence projection replaces the snapshot.
+                    if !validation_event_is_outcome_unknown(&validation_event)
+                        && (validation_event.exit_code.is_some()
+                            || matches!(
+                                validation_event.execution_state.as_str(),
+                                "timed_out" | "cancelled"
+                            ))
+                    {
+                        validation_events.retain(|record| {
+                            !(validation_event_is_outcome_unknown(&record.event)
+                                && record.event.identity == validation_event.identity
+                                && events
+                                    .iter()
+                                    .find(|source| source.event_id == record.source_event_id)
+                                    .is_some_and(|source| {
+                                        event_is_unknown_job_handoff(source)
+                                            && same_job_execution(source, event)
+                                    }))
+                        });
+                    }
                     validation_events.push(ExtractedValidationEvent {
                         source_event_id: event.event_id.clone(),
                         event: validation_event,
@@ -916,6 +951,38 @@ fn extract_validation_event_records(events: &[SessionEvent]) -> Vec<ExtractedVal
     }
 
     validation_events
+}
+
+fn event_is_unknown_job_handoff(event: &SessionEvent) -> bool {
+    event.kind == "tool_call_finished"
+        && event.job_id.as_deref().is_some_and(|id| !id.is_empty())
+        && event.exit_code.is_none()
+        && event
+            .validation_output_summary
+            .as_ref()
+            .and_then(|summary| summary.get("execution_state"))
+            .and_then(Value::as_str)
+            == Some("outcome_unknown")
+}
+
+fn same_job_execution(source: &SessionEvent, terminal: &SessionEvent) -> bool {
+    source
+        .job_id
+        .as_deref()
+        .is_some_and(|id| !id.is_empty() && terminal.job_id.as_deref() == Some(id))
+        && source.session_id == terminal.session_id
+        && source.tool_name == terminal.tool_name
+        && source
+            .resolved_project
+            .as_deref()
+            .or(source.project.as_deref())
+            .is_some_and(|project| {
+                terminal
+                    .resolved_project
+                    .as_deref()
+                    .or(terminal.project.as_deref())
+                    == Some(project)
+            })
 }
 
 /// True for a finished tool event that merely accepted a Job (or promoted a
@@ -1075,14 +1142,7 @@ fn validation_event_from_finished(
         stderr_lines,
     ) = execution_output_evidence(finished);
     let (tests_detected, tests_run_count, tests_passed, tests_failed, zero_tests_run) =
-        validation_test_run_metadata(
-            finished,
-            adapter,
-            diagnostics.as_ref(),
-            &purpose,
-            &execution_state,
-            command_summary.as_deref(),
-        );
+        validation_test_run_metadata(finished, adapter, diagnostics.as_ref());
     let test_count_assertion = finished
         .validation_output_summary
         .as_ref()
@@ -1125,6 +1185,12 @@ fn validation_event_from_finished(
         success,
         validation_passed,
         failure_class: "none",
+        source_state: finished
+            .validation_output_summary
+            .as_ref()
+            .and_then(|summary| summary.get("source_state"))
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default(),
         expectation_satisfied,
         failure_kind,
         unresolved_failure: false,
@@ -1547,9 +1613,6 @@ fn validation_test_run_metadata(
     finished: &SessionEvent,
     adapter: Option<&dyn ValidationAdapter>,
     diagnostics: Option<&ValidationDiagnostics>,
-    purpose: &str,
-    execution_state: &str,
-    command_summary: Option<&str>,
 ) -> (
     Option<bool>,
     Option<u64>,
@@ -1569,6 +1632,10 @@ fn validation_test_run_metadata(
         .into_iter()
         .any(|field| value.get(field).is_some())
     });
+    if !adapter.is_some_and(ValidationAdapter::reports_test_run_metadata) && !explicit_test_metadata
+    {
+        return (None, None, None, None, None);
+    }
     let parsed_test_summary = diagnostics.and_then(|value| value.test_summary.as_ref());
     let truncated = summary
         .and_then(|value| value.get("stdout_truncated"))
@@ -1578,47 +1645,11 @@ fn validation_test_run_metadata(
             .and_then(|value| value.get("stderr_truncated"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-    // The ledger has already sanitized and bounded these excerpts. Admit
-    // pytest counts only for a completed, known-result direct pytest process;
-    // purpose=test alone cannot turn a model-authored line into execution proof.
-    let pytest = (finished.tool_name == "run_process"
-        && adapter.is_none()
-        && purpose == "test"
-        && execution_state == "completed"
-        && finished.exit_code.is_some()
-        && !truncated
-        && command_summary.is_some_and(is_supported_pytest_command_summary))
-    .then(|| {
-        let stdout = summary
-            .and_then(|value| value.get("stdout_tail_excerpt"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let stderr = summary
-            .and_then(|value| value.get("stderr_tail_excerpt"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        parse_pytest_terminal_test_counts(stdout, stderr)
-    })
-    .flatten();
-    if !adapter.is_some_and(ValidationAdapter::reports_test_run_metadata)
-        && !explicit_test_metadata
-        && pytest.is_none()
-    {
-        return (None, None, None, None, None);
-    }
     let parsed_passed = (!truncated)
-        .then(|| {
-            parsed_test_summary
-                .and_then(|value| value.passed)
-                .or(pytest.and_then(|value| value.tests_passed))
-        })
+        .then(|| parsed_test_summary.and_then(|value| value.passed))
         .flatten();
     let parsed_failed = (!truncated)
-        .then(|| {
-            parsed_test_summary
-                .and_then(|value| value.failed)
-                .or(pytest.and_then(|value| value.tests_failed))
-        })
+        .then(|| parsed_test_summary.and_then(|value| value.failed))
         .flatten();
     let parsed_ignored = (!truncated)
         .then(|| parsed_test_summary.and_then(|value| value.ignored))
@@ -1639,12 +1670,10 @@ fn validation_test_run_metadata(
         _ => None,
     };
     let parsed_tests_run = component_tests_run(parsed_passed, parsed_failed);
-    let tests_detected = pytest.map(|value| value.tests_detected).or_else(|| {
-        summary
-            .and_then(|value| value.get("tests_detected"))
-            .and_then(Value::as_bool)
-            .or_else(|| adapter.map(|_| parsed_test_summary.is_some()))
-    });
+    let tests_detected = summary
+        .and_then(|value| value.get("tests_detected"))
+        .and_then(Value::as_bool)
+        .or_else(|| Some(parsed_test_summary.is_some()));
 
     let explicit_tests_run_field = summary.and_then(|value| value.get("tests_run_count"));
     let explicit_tests_passed_field = summary.and_then(|value| value.get("tests_passed"));
@@ -1700,26 +1729,15 @@ fn validation_test_run_metadata(
     let tests_run_count = explicit_tests_run
         .or(explicit_component_run)
         .or(parsed_tests_run);
-    let zero_tests_run = explicit_zero_tests
-        .or_else(|| pytest.and_then(|value| value.zero_tests_run))
-        .or_else(|| {
-            pytest
-                .is_none()
-                .then(|| tests_run_count.map(|count| count == 0))
-                .flatten()
-        });
+    let zero_tests_run = explicit_zero_tests.or_else(|| tests_run_count.map(|count| count == 0));
     let component_run = component_tests_run(tests_passed, tests_failed);
     if matches!((tests_run_count, component_run), (Some(run), Some(component_run)) if run != component_run)
         || (zero_tests_run == Some(true)
             && (tests_run_count.is_some_and(|count| count > 0)
                 || tests_passed.is_some_and(|count| count > 0)
                 || tests_failed.is_some_and(|count| count > 0)))
-        || (tests_detected == Some(false)
-            && (tests_run_count.is_some_and(|count| count > 0)
-                || tests_passed.is_some_and(|count| count > 0)
-                || tests_failed.is_some_and(|count| count > 0)))
     {
-        return (None, None, None, None, None);
+        return (tests_detected, None, None, None, None);
     }
     (
         tests_detected,

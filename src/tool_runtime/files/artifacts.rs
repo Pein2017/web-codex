@@ -24,6 +24,10 @@ pub(crate) const DEFAULT_READ_PROJECT_ARTIFACT_LENGTH: usize = 32 * 1024; // 32 
 /// Maximum returned segment size for `read_project_artifact`.
 pub(crate) const MAX_READ_PROJECT_ARTIFACT_LENGTH: usize = 64 * 1024; // 64 KiB
 
+/// Internal Control↔Runner artifact streaming chunk size. This is deliberately
+/// separate from the model-facing inspection bound above.
+pub(crate) const INTERNAL_ARTIFACT_TRANSFER_CHUNK_BYTES: usize = 1024 * 1024; // 1 MiB
+
 /// Maximum decoded size accepted for one `artifact_upload_chunk` request.
 pub(crate) const MAX_PROJECT_ARTIFACT_UPLOAD_CHUNK_BYTES: usize = 1024 * 1024; // 1 MiB
 
@@ -141,46 +145,27 @@ pub(crate) fn is_sensitive_artifact_path(path: &str) -> bool {
     crate::sensitive_paths::is_bulk_skipped_path(path)
 }
 
-fn validate_artifact_mime(mime_type: Option<&str>) -> Result<Option<String>, String> {
-    let Some(mime) = mime_type.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(None);
-    };
-    if ooxml_extension_for_mime(mime).is_some() {
-        return Ok(Some(mime.to_string()));
-    }
-    match mime {
-        "image/png"
-        | "image/jpeg"
-        | "image/webp"
-        | "audio/mpeg"
-        | "video/mp4"
-        | "application/pdf"
-        | "application/zip"
-        | "text/plain"
-        | "text/csv"
-        | "application/json" => Ok(Some(mime.to_string())),
-        "application/octet-stream" => Ok(Some(mime.to_string())),
-        _ => Err(format!("unsupported mime_type '{}'; allowed artifact MIME types are image/png, image/jpeg, image/webp, audio/mpeg, video/mp4, application/pdf, application/zip, application/vnd.openxmlformats-officedocument.wordprocessingml.document, application/vnd.openxmlformats-officedocument.presentationml.presentation, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, text/plain, text/csv, application/json", mime)),
-    }
+fn validate_artifact_mime(mime_type: Option<&str>) -> Option<String> {
+    let mime = mime_type.map(str::trim).filter(|value| !value.is_empty())?;
+    Some(
+        canonical_known_mime(mime)
+            .unwrap_or(GENERIC_BINARY_MIME)
+            .to_string(),
+    )
 }
 
 pub(crate) fn validate_artifact_mime_for_path(
     path: &str,
     mime_type: Option<&str>,
 ) -> Result<Option<String>, String> {
-    let mime_type = validate_artifact_mime(mime_type)?;
-    if matches!(mime_type.as_deref(), Some("application/octet-stream"))
-        && !has_safe_octet_stream_artifact_extension(path)
-    {
-        return Err(octet_stream_safe_extension_error());
-    }
+    let mime_type = validate_artifact_mime(mime_type);
     if let Some(mime) = mime_type.as_deref() {
-        if let Some(required_extension) = ooxml_extension_for_mime(mime) {
-            if !path.to_ascii_lowercase().ends_with(required_extension) {
-                return Err(format!(
-                    "OOXML MIME type '{mime}' requires a matching {required_extension} artifact path"
-                ));
-            }
+        if !mime_is_compatible_with_path(mime, path) {
+            let required_extension = ooxml_extension_for_mime(mime)
+                .expect("only OOXML MIME types have path compatibility requirements");
+            return Err(format!(
+                "OOXML MIME type '{mime}' requires a matching {required_extension} artifact path"
+            ));
         }
     }
     Ok(mime_type)
@@ -254,10 +239,8 @@ pub(crate) fn validate_project_artifact_export_snapshot(
         .get("mime_type")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "artifact export requires a detected or inferred MIME type".to_string())?;
-    let mime_type = validate_artifact_mime_for_path(path, Some(reported_mime))?
-        .ok_or_else(|| "artifact export requires a validated MIME type".to_string())?;
+        .filter(|value| !value.is_empty());
+    let mime_type = export_presentation_mime(path, reported_mime);
     let name = Path::new(path)
         .file_name()
         .and_then(|value| value.to_str())
@@ -277,6 +260,18 @@ pub(crate) fn validate_project_artifact_export_snapshot(
         mime_type,
         name: name.to_string(),
     })
+}
+
+pub(crate) fn artifact_upload_failure_is_definite(result: &ToolResult, upload_id: &str) -> bool {
+    result
+        .output
+        .get("upload_id")
+        .and_then(Value::as_str)
+        .is_some_and(|returned| returned == upload_id)
+}
+
+pub(crate) fn artifact_upload_begin_failure_is_definite(result: &ToolResult) -> bool {
+    !result.output.is_null()
 }
 
 impl ToolRuntime {
@@ -324,11 +319,15 @@ impl ToolRuntime {
             Ok(Ok(response)) => response,
             Ok(Err(_)) => {
                 self.runner_registry.cancel_request(&request_id).await;
-                return Err("agent export_project_artifact request was dropped".to_string());
+                return Err(
+                    "agent project artifact export metadata request was dropped".to_string()
+                );
             }
             Err(_) => {
                 self.runner_registry.cancel_request(&request_id).await;
-                return Err("timed out waiting for agent export_project_artifact".to_string());
+                return Err(
+                    "timed out waiting for agent project artifact export metadata".to_string(),
+                );
             }
         };
         if let Some(error) = response.error {
@@ -337,7 +336,7 @@ impl ToolRuntime {
         if response.exit_code != Some(0) {
             return Err(response.stderr.unwrap_or_else(|| {
                 format!(
-                    "agent export_project_artifact failed with code {:?}",
+                    "agent project artifact export metadata failed with code {:?}",
                     response.exit_code
                 )
             }));
@@ -346,7 +345,7 @@ impl ToolRuntime {
         let stdout = stdout.trim();
         let output = serde_json::from_str(stdout).map_err(|error| {
             format!(
-                "agent export_project_artifact returned invalid JSON: {error} (got: {})",
+                "agent project artifact export metadata returned invalid JSON: {error} (got: {})",
                 &stdout[..stdout.len().min(200)]
             )
         })?;
@@ -362,6 +361,7 @@ impl ToolRuntime {
         project: &str,
         path: &str,
         expected_file_bytes: usize,
+        expected_sha256: &str,
         offset: usize,
         length: usize,
         auth: Option<&AuthContext>,
@@ -375,10 +375,16 @@ impl ToolRuntime {
                 MAX_PROJECT_ARTIFACT_EXPORT_BYTES
             ));
         }
-        if length == 0 || length > MAX_READ_PROJECT_ARTIFACT_LENGTH {
+        if !is_hex_sha256(expected_sha256) {
+            return Err(
+                "artifact export expected_sha256 must be a lowercase 64-character hex digest"
+                    .to_string(),
+            );
+        }
+        if length == 0 || length > INTERNAL_ARTIFACT_TRANSFER_CHUNK_BYTES {
             return Err(format!(
                 "artifact export chunk length must be between 1 and {} bytes",
-                MAX_READ_PROJECT_ARTIFACT_LENGTH
+                INTERNAL_ARTIFACT_TRANSFER_CHUNK_BYTES
             ));
         }
         offset
@@ -392,6 +398,7 @@ impl ToolRuntime {
         let payload = json!({
             "path": path,
             "expected_file_bytes": expected_file_bytes,
+            "expected_sha256": expected_sha256,
             "offset": offset,
             "length": length,
         });

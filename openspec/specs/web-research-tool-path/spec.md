@@ -49,22 +49,18 @@ The optional workflow plugin SHALL provide read-only public-message retrieval fo
 - **WHEN** history access is unconfigured or a request attempts to escape its configured root
 - **THEN** the capability is absent or access is denied without reading outside that root
 
-### Requirement: Exclude CLAUDE from automatic instruction loading
-
-An operator-controlled policy SHALL allow exclusion of the fixed `CLAUDE.md` instruction candidate. With exclusion enabled, startup and on-demand project instructions MUST omit its content and source metadata while retaining eligible `AGENTS.md` sources. Unset policy MUST preserve existing defaults; exclusion MUST NOT delete files or deny separately authorized explicit reads.
-
-#### Scenario: Enabled exclusion with multiple instruction files
-- **WHEN** a project contains `AGENTS.md`, `CLAUDE.md`, and `.codex/AGENTS.md`, and exclusion is enabled
-- **THEN** `work_on_project(include_project_instructions=true)` and `context_request` project guidance omit `CLAUDE.md` consistently without labeling intentional exclusion a failed scan
-
-#### Scenario: Existing defaults and explicit read
-- **WHEN** exclusion is unset or the user explicitly reads `CLAUDE.md` through a file tool
-- **THEN** default auto-discovery remains unchanged when unset and explicit authorized file reads remain possible with either setting
-
 ### Requirement: Guidance preserves execution boundaries
 
-Web guidance SHALL distinguish resolved project identity, business Session, recorder and explicit context ACK, and explain partial-result continuation. It MUST NOT infer recorder identity, auto-ACK context, rerun an effect solely to record it, or recommend changing execution tools to evade a host safety denial.
+Web guidance SHALL distinguish resolved project identity, business Session, recorder and explicit collaboration-message ACK, and explain partial-result continuation. It SHALL follow upstream explicit recovery/handoff behavior without requesting retired Session context ACKs or context revisions. It MUST NOT infer recorder identity, auto-ACK messages, rerun an effect solely to record it, or recommend changing execution tools to evade a host safety denial.
 
 #### Scenario: Successful execution with missing recorder
 - **WHEN** execution succeeds but recorder metadata is missing
 - **THEN** guidance preserves the execution result and requests explicit metadata on future calls rather than re-executing the command
+
+#### Scenario: Native recovery after missing context
+- **WHEN** prior task context is missing or an explicit handoff is requested
+- **THEN** guidance uses the exact authorized upstream Session handoff path without a context revision handshake or automatic effect retry
+
+#### Scenario: Collaboration message ACK
+- **WHEN** the caller explicitly acknowledges messages for an authorized recorder
+- **THEN** the acknowledgment remains request-scoped, is not forwarded as provider business input, and grants neither effect authority nor durable task acceptance

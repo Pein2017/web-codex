@@ -208,6 +208,7 @@ fn runner_config(
         quic: None,
         shell,
         skills: SkillsConfig::default(),
+        instructions: crate::webcodex_runner::config::InstructionsConfig::default(),
         ssh: SshConfig::default(),
         tool_providers: ToolProvidersConfig::default(),
         mcp_gateway: McpGatewayConfig::default(),
@@ -620,7 +621,7 @@ fn runner_real_process_plugin_blocking_stdin_write_respects_total_deadline_and_r
         .marker_pid("descendant-pid:")
         .expect("fixture descendant pid");
     assert!(wait_until(Duration::from_secs(1), || {
-        !crate::job_manager_tests::process_running(descendant_pid)
+        !crate::webcodex_runner::job_manager::job_manager_tests::process_running(descendant_pid)
     }));
 
     let retired = fixture.call();
@@ -689,7 +690,7 @@ fn runner_real_process_plugin_shutdown_terminates_process_tree_while_effectful_s
     ));
     let descendant_pid = fixture.marker_pid("descendant-pid:").unwrap();
     assert!(wait_until(Duration::from_secs(1), || {
-        !crate::job_manager_tests::process_running(descendant_pid)
+        !crate::webcodex_runner::job_manager::job_manager_tests::process_running(descendant_pid)
     }));
 }
 
@@ -1452,7 +1453,10 @@ fn runner_config_reload_and_plugin_state_commit_as_one_active_generation() {
     let rejected = runtime.reload_config(2);
     assert_eq!(rejected.valid, Some(false));
     assert_eq!(rejected.current_generation, Some(2));
-    assert_eq!(rejected.error_code.as_deref(), Some("plugin_reload_failed"));
+    assert_eq!(
+        rejected.error_code,
+        Some(webcodex_core::runner_protocol::RunnerConfigErrorCode::PluginReloadFailed)
+    );
     assert_eq!(runtime.snapshot().generation, 2);
     let still_v2 = current_providers(runtime.plugins())[0].clone();
     assert_eq!(still_v2.provider_instance_id, v2.provider_instance_id);

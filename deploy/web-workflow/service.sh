@@ -12,7 +12,6 @@ export GH_CONFIG_DIR="$root/config/gh"
 export XDG_CONFIG_HOME="$root/state/xdg/config"
 export XDG_DATA_HOME="$root/state/xdg/data"
 export XDG_CACHE_HOME="$root/state/xdg/cache"
-export WEBCODEX_EXCLUDE_CLAUDE_INSTRUCTIONS=1
 export HTTP_PROXY=http://127.0.0.1:9090 HTTPS_PROXY=http://127.0.0.1:9090 ALL_PROXY=http://127.0.0.1:9090
 export http_proxy="$HTTP_PROXY" https_proxy="$HTTPS_PROXY" all_proxy="$ALL_PROXY"
 export NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost
@@ -21,7 +20,6 @@ exec >> "$root/logs/$service.log" 2>&1
 case "$service" in
   server)
     export WEBCODEX_AUTHORITY_MODE=trusted_agent
-    export WEBCODEX_MCP_MODEL_SURFACE=full-operator-v1
     export WEBCODEX_MCP_COMPACT_SCHEMAS=true
     export WEBCODEX_MCP_INSTRUCTIONS_FILE="$root/current/AGENTS.md"
     export WEBCODEX_ENV_FILE="$root/config/server.env"
@@ -41,7 +39,7 @@ case "$service" in
     source "$root/config/tunnel.env"
     set +a
     export WEBCODEX_TUNNEL_CLIENT_BIN="$root/runtime/bin/tunnel-client"
-    command=("$root/runtime/bin/webcodex-cli" server tunnel --provider openai
+    command=("$root/current/bin/webcodex-cli" server tunnel --provider openai
       --env-file "$root/config/server.env" --json --stop-on-stdin-eof)
     ;;
 esac

@@ -11,6 +11,7 @@ runner-real-process-tests = ["webcodex-lsp/real-process-tests"]
 
 [dependencies]
 agent-client-protocol-schema = { version = "1.7.0", default-features = false }
+webcodex-browser = { path = "../webcodex-browser" }
 webcodex-computer = { path = "../webcodex-computer" }
 webcodex-runner-config = { path = "../webcodex-runner-config" }
 webcodex-core = { path = "../webcodex-core" }
@@ -49,6 +50,8 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
 
@@ -57,5 +60,7 @@ windows-sys = { version = "0.61.2", features = [
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }

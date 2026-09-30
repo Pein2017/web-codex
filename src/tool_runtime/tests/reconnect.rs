@@ -137,7 +137,6 @@ async fn runner_disconnect_and_reconnect_change_layers_independently() {
         "server_transport",
         "server_registration",
         "project_registry",
-        "connector_endpoint",
         "last_successful_tool_call",
     ] {
         assert_layer_contract(&connected[name], name);
@@ -155,12 +154,6 @@ async fn runner_disconnect_and_reconnect_change_layers_independently() {
     );
     assert_eq!(connected["server_registration"]["status"], "registered");
     assert_eq!(connected["project_registry"]["status"], "registered");
-    // Connector runtime is not configured in this process.
-    assert_eq!(connected["connector_endpoint"]["status"], "not_configured");
-    assert_eq!(
-        connected["connector_endpoint"]["reason_code"],
-        "connector_runtime_disabled"
-    );
 
     // Disconnect: layers change independently; stale registration is not ready.
     runtime
@@ -213,10 +206,12 @@ async fn runner_disconnect_and_reconnect_change_layers_independently() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "echo back".to_string(),
                         session_id: None,
                         timeout_secs: Some(5),
+                        sync_wait_secs: None,
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -518,6 +513,7 @@ async fn agent_job_lost_on_disconnect_stays_terminal_after_reconnect() {
         .runner_registry
         .start_job(
             ShellJobOpRequest {
+                login: false,
                 op: "start".to_string(),
                 client_id: Some("job-agent".to_string()),
                 cwd: None,
@@ -634,6 +630,14 @@ async fn version_compatibility_reports_stable_mismatch_facts() {
     // Same package version + supported protocol remains compatible even when
     // exact source differs. Source alignment is a separate diagnostic axis.
     let server_build = crate::build_info::runtime_build_info();
+    let expected_old_build_alignment = webcodex_core::desktop_runtime_contract::build_alignment(
+        Some("0.0.1"),
+        None,
+        None,
+        Some(server_version),
+        server_build.git_commit,
+        server_build.git_dirty,
+    );
     let different_commit = format!(
         "{}-different",
         server_build.git_commit.unwrap_or("server-source")
@@ -648,11 +652,14 @@ async fn version_compatibility_reports_stable_mismatch_facts() {
                 version: Some(server_version.to_string()),
                 git_commit: Some(different_commit),
                 git_dirty: Some(false),
+                built_at: None,
+                target: None,
+                architecture: None,
             }),
         ))
         .await
         .unwrap();
-    // Different build version → version_mismatch (connected ≠ compatible).
+    // Different package version remains protocol-compatible; build alignment is advisory.
     runtime
         .runner_registry
         .register(register_request(
@@ -663,6 +670,9 @@ async fn version_compatibility_reports_stable_mismatch_facts() {
                 version: Some("0.0.1".to_string()),
                 git_commit: None,
                 git_dirty: None,
+                built_at: None,
+                target: None,
+                architecture: None,
             }),
         ))
         .await
@@ -681,7 +691,8 @@ async fn version_compatibility_reports_stable_mismatch_facts() {
     let status = runtime.runtime_status(None).await;
     assert!(status.success);
     let compat = &status.output["version_compatibility"];
-    assert_eq!(compat["status"], "version_mismatch");
+    assert_eq!(compat["status"], "compatible");
+    assert_eq!(compat["protocol_compatibility"], "compatible");
     assert_eq!(compat["server"]["version"], server_version);
     let runners = compat["runners"].as_array().unwrap();
     let by_id = |id: &str| {
@@ -701,15 +712,15 @@ async fn version_compatibility_reports_stable_mismatch_facts() {
     assert_eq!(compat["source_alignment"]["status"], "different");
     assert!(different_source.get("build_matches_server").is_none());
 
-    assert_eq!(by_id("old-build")["status"], "version_mismatch");
+    assert_eq!(by_id("old-build")["status"], "compatible");
+    assert_eq!(by_id("old-build")["protocol_compatibility"], "compatible");
     assert_eq!(
-        by_id("old-build")["reason_code"],
-        "runner_version_differs_from_server"
+        by_id("old-build")["build_alignment"],
+        serde_json::json!(expected_old_build_alignment)
     );
-    assert!(by_id("old-build")["action"]
-        .as_str()
-        .unwrap()
-        .contains("align"));
+    assert_eq!(by_id("old-build")["version_matches_server"], false);
+    assert!(by_id("old-build")["reason_code"].is_null());
+    assert!(by_id("old-build")["action"].is_null());
     let compact = crate::tool_runtime::runtime_info::compact_runtime_status(&status.output);
     let compact_runner = compact["agents"]["clients"]
         .as_array()
@@ -864,11 +875,11 @@ async fn dispatch_coding_call_in_window_with_transport(
                 .await
         }
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + CODING_WORKFLOW_FIXTURE_TIMEOUT;
     while !task.is_finished() {
         assert!(
             std::time::Instant::now() < deadline,
-            "coding workflow did not finish within the 10-second test deadline"
+            "coding workflow did not finish within the {CODING_WORKFLOW_FIXTURE_TIMEOUT:?} test deadline"
         );
         if let Some(req) = runtime
             .runner_registry
@@ -905,8 +916,7 @@ fn coding_start_call(project: &str, instruction: &str) -> ToolCall {
         base_ref: None,
         instruction: instruction.to_string(),
         session_id: None,
-        include_project_instructions: true,
-        include_workflow_guidance: true,
+        guidance_profile: Default::default(),
         include_extension_catalog: false,
     }
 }
@@ -920,8 +930,7 @@ fn coding_resume_call(project: &str, instruction: &str, session_id: &str) -> Too
         base_ref: None,
         instruction: instruction.to_string(),
         session_id: Some(session_id.to_string()),
-        include_project_instructions: true,
-        include_workflow_guidance: true,
+        guidance_profile: Default::default(),
         include_extension_catalog: false,
     }
 }
@@ -1235,7 +1244,9 @@ async fn coding_workflow_read_only_upgrade_is_atomic_and_permission_checked() {
     assert_eq!(upgraded.output["session_id"], session_id);
     assert_eq!(upgraded.output["continuation"], "resumed_explicitly");
     assert_eq!(upgraded.output["instructions"]["status"], "reused");
-    assert_eq!(upgraded.output["instructions"]["content_included"], true);
+    assert!(upgraded.output["instructions"]
+        .get("content_included")
+        .is_none());
     assert!(upgraded.output.get("continuation_feedback").is_none());
     let summary = runtime.sessions.summary(&session_id, Some(20)).unwrap();
     assert!(!summary.guards.deny_write_tools);

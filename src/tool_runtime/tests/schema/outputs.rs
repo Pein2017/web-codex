@@ -1,9 +1,8 @@
 use super::*;
 
 #[test]
-fn computer_launch_application_output_schema_has_closed_native_platforms() {
-    let schema =
-        crate::tool_runtime::registry::output_schema_for_tool("computer_launch_application");
+fn computer_control_output_schema_has_closed_native_platforms() {
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("computer_control");
     let validate = |value: &Value| {
         crate::tool_runtime::startup_brief::validate_schema_instance_for_test(value, &schema)
     };
@@ -29,8 +28,8 @@ fn computer_launch_application_output_schema_has_closed_native_platforms() {
                 "state_changed": false,
                 "execution_state": "not_started",
                 "suggested_call": {
-                    "tool": "computer_list_applications",
-                    "arguments": {"client_id": "msi"}
+                    "tool": "computer_observe",
+                    "arguments": {"action": "applications", "client_id": "msi"}
                 }
             }),
         ),
@@ -38,7 +37,7 @@ fn computer_launch_application_output_schema_has_closed_native_platforms() {
     .unwrap();
     validate(&stale).unwrap();
     let mut legacy_recovery_tool = stale.clone();
-    legacy_recovery_tool["output"]["recovery_tool"] = json!("computer_list_applications");
+    legacy_recovery_tool["output"]["recovery_tool"] = json!("computer_observe");
     assert!(validate(&legacy_recovery_tool).is_err());
     assert!(schema["properties"]["output"]["properties"]
         .get("recovery_tool")
@@ -83,6 +82,131 @@ fn computer_launch_application_output_schema_has_closed_native_platforms() {
     })))
     .unwrap();
     assert!(validate(&extra).is_err());
+}
+
+#[test]
+fn browser_output_schemas_accept_canonical_results_and_reject_leaked_fields() {
+    let observe_schema = crate::tool_runtime::registry::output_schema_for_tool("browser_observe");
+    let act_schema = crate::tool_runtime::registry::output_schema_for_tool("browser_act");
+    let validate_observe = |value: &Value| {
+        crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+            value,
+            &observe_schema,
+        )
+    };
+    let validate_act = |value: &Value| {
+        crate::tool_runtime::startup_brief::validate_schema_instance_for_test(value, &act_schema)
+    };
+
+    let snapshot = serde_json::to_value(crate::tool_runtime::tool_result::ToolResult::ok(json!({
+        "execution_state": "completed",
+        "state_changed": false,
+        "browser_id": "browser_abcdefghijklmnop",
+        "page_id": "page_abcdefghijklmnop",
+        "snapshot_generation": 1,
+        "node_count": 1,
+        "truncated": false,
+        "nodes": [{
+            "role": "button",
+            "name": "Continue",
+            "value": null,
+            "element_id": "element_abcdefghijklmnop",
+            "actionable": true
+        }]
+    })))
+    .unwrap();
+    validate_observe(&snapshot).unwrap();
+
+    let screenshot =
+        serde_json::to_value(crate::tool_runtime::tool_result::ToolResult::ok(json!({
+            "execution_state": "completed",
+            "state_changed": false,
+            "browser_id": "browser_abcdefghijklmnop",
+            "page_id": "page_abcdefghijklmnop",
+            "content_base64": "iVBORw0KGgo=",
+            "mime_type": "image/png",
+            "width": 1024,
+            "height": 768,
+            "file_bytes": 8,
+            "sha256": "a".repeat(64)
+        })))
+        .unwrap();
+    validate_observe(&screenshot).unwrap();
+
+    let console = serde_json::to_value(crate::tool_runtime::tool_result::ToolResult::ok(json!({
+        "execution_state": "completed",
+        "state_changed": false,
+        "retained_count": 200,
+        "count": 2,
+        "truncated": true,
+        "entries": [
+            {"level":"warning","text":"warn","source":null,"timestamp":1.0},
+            {"level":"error","text":"boom","source":"https://example.test/app.js","timestamp":2.0}
+        ]
+    })))
+    .unwrap();
+    validate_observe(&console).unwrap();
+
+    let diagnostics = serde_json::to_value(crate::tool_runtime::tool_result::ToolResult::ok(json!({
+        "execution_state": "completed",
+        "state_changed": false,
+        "console_retained": 200,
+        "console_count": 1,
+        "console_truncated": true,
+        "console": [
+            {"level":"exception","text":"boom","source":null,"timestamp":3.0}
+        ],
+        "network_retained": 300,
+        "network_count": 1,
+        "network_truncated": false,
+        "network": [
+            {"method":"GET","url":"https://example.test/api","resource_type":"Fetch","status":500,"failed_reason":null,"timestamp":4.0}
+        ]
+    })))
+    .unwrap();
+    validate_observe(&diagnostics).unwrap();
+
+    let launch = serde_json::to_value(crate::tool_runtime::tool_result::ToolResult::ok(json!({
+        "execution_state": "completed",
+        "state_changed": true,
+        "browser_id": "browser_abcdefghijklmnop",
+        "page_count": 1
+    })))
+    .unwrap();
+    validate_act(&launch).unwrap();
+
+    let stale = serde_json::to_value(
+        crate::tool_runtime::tool_result::ToolResult::err_with_output(
+            "stale element",
+            json!({
+                "execution_state": "not_started",
+                "state_changed": false,
+                "error_kind": "stale_element",
+                "message": "element identity is stale",
+                "recovery": {
+                    "reason": "re-observe before acting",
+                    "suggested_call": {
+                        "tool": "browser_observe",
+                        "arguments": {
+                            "action": "snapshot",
+                            "client_id": "msi",
+                            "browser_id": "browser_abcdefghijklmnop",
+                            "page_id": "page_abcdefghijklmnop"
+                        }
+                    }
+                }
+            }),
+        ),
+    )
+    .unwrap();
+    validate_act(&stale).unwrap();
+
+    let mut leaked = snapshot;
+    leaked["output"]["target_id"] = json!("private-cdp-target");
+    assert!(validate_observe(&leaked).is_err());
+    let mut leaked = launch;
+    leaked["output"]["debug_endpoint"] = json!("private-endpoint");
+    assert!(validate_act(&leaked).is_err());
 }
 
 #[test]

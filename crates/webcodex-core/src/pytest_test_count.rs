@@ -13,24 +13,9 @@ pub struct PytestTestRunMetadata {
     pub zero_tests_run: Option<bool>,
 }
 
-/// A display preview is not argv authority. Restrict it to an unambiguous
-/// direct pytest/Python-module prefix and reject shell chaining. Unknown
-/// commands remain outside this parser instead of interpreting arbitrary
-/// output that happens to contain a pytest-looking string.
-pub fn is_supported_pytest_command_summary(summary: &str) -> bool {
-    if summary.is_empty()
-        || summary.contains('…')
-        || summary
-            .chars()
-            .any(|ch| matches!(ch, ';' | '|' | '&' | '>' | '<' | '`' | '$'))
-    {
-        return false;
-    }
-    let mut words = summary.split_whitespace();
-    let Some(program) = words.next() else {
-        return false;
-    };
-    let basename = program.rsplit(['/', '\\']).next().unwrap_or_default();
+/// Recognize pytest only from the typed executable and argument vector.
+pub fn is_supported_pytest_argv(executable: &str, args: &[String]) -> bool {
+    let basename = executable.rsplit(['/', '\\']).next().unwrap_or_default();
     if basename == "pytest" {
         return true;
     }
@@ -40,12 +25,12 @@ pub fn is_supported_pytest_command_summary(summary: &str) -> bool {
     if !suffix.is_empty() && !suffix.chars().all(|ch| ch.is_ascii_digit() || ch == '.') {
         return false;
     }
-    let mut option = words.next();
-    // Python flags are not a pytest-selector identity and may precede -m.
+    let mut args = args.iter().map(String::as_str);
+    let mut option = args.next();
     while matches!(option, Some("-B" | "-u" | "-I" | "-E" | "-s" | "-S")) {
-        option = words.next();
+        option = args.next();
     }
-    option == Some("-m") && words.next() == Some("pytest")
+    option == Some("-m") && args.next() == Some("pytest")
 }
 
 /// Parse a *completed, untruncated* execution's separate bounded stdout and
@@ -80,7 +65,7 @@ fn pytest_summary_candidate(line: &str) -> bool {
 
 fn parse_pytest_summary_line(line: &str) -> Option<PytestTestRunMetadata> {
     // The usual pytest banner is equals-fenced; its -q/-qq plain final line
-    // is also accepted when the command preview proves direct pytest intent.
+    // is also accepted after typed argv proves direct pytest intent.
     let banner = line.starts_with("==") && line.ends_with("==");
     if line.contains('=') && !banner {
         return None;
@@ -116,6 +101,7 @@ fn parse_pytest_summary_line(line: &str) -> Option<PytestTestRunMetadata> {
         || seconds.ends_with('.')
         || seconds.matches('.').count() > 1
         || !seconds.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+        || !seconds.parse::<f64>().ok()?.is_finite()
     {
         return None;
     }
@@ -157,7 +143,7 @@ fn parse_pytest_summary_line(line: &str) -> Option<PytestTestRunMetadata> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_supported_pytest_command_summary, parse_pytest_terminal_test_counts};
+    use super::{is_supported_pytest_argv, parse_pytest_terminal_test_counts};
 
     #[test]
     fn direct_module_and_pytest_commands_only() {
@@ -167,16 +153,25 @@ mod tests {
             "/usr/bin/python3.11 -m pytest tests/test_api.py",
             "/tmp/venv/bin/pytest -q",
         ] {
-            assert!(is_supported_pytest_command_summary(command), "{command}");
+            let words: Vec<_> = command.split_whitespace().collect();
+            let args = words[1..]
+                .iter()
+                .map(|word| word.to_string())
+                .collect::<Vec<_>>();
+            assert!(is_supported_pytest_argv(words[0], &args), "{command}");
         }
         for command in [
             "python -m unittest discover",
             "python -c print(2 passed in 0.1s)",
-            "python -m pytest && echo 1 passed in 0.1s",
             "python -m pytest…",
             "sh -c python -m pytest",
         ] {
-            assert!(!is_supported_pytest_command_summary(command), "{command}");
+            let words: Vec<_> = command.split_whitespace().collect();
+            let args = words[1..]
+                .iter()
+                .map(|word| word.to_string())
+                .collect::<Vec<_>>();
+            assert!(!is_supported_pytest_argv(words[0], &args), "{command}");
         }
     }
 
@@ -213,6 +208,7 @@ mod tests {
             "=== 2 passed in 109.10s (0:91:49) ===\n",
             "=== 2 passed in 109.10s (bad:01:49) ===\n",
             "2 passed, nope failed in 0.1s\n",
+            "2 passed in 999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999s\n",
             "1 passed in 0.1s\n2 passed in 0.2s\n",
             "2 xpassed, 1 failed in 0.1s\n",
             "Collected 2 items, 2 passed in 0.1s\n",

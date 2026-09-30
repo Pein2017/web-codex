@@ -108,6 +108,23 @@ fn work_result_projection_is_sparse_bounded_and_honest() {
 }
 
 #[test]
+fn work_result_preserves_unproven_source_without_hiding_historical_execution_success() {
+    let projected = build_work_result_projection(
+        "agent:special:demo",
+        "wc_sess_0123456789abcdef",
+        true,
+        &json!({"git_available":true,"clean":true}),
+        &validation("passed", "passed", 1, 0),
+        &current_validation("unproven", 0, 0),
+        &review(0),
+        false,
+    );
+    assert_eq!(projected["validation"]["status"], "passed");
+    assert_eq!(projected["validation"]["successes"], 1);
+    assert_eq!(projected["validation"]["current_status"], "unproven");
+}
+
+#[test]
 fn work_result_state_version_matches_buffered_projection_hash() {
     let projection = build_work_result_projection(
         "agent:special:项目-🦀",
@@ -136,7 +153,7 @@ fn work_result_state_version_matches_buffered_projection_hash() {
         true,
     );
     let expected = format!(
-        "wr1_{:x}",
+        "wr2_{:x}",
         Sha256::digest(serde_json::to_vec(&projection).unwrap())
     );
     assert_eq!(work_result_state_version(&projection), expected);
@@ -217,7 +234,7 @@ fn work_result_projection_marks_bounded_history_partial_without_inventing_absenc
     assert_eq!(partial["review"]["history_partial"], true);
     assert_eq!(partial["review"]["total"], 0);
 
-    for current in ["passed", "failed", "stale"] {
+    for current in ["unproven", "failed", "stale"] {
         let projected = build_work_result_projection(
             "agent:special:demo",
             &session_id,
@@ -334,11 +351,25 @@ async fn work_result_state_reauthorizes_exact_identity_and_refresh_does_not_reco
         alias_present.output["error_kind"],
         "work_result_project_not_exact"
     );
+    let dispatched_alias = runtime
+        .dispatch_with_auth(
+            ToolCall::WorkResultState {
+                project: "demo".to_string(),
+                session_id: session.session_id.clone(),
+            },
+            Some(&auth),
+        )
+        .await;
+    assert!(!dispatched_alias.success);
+    assert_eq!(
+        dispatched_alias.output["error_kind"],
+        "work_result_project_not_exact"
+    );
     assert!(
         probe_patch_agent_request(&runtime, "work-result")
             .await
             .is_none(),
-        "a non-canonical project alias must fail before workspace observation"
+        "a non-canonical project alias must fail before workspace observation, including through top-level dispatch"
     );
 
     let after = runtime.sessions.summary(&session.session_id, None).unwrap();
@@ -388,6 +419,234 @@ async fn work_result_state_reauthorizes_exact_identity_and_refresh_does_not_reco
 }
 
 #[tokio::test]
+async fn work_result_progress_uses_latest_meaningful_session_activity() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "hello\n", "initial");
+    let runtime = test_runtime();
+    let project = register_runner_project_at_path(
+        &runtime,
+        "work-result-meaningful-progress",
+        "demo",
+        tmp.path(),
+    )
+    .await;
+    let auth = auth_context(None, true);
+    let session = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("Work Result meaningful progress".to_string()),
+    );
+
+    let meaningful = runtime.sessions.record_tool_call_started_with_options(
+        Some(&session.session_id),
+        crate::tool_runtime::sessions::SessionTransport::Api,
+        "show_changes",
+        &json!({"project": project, "include_diff": false}),
+        Some(project.clone()),
+        crate::tool_runtime::sessions::session_tool_contract("show_changes"),
+    );
+    runtime.sessions.record_tool_call_finished(
+        meaningful,
+        true,
+        &json!({"git_available": true, "clean": true, "files": [], "files_total": 0}),
+        None,
+        None,
+    );
+
+    let presentation = runtime.sessions.record_tool_call_started_with_options(
+        Some(&session.session_id),
+        crate::tool_runtime::sessions::SessionTransport::Mcp,
+        "present_work_result",
+        &json!({"project": project, "session_id": session.session_id}),
+        Some(project.clone()),
+        crate::tool_runtime::sessions::session_tool_contract("present_work_result"),
+    );
+    runtime.sessions.record_tool_call_finished(
+        presentation,
+        true,
+        &json!({"work_result": {"project": project, "session_id": session.session_id}}),
+        None,
+        None,
+    );
+
+    let state = refresh_once(
+        &runtime,
+        "work-result-meaningful-progress",
+        &project,
+        &session.session_id,
+        &auth,
+    )
+    .await;
+    assert!(state.success, "{:?}", state.error);
+    assert_eq!(
+        state.output["work_result"]["session"]["latest_activity"]["tool"], "show_changes",
+        "presentation-only Session events must not masquerade as work progress"
+    );
+    let workflow = &state.output["work_result"]["workflow"];
+    let activity = workflow["activity"].as_array().unwrap();
+    assert_eq!(
+        activity.len(),
+        1,
+        "paired calls appear once; presentation calls are excluded"
+    );
+    assert_eq!(activity[0]["stage"], "review");
+    assert_eq!(activity[0]["label"], "Reviewed changes");
+    assert_eq!(activity[0]["state"], "succeeded");
+    assert!(activity[0].get("tool").is_none());
+    assert!(activity[0].get("paths").is_none());
+    assert_eq!(workflow["history_partial"], false);
+    assert_eq!(
+        state.output["work_result"]["session"]["latest_activity"]["kind"],
+        "tool_call_finished"
+    );
+    assert!(
+        state.output["work_result"]["session"]["events_total"]
+            .as_u64()
+            .unwrap()
+            >= 4,
+        "session event count remains an honest total rather than a tool-call count"
+    );
+}
+
+#[tokio::test]
+async fn work_result_refresh_reobserves_validation_source_staleness_without_recording() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "hello\n", "initial");
+    let runtime = test_runtime();
+    let project =
+        register_runner_project_at_path(&runtime, "work-result-source", "demo", tmp.path()).await;
+    let auth = auth_context(None, true);
+    let session = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("Work Result source refresh".to_string()),
+    );
+
+    let start_fence = runtime
+        .validation_sources
+        .capture(&project)
+        .expect("source fence");
+    let initial_source = runtime
+        .validation_sources
+        .observe(&project, Some(&start_fence));
+    assert_eq!(
+        initial_source.freshness,
+        webcodex_core::validation_source::ValidationFreshness::Unproven
+    );
+    assert_eq!(
+        initial_source.observed_mutation_fence,
+        webcodex_core::validation_source::ObservedMutationFence::Uncrossed
+    );
+
+    let started = runtime.sessions.record_tool_call_started_with_options(
+        Some(&session.session_id),
+        crate::tool_runtime::sessions::SessionTransport::Api,
+        "cargo_check",
+        &json!({"project": "demo"}),
+        Some(project.clone()),
+        crate::tool_runtime::sessions::session_tool_contract("cargo_check"),
+    );
+    runtime.sessions.record_tool_call_finished(
+        started,
+        true,
+        &json!({
+            "terminal": true,
+            "command_started": true,
+            "command_completed": true,
+            "execution_state": "completed",
+            "exit_code": 0,
+            "stdout_tail": "",
+            "stderr_tail": "",
+            "source_state": initial_source,
+        }),
+        None,
+        None,
+    );
+
+    let before = runtime.sessions.summary(&session.session_id, None).unwrap();
+    let persisted_finished = before
+        .events
+        .iter()
+        .find(|event| event.kind == "tool_call_finished" && event.tool_name == "cargo_check")
+        .expect("persisted validation finish");
+    assert_eq!(
+        persisted_finished.resolved_project.as_deref(),
+        Some(project.as_str())
+    );
+    assert_eq!(
+        persisted_finished
+            .validation_output_summary
+            .as_ref()
+            .and_then(|value| value.pointer("/source_state/start_fence/epoch"))
+            .and_then(Value::as_str),
+        Some(start_fence.epoch.as_str())
+    );
+    let initial = refresh_once(
+        &runtime,
+        "work-result-source",
+        &project,
+        &session.session_id,
+        &auth,
+    )
+    .await;
+    assert!(initial.success, "{:?}", initial.error);
+    assert_eq!(
+        initial.output["work_result"]["validation"]["current_status"],
+        "unproven"
+    );
+
+    let mutation = runtime
+        .validation_sources
+        .begin(&project)
+        .expect("mutation observation");
+    mutation.finish(&ToolResult::ok(json!({
+        "execution_state": "completed",
+        "state_changed": true,
+    })));
+
+    let mut reobserved_events = before.events.clone();
+    runtime.refresh_validation_source_states(&mut reobserved_events);
+    let reobserved = reobserved_events
+        .iter()
+        .find(|event| event.kind == "tool_call_finished" && event.tool_name == "cargo_check")
+        .and_then(|event| event.validation_output_summary.as_ref())
+        .and_then(|value| value.get("source_state"))
+        .cloned()
+        .and_then(|value| {
+            serde_json::from_value::<webcodex_core::validation_source::ValidationSourceState>(value)
+                .ok()
+        })
+        .expect("reobserved source state");
+    assert_eq!(
+        reobserved.freshness,
+        webcodex_core::validation_source::ValidationFreshness::Stale
+    );
+
+    let stale = refresh_once(
+        &runtime,
+        "work-result-source",
+        &project,
+        &session.session_id,
+        &auth,
+    )
+    .await;
+    assert!(stale.success, "{:?}", stale.error);
+    assert_eq!(
+        stale.output["work_result"]["validation"]["current_status"],
+        "stale"
+    );
+    assert_eq!(
+        stale.output["work_result"]["validation"]["reason"],
+        "validation_source_fence_crossed"
+    );
+
+    let after = runtime.sessions.summary(&session.session_id, None).unwrap();
+    assert_eq!(after.events_total, before.events_total);
+    assert_eq!(after.events.len(), before.events.len());
+    assert_eq!(after.updated_at, before.updated_at);
+}
+
+#[tokio::test]
 async fn work_result_state_marks_truncated_session_evidence_partial_without_recording_refresh() {
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
@@ -400,7 +659,7 @@ async fn work_result_state_marks_truncated_session_evidence_partial_without_reco
         Some(project.clone()),
         Some("Work Result bounded evidence".to_string()),
     );
-    seed_model_facing_recovery_events(&runtime, &session.session_id, &project, 110);
+    seed_recovery_events(&runtime, &session.session_id, &project, 110);
     let bounded = runtime
         .sessions
         .summary(&session.session_id, Some(200))
@@ -485,8 +744,141 @@ async fn work_result_state_fails_closed_for_foreign_session_authority() {
     );
 }
 
+#[tokio::test]
+async fn work_result_collaboration_reuses_session_store_and_ack_resolution_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "hello\n", "initial");
+    let runtime = test_runtime();
+    let project =
+        register_runner_project_at_path(&runtime, "work-result-collab", "demo", tmp.path()).await;
+    let auth = auth_context(None, true);
+    let session = runtime.sessions.start_session(
+        Some(project.clone()),
+        Some("Collaborative Work Result".to_string()),
+    );
+
+    let send = runtime
+        .work_result_send_message(
+            project.clone(),
+            session.session_id.clone(),
+            "Please keep the existing retry mechanism.".to_string(),
+            "card-message-1".to_string(),
+            Some(&auth),
+            None,
+        )
+        .await;
+    assert!(send.success, "{:?}", send.error);
+    let message_id = send.output["message_id"].as_str().unwrap().to_string();
+    assert_eq!(send.output["replayed"], false);
+    assert_eq!(send.output["state_changed"], true);
+
+    let retained = runtime
+        .sessions
+        .list_messages(
+            &session.session_id,
+            webcodex_workflow_session::ListSessionMessagesFilter {
+                limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(
+        retained[0].kind,
+        webcodex_workflow_session::SessionMessageKind::Guidance
+    );
+    assert!(retained[0].requires_ack);
+    assert!(retained[0].first_ack_observed_at.is_none());
+
+    let sent = refresh_once(
+        &runtime,
+        "work-result-collab",
+        &project,
+        &session.session_id,
+        &auth,
+    )
+    .await;
+    assert!(sent.success, "{:?}", sent.error);
+    assert_eq!(
+        sent.output["work_result"]["collaboration"]["messages"][0]["message_id"],
+        message_id
+    );
+    assert_eq!(
+        sent.output["work_result"]["collaboration"]["messages"][0]["state"],
+        "sent"
+    );
+
+    let ack = runtime
+        .sessions
+        .observe_message_acks(&session.session_id, std::slice::from_ref(&message_id));
+    assert_eq!(ack.accepted_count, 1);
+    let seen = refresh_once(
+        &runtime,
+        "work-result-collab",
+        &project,
+        &session.session_id,
+        &auth,
+    )
+    .await;
+    assert_eq!(
+        seen.output["work_result"]["collaboration"]["messages"][0]["state"],
+        "acknowledged"
+    );
+
+    runtime
+        .sessions
+        .resolve_message(
+            &session.session_id,
+            &message_id,
+            Some("Applied the requested constraint.".to_string()),
+        )
+        .unwrap();
+    let handled = refresh_once(
+        &runtime,
+        "work-result-collab",
+        &project,
+        &session.session_id,
+        &auth,
+    )
+    .await;
+    assert_eq!(
+        handled.output["work_result"]["collaboration"]["messages"][0]["state"],
+        "handled"
+    );
+    assert_eq!(
+        handled.output["work_result"]["collaboration"]["messages"][0]["resolution"],
+        "Applied the requested constraint."
+    );
+
+    let replay = runtime
+        .work_result_send_message(
+            project,
+            session.session_id,
+            "Please keep the existing retry mechanism.".to_string(),
+            "card-message-1".to_string(),
+            Some(&auth),
+            None,
+        )
+        .await;
+    assert!(replay.success, "{:?}", replay.error);
+    assert_eq!(replay.output["message_id"], message_id);
+    assert_eq!(replay.output["replayed"], true);
+    assert_eq!(replay.output["state_changed"], false);
+}
+
 #[test]
 fn work_result_tool_contract_requires_exact_project_and_session() {
+    assert!(
+        ToolCall::from_tool_name(
+            "present_changes",
+            json!({
+                "project": "agent:x:y", "session_id": format!("wc_sess_{}", "1".repeat(32))
+            })
+        )
+        .is_err(),
+        "the retired presentation must not parse as a compatibility alias"
+    );
     for name in ["present_work_result", "work_result_state"] {
         assert!(ToolCall::from_tool_name(name, json!({"project": "agent:x:y"})).is_err());
         assert!(ToolCall::from_tool_name(
@@ -504,4 +896,33 @@ fn work_result_tool_contract_requires_exact_project_and_session() {
         .unwrap();
         assert_eq!(call.tool_name(), name);
     }
+
+    for incomplete in [
+        json!({
+            "project": "agent:x:y",
+            "session_id": format!("wc_sess_{}", "1".repeat(32)),
+            "delivery_key": "card-send-1"
+        }),
+        json!({
+            "project": "agent:x:y",
+            "session_id": format!("wc_sess_{}", "1".repeat(32)),
+            "message": "hello"
+        }),
+    ] {
+        assert!(ToolCall::from_tool_name("work_result_send_message", incomplete).is_err());
+    }
+    let send = ToolCall::from_tool_name(
+        "work_result_send_message",
+        json!({
+            "project": "agent:x:y",
+            "session_id": format!("wc_sess_{}", "1".repeat(32)),
+            "message": "hello",
+            "delivery_key": "card-send-1"
+        }),
+    )
+    .unwrap();
+    assert_eq!(send.tool_name(), "work_result_send_message");
 }
+
+#[path = "work_result/frozen_changes.rs"]
+mod frozen_changes;

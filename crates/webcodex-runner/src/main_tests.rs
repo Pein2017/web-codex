@@ -1,5 +1,6 @@
 use super::*;
 use crate::webcodex_runner::config::validate_shell_config;
+use crate::webcodex_runner::job_manager::job_manager_tests::{shell_job_request, ws_sink};
 use crate::webcodex_runner::projects::{project_root_fingerprint, RunnerProjectFile};
 use crate::webcodex_runner::run_shell_with_profiles;
 use crate::webcodex_runner::{
@@ -85,6 +86,7 @@ fn test_config(project_registry_dir: PathBuf) -> RunnerConfig {
         policy: unrestricted_test_policy(),
         shell: ShellConfig::default(),
         skills: crate::webcodex_runner::config::SkillsConfig::default(),
+        instructions: crate::webcodex_runner::config::InstructionsConfig::default(),
         ssh: SshConfig::default(),
         transport: None,
         websocket_connect_timeout_secs: default_websocket_connect_timeout_secs(),
@@ -348,231 +350,6 @@ fn run_profile_shell(
     )
 }
 
-fn shell_job_request(cwd: &Path, command: &str) -> RunnerRequest {
-    RunnerRequest {
-        request_id: "req-job".to_string(),
-        client_id: "ws-client".to_string(),
-        kind: "start_job".to_string(),
-        job_id: Some("job-profile".to_string()),
-        cwd: Some(cwd.to_string_lossy().to_string()),
-        path: None,
-        content: None,
-        max_bytes: None,
-        expected_sha256: None,
-        expected_prefix: None,
-        start_line: None,
-        end_line: None,
-        create_dirs: false,
-        command: command.to_string(),
-        process: None,
-        script: None,
-        stdin: None,
-        timeout_secs: 10,
-        requested_by: "tester".to_string(),
-        created_at: 0,
-        validation: None,
-        lsp: None,
-        job_context: Some(test_job_context(cwd, Vec::new())),
-        mcp_gateway: None,
-        plugin_gateway: None,
-        coding_agent: None,
-        persistent_shell: None,
-    }
-}
-
-#[test]
-fn runner_recovery_context_rejects_cross_product_go_test_metadata() {
-    let temp = tempfile::tempdir().unwrap();
-    let mut request = shell_job_request(temp.path(), "");
-    request.kind = "start_validation_job".to_string();
-    let cargo_step = ShellJobValidationStep {
-        name: "test".to_string(),
-        program: "cargo".to_string(),
-        args: vec!["test".to_string(), "tool_runtime".to_string()],
-        env: Vec::new(),
-    };
-    request.command = serde_json::to_string(&vec![cargo_step.clone()]).unwrap();
-    let context = request.job_context.as_mut().unwrap();
-    context.purpose = Some("validation".to_string());
-    context.validation_steps = vec!["test".to_string()];
-    context.validation = Some(runner_protocol::ShellJobValidationMetadata {
-        tool: "go_test".to_string(),
-        kind: "test".to_string(),
-        steps: vec![cargo_step],
-        effective_timeout_secs: 1800,
-        sync_wait_secs: 10,
-        adapter: "go_test".to_string(),
-        validation_target_id: None,
-        minimum_tests: None,
-        require_tests: None,
-        no_run: None,
-    });
-    let context = context.clone();
-
-    let error = validate_runner_job_context(&context, &request, "ws-client").unwrap_err();
-    assert!(error.contains("validation metadata is invalid"), "{error}");
-}
-
-#[test]
-fn runner_recovery_context_accepts_server_validation_identity_metadata() {
-    let temp = tempfile::tempdir().unwrap();
-    let mut request = shell_job_request(temp.path(), "");
-    request.kind = "start_process_job".to_string();
-    request.process = Some(runner_protocol::ShellProcessArgv {
-        executable: "cargo".to_string(),
-        args: vec!["test".to_string(), "focused".to_string()],
-    });
-    let context = request.job_context.as_mut().unwrap();
-    context.purpose = Some("test".to_string());
-    context.shell = Some("direct_argv".to_string());
-    context.command_preview = "cargo test focused".to_string();
-    context.structured_execution = Some(runner_protocol::ShellJobStructuredExecutionMetadata {
-        execution_source: "run_process".to_string(),
-        language: None,
-        script_bytes: None,
-        arg_count: 2,
-        stdin_present: false,
-        validation_identity: Some("assertion:0123456789abcdef01234567".to_string()),
-        validation_tool: Some("cargo_test".to_string()),
-        assertion_name: Some("runner restart assertion".to_string()),
-    });
-    let context = context.clone();
-
-    validate_runner_job_context(&context, &request, "ws-client").unwrap();
-
-    let mut invalid = context.clone();
-    invalid
-        .structured_execution
-        .as_mut()
-        .unwrap()
-        .validation_identity = Some("target:not-valid".to_string());
-    let error = validate_runner_job_context(&invalid, &request, "ws-client").unwrap_err();
-    assert!(
-        error.contains("structured execution metadata is invalid"),
-        "{error}"
-    );
-
-    let mut detached_assertion = context.clone();
-    let structured = detached_assertion.structured_execution.as_mut().unwrap();
-    structured.execution_source = "run_detached_process".to_string();
-    structured.validation_tool = None;
-    structured.assertion_name = None;
-    assert!(
-        !structured.is_valid(),
-        "assertion identities must remain closed to model-facing process/script Jobs"
-    );
-}
-
-#[test]
-fn runner_recovery_context_accepts_compact_session_base64url_alphabet() {
-    let temp = tempfile::tempdir().unwrap();
-    let mut request = shell_job_request(temp.path(), "printf ok");
-    let context = request.job_context.as_mut().unwrap();
-    context.runtime_project_id = Some("agent:ws-client:demo".to_string());
-    context.workflow_session_id = Some("wc_sess_AAAAAAAA-AAAAAA_".to_string());
-    let context = context.clone();
-
-    validate_runner_job_context(&context, &request, "ws-client").unwrap();
-}
-
-#[test]
-fn runner_recovery_context_accepts_javascript_script_job() {
-    let temp = tempfile::tempdir().unwrap();
-    let script = runner_protocol::ShellScriptPayload {
-        language: runner_protocol::ShellScriptLanguage::Javascript,
-        script: "console.log('recovered');\n".to_string(),
-        args: vec!["literal arg".to_string()],
-    };
-    let mut request = shell_job_request(temp.path(), "");
-    request.kind = "start_script_job".to_string();
-    request.timeout_secs = 60;
-    request.script = Some(script.clone());
-    let context = request.job_context.as_mut().unwrap();
-    context.shell = Some("javascript".to_string());
-    context.command_preview = format!(
-        "javascript script ({} bytes, {} args)",
-        script.script.len(),
-        script.args.len()
-    );
-    context.structured_execution = Some(runner_protocol::ShellJobStructuredExecutionMetadata {
-        execution_source: "run_script".to_string(),
-        language: Some(runner_protocol::ShellScriptLanguage::Javascript),
-        script_bytes: Some(script.script.len()),
-        arg_count: script.args.len(),
-        stdin_present: false,
-        validation_identity: None,
-        validation_tool: None,
-        assertion_name: None,
-    });
-    let context = context.clone();
-
-    validate_runner_job_context(&context, &request, "ws-client").unwrap();
-
-    let mut invalid = context;
-    invalid.shell = Some("node".to_string());
-    let error = validate_runner_job_context(&invalid, &request, "ws-client").unwrap_err();
-    assert!(error.contains("shell is invalid"), "{error}");
-}
-
-#[test]
-fn runner_recovery_context_accepts_typescript_semantic_identity_only() {
-    let temp = tempfile::tempdir().unwrap();
-    let script = runner_protocol::ShellScriptPayload {
-        language: runner_protocol::ShellScriptLanguage::Typescript,
-        script: "const recovered: string = 'ok';\nvoid recovered;\n".to_string(),
-        args: vec!["literal arg".to_string()],
-    };
-    let mut request = shell_job_request(temp.path(), "");
-    request.kind = "start_script_job".to_string();
-    request.timeout_secs = 60;
-    request.script = Some(script.clone());
-    let context = request.job_context.as_mut().unwrap();
-    context.shell = Some("typescript".to_string());
-    context.command_preview = format!(
-        "typescript script ({} bytes, {} args)",
-        script.script.len(),
-        script.args.len()
-    );
-    context.structured_execution = Some(runner_protocol::ShellJobStructuredExecutionMetadata {
-        execution_source: "run_script".to_string(),
-        language: Some(runner_protocol::ShellScriptLanguage::Typescript),
-        script_bytes: Some(script.script.len()),
-        arg_count: script.args.len(),
-        stdin_present: false,
-        validation_identity: None,
-        validation_tool: None,
-        assertion_name: None,
-    });
-    let context = context.clone();
-
-    validate_runner_job_context(&context, &request, "ws-client").unwrap();
-    for concrete_runtime in ["node", "tsx"] {
-        let mut invalid = context.clone();
-        invalid.shell = Some(concrete_runtime.to_string());
-        let error = validate_runner_job_context(&invalid, &request, "ws-client").unwrap_err();
-        assert!(error.contains("shell is invalid"), "{error}");
-    }
-}
-
-fn wait_for_job_envelope(
-    rx: &mut tokio::sync::mpsc::Receiver<RunnerEnvelope>,
-    message: &str,
-) -> RunnerEnvelope {
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        match rx.try_recv() {
-            Ok(envelope) => return envelope,
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => panic!("{message}"),
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                panic!("{message}: channel disconnected")
-            }
-        }
-    }
-}
-
 fn line_edit_json(result: CommandResult) -> serde_json::Value {
     assert_eq!(result.exit_code, Some(0), "unexpected result: {:?}", result);
     assert!(
@@ -590,6 +367,8 @@ fn json_file_op_request(
     payload: serde_json::Value,
 ) -> RunnerRequest {
     RunnerRequest {
+        login: false,
+        shell: None,
         request_id: format!("req-{kind}"),
         client_id: "agent-1".to_string(),
         kind: kind.to_string(),
@@ -1006,7 +785,7 @@ fn wait_until_process_dead(pid: u32, timeout: Duration, tag: &str) -> bool {
 }
 
 /// Parse `KEY=<pid>` from a marker file written by the fixture helper.
-#[cfg(feature = "runner-real-process-tests")]
+#[cfg(any(windows, feature = "runner-real-process-tests"))]
 fn read_marker_pid(marker: &Path, key: &str) -> u32 {
     let text = std::fs::read_to_string(marker).expect("read pid marker");
     text.lines()
@@ -1049,7 +828,7 @@ impl ShellTreeMarkers {
 
     /// Both pids must be dead after cancellation; `PARENT_PID` and
     /// `DESCENDANT_PID` are both written to the parent marker.
-    #[cfg(feature = "runner-real-process-tests")]
+    #[cfg(any(windows, feature = "runner-real-process-tests"))]
     fn assert_tree_dead(&self, tag: &str) {
         let parent = read_marker_pid(&self.parent, "PARENT_PID");
         let descendant = read_marker_pid(&self.parent, "DESCENDANT_PID");
@@ -1077,12 +856,21 @@ impl ShellTreeMarkers {
 fn shell_job_native_exe_nonzero_exit_code_is_preserved() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().to_string_lossy().to_string();
-    let helper = shell_tree_helper();
+    // Use the OS-owned command processor instead of the rustc-built process-tree
+    // fixture. This test only verifies PowerShell native-exit propagation; a freshly
+    // generated EXE can be delayed by Windows malware scanning under parallel CI and
+    // would turn that unrelated startup latency into a false shell timeout.
+    // Allow time for PowerShell startup on a busy Windows CI host as well.
+    let command_processor = std::env::var_os("ComSpec")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .expect("Windows ComSpec must name the native command processor");
     // No fixture-level `exit $LASTEXITCODE`: the PowerShell command wrapper
     // must propagate the native executable's exit code on its own.
     let command = format!(
-        "& {} sleep 0 3",
-        shell_tree_quote(&helper.to_string_lossy())
+        "& {} /d /c {}",
+        shell_tree_quote(&command_processor.to_string_lossy()),
+        shell_tree_quote("exit /b 3")
     );
     let result = run_shell(
         &unrestricted_test_policy(),
@@ -1090,7 +878,7 @@ fn shell_job_native_exe_nonzero_exit_code_is_preserved() {
         Some(&cwd),
         &command,
         None,
-        10,
+        30,
         None,
     );
     assert_eq!(result.exit_code, Some(3), "{result:?}");
@@ -1240,18 +1028,6 @@ fn generated_runner_instance_id_is_non_empty_uuid_like() {
     );
 }
 
-fn ws_sink(client_id: &str) -> (RunnerSink, tokio::sync::mpsc::Receiver<RunnerEnvelope>) {
-    let (tx, rx) = tokio::sync::mpsc::channel::<RunnerEnvelope>(WS_OUTGOING_CAPACITY);
-    (
-        RunnerSink::WebSocket {
-            tx,
-            client_id: client_id.to_string(),
-            runner_instance_id: "ws-inst".to_string(),
-        },
-        rx,
-    )
-}
-
 fn quic_sink(client_id: &str) -> (RunnerSink, tokio::sync::mpsc::Receiver<RunnerEnvelope>) {
     let (tx, rx) = tokio::sync::mpsc::channel::<RunnerEnvelope>(WS_OUTGOING_CAPACITY);
     (
@@ -1264,127 +1040,6 @@ fn quic_sink(client_id: &str) -> (RunnerSink, tokio::sync::mpsc::Receiver<Runner
     )
 }
 
-#[cfg(unix)]
-#[test]
-fn job_manager_stop_all_clears_queue_and_requests_running_stop() {
-    let tmp = tempfile::tempdir().unwrap();
-    let cfg = test_config(tmp.path().join("config/project-registry"));
-    let jobs = JobManager::new(1);
-    let stop_requested = Arc::new(AtomicBool::new(false));
-    let mut running_command =
-        configured_shell_job_command(&ShellConfig::default(), "sleep 60").unwrap();
-    running_command
-        .current_dir(tmp.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let running_child = Arc::new(Mutex::new(
-        ManagedChild::spawn(&mut running_command).unwrap(),
-    ));
-    let running_pid = lock_unpoison(&running_child).id();
-    jobs.jobs.lock().unwrap().insert(
-        "running-job".to_string(),
-        RunningJob {
-            client_id: "ws-client".to_string(),
-            runner_instance_id: "ws-instance".to_string(),
-            snapshot: test_job_snapshot("running-job"),
-            child: Some(Arc::clone(&running_child)),
-            stop_requested: stop_requested.clone(),
-            slot_reserved: true,
-        },
-    );
-    let (sink, mut rx) = ws_sink("ws-client");
-    let request = RunnerRequest {
-        request_id: "req-queued".to_string(),
-        client_id: "ws-client".to_string(),
-        kind: "start_job".to_string(),
-        job_id: Some("queued-job".to_string()),
-        cwd: Some(tmp.path().to_string_lossy().to_string()),
-        path: None,
-        content: None,
-        max_bytes: None,
-        expected_sha256: None,
-        expected_prefix: None,
-        start_line: None,
-        end_line: None,
-        create_dirs: false,
-        command: ": > queued-started".to_string(),
-        process: None,
-        script: None,
-        stdin: None,
-        timeout_secs: 60,
-        requested_by: "tester".to_string(),
-        created_at: 0,
-        validation: None,
-        lsp: None,
-        job_context: Some(test_job_context(tmp.path(), Vec::new())),
-        mcp_gateway: None,
-        plugin_gateway: None,
-        coding_agent: None,
-        persistent_shell: None,
-    };
-    let mut rejected_request = request.clone();
-    rejected_request.request_id = "req-after-shutdown".to_string();
-    rejected_request.job_id = Some("job-after-shutdown".to_string());
-
-    jobs.enqueue(
-        sink,
-        PendingJobStart::from_wire(
-            1,
-            cfg.policy.clone(),
-            cfg.shell.clone(),
-            cfg.ssh.clone(),
-            project_registry_dir(&cfg).unwrap(),
-            request,
-        ),
-    );
-    match wait_for_job_envelope(&mut rx, "queued status was sent") {
-        RunnerEnvelope::JobUpdate { payload } => {
-            assert_eq!(payload.job_id, "queued-job");
-            assert_eq!(payload.status, "agent_queued");
-        }
-        other => panic!("expected job_update, got {:?}", other.kind()),
-    }
-    assert_eq!(jobs.queued.lock().unwrap().len(), 1);
-
-    jobs.stop_all();
-
-    assert!(stop_requested.load(Ordering::SeqCst));
-    assert!(jobs.queued.lock().unwrap().is_empty());
-    assert!(lock_unpoison(&running_child).try_wait().unwrap().is_some());
-    assert!(!job_manager_tests::process_running(running_pid));
-    assert!(
-        !tmp.path().join("queued-started").exists(),
-        "queued job started during shutdown"
-    );
-
-    let (rejected_sink, mut rejected_rx) = ws_sink("ws-client");
-    jobs.enqueue(
-        rejected_sink,
-        PendingJobStart::from_wire(
-            1,
-            cfg.policy.clone(),
-            cfg.shell.clone(),
-            cfg.ssh.clone(),
-            project_registry_dir(&cfg).unwrap(),
-            rejected_request,
-        ),
-    );
-    assert!(jobs.queued.lock().unwrap().is_empty());
-    let rejected = (0..2)
-        .find_map(
-            |_| match wait_for_job_envelope(&mut rejected_rx, "shutdown update was sent") {
-                RunnerEnvelope::JobUpdate { payload } if payload.finished => Some(payload),
-                RunnerEnvelope::JobUpdate { .. } => None,
-                other => panic!("expected job_update, got {:?}", other.kind()),
-            },
-        )
-        .expect("shutdown rejection terminal update was sent");
-    assert_eq!(rejected.job_id, "job-after-shutdown");
-    assert_eq!(rejected.status, "failed");
-    assert!(rejected.finished);
-    assert_eq!(rejected.error.as_deref(), Some("runner is shutting down"));
-}
-
 fn project_policy(root: &Path) -> RunnerPolicy {
     RunnerPolicy {
         allow_cwd_anywhere: false,
@@ -1395,6 +1050,8 @@ fn project_policy(root: &Path) -> RunnerPolicy {
 
 fn project_request(kind: &str, payload: serde_json::Value) -> RunnerRequest {
     RunnerRequest {
+        login: false,
+        shell: None,
         request_id: format!("req-{}", kind),
         client_id: "oe".to_string(),
         kind: kind.to_string(),
@@ -1976,10 +1633,11 @@ fn runner_project_cache_invalidate_refreshes_after_project_op() {
     project_ok(handle_project_op(&cfg.policy, &project_registry_dir, &req));
 
     assert!(
-        cache.get(&cfg).is_empty(),
-        "cache should still be stale before invalidation"
+        !cache.needs_refresh(),
+        "project operation must not mutate this cache instance directly"
     );
     cache.invalidate();
+    assert!(cache.needs_refresh());
     let projects = cache.get(&cfg);
     assert_eq!(projects.len(), 1);
     assert_eq!(projects[0].id, "cached");

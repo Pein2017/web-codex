@@ -7,16 +7,8 @@ use std::time::Duration;
 
 #[path = "runtime_http/tests/import_http_tests.rs"]
 mod import_http_tests;
-#[path = "runtime_http/tests/jobs_tests.rs"]
-mod jobs_tests;
 #[path = "runtime_http/tests/model_ergonomics_tests.rs"]
 mod model_ergonomics_tests;
-#[path = "runtime_http/tests/project_files_tests.rs"]
-mod project_files_tests;
-#[path = "runtime_http/tests/projects_tests.rs"]
-mod projects_tests;
-#[path = "runtime_http/tests/runner_config_tests.rs"]
-mod runner_config_tests;
 
 #[test]
 fn computer_action_audit_projection_omits_sensitive_observation_payloads() {
@@ -34,7 +26,7 @@ fn computer_action_audit_projection_omits_sensitive_observation_payloads() {
         "total_count": 1,
         "truncated": false
     });
-    let targets_audit = action_audit_output_for_tool("computer_list_targets", &targets_output);
+    let targets_audit = action_audit_output_for_tool("computer_observe", &targets_output);
     assert_eq!(
         targets_audit,
         serde_json::json!({"count": 1, "total_count": 1, "truncated": false})
@@ -56,7 +48,7 @@ fn computer_action_audit_projection_omits_sensitive_observation_payloads() {
         "count": 1,
         "truncated": false
     });
-    let list_audit = action_audit_output_for_tool("computer_list_windows", &list_output);
+    let list_audit = action_audit_output_for_tool("computer_observe", &list_output);
     assert_eq!(
         list_audit,
         serde_json::json!({"count": 1, "truncated": false})
@@ -82,7 +74,7 @@ fn computer_action_audit_projection_omits_sensitive_observation_payloads() {
         "file_bytes": 12345,
         "content_base64": "SUPER_SECRET_SCREENSHOT_BYTES"
     });
-    let snapshot_audit = action_audit_output_for_tool("computer_snapshot", &snapshot_output);
+    let snapshot_audit = action_audit_output_for_tool("computer_observe", &snapshot_output);
     let snapshot_serialized = serde_json::to_string(&snapshot_audit).unwrap();
     assert_eq!(snapshot_audit["surface_id"], "surface_safe");
     assert_eq!(snapshot_audit["width"], 900);
@@ -101,7 +93,7 @@ fn computer_action_audit_projection_omits_sensitive_observation_payloads() {
         "text": "REST_AUDIT_SECRET",
         "value": "REST_AUDIT_SECRET"
     });
-    let text_audit = action_audit_output_for_tool("computer_input_text", &text_output);
+    let text_audit = action_audit_output_for_tool("computer_control", &text_output);
     let text_serialized = serde_json::to_string(&text_audit).unwrap();
     assert_eq!(text_audit["surface_id"], "surface_safe");
     assert_eq!(text_audit["element_id"], "element_safe");
@@ -203,10 +195,9 @@ fn runtime_with_local_project(root: &std::path::Path, project_id: &str) -> ToolR
     )
 }
 
-/// Build a router that mirrors the production /api wiring for the new
-/// dedicated project actions: Config, Database, and ToolRuntime are
-/// injected so AuthMiddleware and the handlers resolve state exactly as
-/// in `main.rs`.
+/// Build a router that mirrors the retained production runtime HTTP wiring.
+/// Config, Database, and ToolRuntime are injected so AuthMiddleware and the
+/// canonical handlers resolve state exactly as in `main.rs`.
 fn build_projects_router(
     config: Arc<crate::Config>,
     db: Arc<crate::Database>,
@@ -226,28 +217,32 @@ fn build_projects_router(
                     Router::with_path("artifacts/import")
                         .post(import_conversation_files_to_project),
                 )
-                .push(Router::with_path("projects/list").post(projects_list))
-                .push(Router::with_path("projects/register").post(projects_register))
-                .push(Router::with_path("projects/create").post(projects_create))
-                .push(Router::with_path("projects/git_status").post(projects_git_status))
                 .push(
-                    Router::with_path("projects/apply_unified_diff")
-                        .post(projects_apply_unified_diff),
+                    Router::with_path("projects/resolve-or-register")
+                        .post(projects_resolve_or_register),
                 )
-                .push(Router::with_path("projects/run_shell").post(projects_run_shell))
+                .push(Router::with_path("runtime/status").post(runtime_status)),
+        )
+}
+
+fn build_runner_registration_status_router(
+    config: Arc<crate::Config>,
+    db: Arc<crate::Database>,
+    runtime: Arc<ToolRuntime>,
+    registry: Arc<RunnerRegistry>,
+) -> Router {
+    Router::new()
+        .hoop(affix_state::inject(config))
+        .hoop(affix_state::inject(db))
+        .hoop(affix_state::inject(runtime))
+        .hoop(affix_state::inject(registry))
+        .push(
+            Router::with_path("api")
+                .hoop(crate::AuthMiddleware)
                 .push(
-                    Router::with_path("projects/git_restore_paths")
-                        .post(projects_git_restore_paths),
+                    Router::with_path("shell/agent/register")
+                        .post(crate::runner_http::runner_register),
                 )
-                .push(
-                    Router::with_path("projects/discard_untracked")
-                        .post(projects_discard_untracked),
-                )
-                .push(Router::with_path("projects/run_job").post(projects_run_job))
-                .push(Router::with_path("projects/list_files").post(projects_list_files))
-                .push(Router::with_path("jobs/list").post(jobs_list))
-                .push(Router::with_path("jobs/stop").post(job_stop))
-                .push(Router::with_path("jobs/tail").post(job_tail))
                 .push(Router::with_path("runtime/status").post(runtime_status)),
         )
 }
@@ -317,43 +312,6 @@ async fn register_import_agent_with_capabilities(
 
 async fn register_import_agent(root: &std::path::Path) -> (Arc<ToolRuntime>, Arc<RunnerRegistry>) {
     register_import_agent_with_capabilities(root, None).await
-}
-
-async fn complete_one_agent_request(
-    registry: Arc<RunnerRegistry>,
-    stdout: impl Into<String>,
-    stderr: impl Into<String>,
-    exit_code: i32,
-) {
-    use crate::runner_protocol::{RunnerPollRequest, RunnerResultRequest};
-    let request = loop {
-        if let Some(request) = registry
-            .poll(RunnerPollRequest {
-                client_id: "importer".to_string(),
-                runner_instance_id: "inst-import".to_string(),
-            })
-            .await
-            .unwrap()
-        {
-            break request;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    };
-    registry
-        .complete(RunnerResultRequest {
-            client_id: "importer".to_string(),
-            runner_instance_id: "inst-import".to_string(),
-            request_id: request.request_id,
-            exit_code: Some(exit_code),
-            stdout: Some(stdout.into()),
-            stderr: Some(stderr.into()),
-            stdout_truncated: false,
-            stderr_truncated: false,
-            duration_ms: Some(1),
-            error: None,
-        })
-        .await
-        .unwrap();
 }
 
 fn spawn_startup_agent_executor(registry: Arc<RunnerRegistry>) -> tokio::task::JoinHandle<()> {
@@ -432,11 +390,11 @@ fn spawn_startup_agent_executor(registry: Arc<RunnerRegistry>) -> tokio::task::J
 }
 
 // =========================================================================
-// listProjects
+// list_projects
 // =========================================================================
 
 #[tokio::test]
-async fn all_project_endpoints_require_bearer_auth() {
+async fn retained_runtime_endpoints_require_bearer_auth() {
     let _env = crate::auth::AuthEnvGuard::auth_required();
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
@@ -445,22 +403,12 @@ async fn all_project_endpoints_require_bearer_auth() {
     let service = Service::new(build_projects_router(config, db, runtime));
 
     let endpoints: Vec<(&str, Value)> = vec![
-        ("/api/projects/list", json!({})),
-        ("/api/projects/git_status", json!({"project": "demo"})),
-        (
-            "/api/projects/apply_unified_diff",
-            json!({"project": "demo", "diff": "diff"}),
-        ),
         ("/api/tools/list", json!({})),
         ("/api/tools/call", json!({"tool": "list_tools"})),
         ("/api/runtime/status", json!({})),
         (
-            "/api/projects/register",
-            json!({"client_id": "oe", "id": "my-project", "name": "My Project", "path": "/root/git/my-project"}),
-        ),
-        (
-            "/api/projects/create",
-            json!({"client_id": "oe", "id": "hello", "name": "Hello", "path": "/root/git/hello"}),
+            "/api/projects/resolve-or-register",
+            json!({"client_id": "oe", "path": "/root/git/my-project"}),
         ),
     ];
     for (path, body) in &endpoints {
@@ -479,6 +427,42 @@ async fn all_project_endpoints_require_bearer_auth() {
 // =========================================================================
 // getRuntimeStatus / /api/runtime/status
 // =========================================================================
+
+#[tokio::test]
+async fn retired_dedicated_runtime_routes_are_unmounted() {
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let tmp_proj = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(runtime_with_local_project(tmp_proj.path(), "demo"));
+    let service = Service::new(build_projects_router(config, db, runtime));
+
+    for (group, leaf) in [
+        ("projects", "git_status"),
+        ("projects", "list_files"),
+        ("projects", "apply_unified_diff"),
+        ("projects", "run_shell"),
+        ("projects", "run_job"),
+        ("projects", "git_restore_paths"),
+        ("projects", "discard_untracked"),
+        ("jobs", "list"),
+        ("jobs", "tail"),
+        ("jobs", "stop"),
+        ("projects", "list"),
+        ("projects", "register"),
+        ("projects", "create"),
+        ("projects", "unregister"),
+        ("runners/config", "check"),
+        ("runners/config", "reload"),
+    ] {
+        let path = format!("/api/{group}/{leaf}");
+        let resp = TestClient::post(format!("http://localhost{path}"))
+            .bearer_auth("secret")
+            .json(&json!({}))
+            .send(&service)
+            .await;
+        assert_eq!(effective_status(&resp), StatusCode::NOT_FOUND, "{path}");
+    }
+}
 
 #[tokio::test]
 async fn http_runtime_status_rejects_wrong_bearer() {
@@ -546,6 +530,160 @@ async fn http_runtime_status_correct_bearer_returns_summary() {
     }
 }
 
+#[test]
+fn http_runtime_status_after_runner_registration_fits_default_worker_stack() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("build production-shaped runtime status regression runtime");
+
+    runtime.block_on(async {
+        tokio::spawn(async {
+            use crate::runner_protocol::{
+                RunnerBuildInfo, RunnerPolicySummary, RunnerProjectSummary, RunnerRegisterRequest,
+                ShellJobInventory,
+            };
+
+            let config = test_config(Some("secret"));
+            let (_tmp, db) = test_db();
+            let registry = Arc::new(RunnerRegistry::default());
+            let tool_runtime = Arc::new(ToolRuntime::new_for_tests_with_runner_registry(
+                registry.clone(),
+            ));
+            let service = Service::new(build_runner_registration_status_router(
+                config,
+                db,
+                tool_runtime,
+                registry.clone(),
+            ));
+            let policy: RunnerPolicySummary = serde_json::from_value(json!({
+                "allow_raw_shell": true,
+                "allow_cwd_anywhere": true,
+                "allowed_roots": ["/root"],
+                "max_timeout_secs": 60,
+                "max_output_bytes": 262144,
+                "shell_profiles": {
+                    "default_profile": null,
+                    "configured_count": 0,
+                    "prepared_cache_count": 0,
+                    "profiles": [],
+                    "default_dialect": "sh",
+                    "available_dialects": ["sh", "bash"]
+                },
+                "tool_providers": {
+                    "strategy": "native",
+                    "claude_code": {
+                        "enabled": false,
+                        "version": null,
+                        "available": false,
+                        "process_state": "not_started",
+                        "discovered_tool_names": [],
+                        "capabilities": {"search_project_text": "unmapped"},
+                        "last_error_code": null
+                    }
+                },
+                "mcp_gateway_providers": []
+            }))
+            .expect("realistic current Runner policy fixture");
+            let mut registration =
+                crate::test_support::current_runner_registration(RunnerRegisterRequest {
+                    process_started_at: Some(1),
+                    build: Some(RunnerBuildInfo {
+                        version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                        git_commit: Some("0123456789abcdef".to_string()),
+                        git_dirty: Some(false),
+                        built_at: Some("100".to_string()),
+                        target: Some("x86_64-unknown-linux-gnu".to_string()),
+                        architecture: Some("x86_64".to_string()),
+                    }),
+                    job_concurrency_limit: Some(4),
+                    job_inventory: Some(ShellJobInventory {
+                        active_complete: true,
+                        jobs: Vec::new(),
+                    }),
+                    coding_agent_providers: None,
+                    coding_agent_inventory: None,
+                    client_id: "status-stack-runner".to_string(),
+                    runner_instance_id: "status-stack-instance".to_string(),
+                    runner_protocol_generation:
+                        crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+                    display_name: Some("Status Stack Runner".to_string()),
+                    owner: Some("status-stack".to_string()),
+                    hostname: Some("status-stack-host".to_string()),
+                    host_context: None,
+                    capabilities: Default::default(),
+                    policy: Some(policy),
+                });
+            registration.capabilities.job_state_reconciliation = true;
+
+            let mut register = TestClient::post("http://localhost/api/shell/agent/register")
+                .bearer_auth("secret")
+                .json(&registration)
+                .send(&service)
+                .await;
+            let register_status = effective_status(&register);
+            if register_status != StatusCode::OK {
+                let body: Value = register.take_json().await.unwrap_or(Value::Null);
+                panic!("realistic Runner registration failed with {register_status}: {body}");
+            }
+            crate::test_support::apply_project_inventory_snapshot(
+                registry.as_ref(),
+                "status-stack-runner",
+                "status-stack-instance",
+                vec![RunnerProjectSummary {
+                    id: "smoke-proj".to_string(),
+                    name: Some("Smoke Project".to_string()),
+                    path: "/tmp/status-stack-project".to_string(),
+                    allow_patch: true,
+                    kind: Some("repo".to_string()),
+                    registration_source: None,
+                    description: None,
+                    hooks: Vec::new(),
+                    disabled: false,
+                    revision: None,
+                    root_fingerprint: None,
+                    lineage: None,
+                    git_branch: Some("main".to_string()),
+                    git_head: None,
+                    git_dirty: Some(false),
+                    updated_at: 1,
+                    shell_profile: None,
+                }],
+            )
+            .await;
+
+            let mut status = TestClient::post("http://localhost/api/runtime/status")
+                .bearer_auth("secret")
+                .json(&json!({}))
+                .send(&service)
+                .await;
+            assert_eq!(effective_status(&status), StatusCode::OK);
+            let body: Value = status.take_json().await.unwrap();
+            assert_eq!(body["success"], true);
+            assert_eq!(body["output"]["agents"]["count"], 1);
+            assert_eq!(
+                body["output"]["agents"]["clients"][0]["client_id"],
+                "status-stack-runner"
+            );
+            assert_eq!(
+                body["output"]["agents"]["clients"][0]["build"]["built_at"],
+                "100"
+            );
+            assert_eq!(
+                body["output"]["agents"]["clients"][0]["build"]["target"],
+                "x86_64-unknown-linux-gnu"
+            );
+            assert_eq!(
+                body["output"]["agents"]["clients"][0]["build"]["architecture"],
+                "x86_64"
+            );
+        })
+        .await
+        .expect("runtime status regression task must not abort or panic");
+    });
+}
+
 #[tokio::test]
 async fn http_runtime_status_optional_body_accepts_empty_and_rejects_malformed_json() {
     let config = test_config(Some("secret"));
@@ -575,7 +713,7 @@ async fn http_runtime_status_optional_body_accepts_empty_and_rejects_malformed_j
 }
 
 // =========================================================================
-// Legacy /api/tools/call generic entry point
+// Generic /api/tools/call entry point
 // =========================================================================
 
 fn phase2_service() -> (tempfile::TempDir, salvo::Service) {
@@ -728,11 +866,10 @@ async fn http_tools_call_full_trace_captures_pre_dispatch_error_response() {
 }
 
 #[tokio::test]
-async fn flattened_tool_manifest_audit_intent_survives_null_params_wrapper() {
+async fn tool_manifest_audit_intent_uses_explicit_params() {
     let (tool, params) = extract_tool_call(&json!({
         "tool": "tool_manifest",
-        "params": null,
-        "intent": "audit",
+        "params": {"intent": "audit"},
     }))
     .unwrap();
     let call = ToolCall::from_tool_name(&tool, params).unwrap();
@@ -753,13 +890,14 @@ async fn flattened_tool_manifest_audit_intent_survives_null_params_wrapper() {
 }
 
 #[tokio::test]
-async fn flattened_tool_manifest_exact_name_survives_null_params_wrapper() {
+async fn tool_manifest_exact_name_uses_explicit_params() {
     let (tool, params) = extract_tool_call(&json!({
         "tool": "tool_manifest",
-        "params": null,
-        "tool_name": "cargo_test",
-        "include_recommended_flows": false,
-        "include_risk_summary": false,
+        "params": {
+            "tool_name": "cargo_test",
+            "include_recommended_flows": false,
+            "include_risk_summary": false
+        },
     }))
     .unwrap();
     let call = ToolCall::from_tool_name(&tool, params).unwrap();
@@ -776,25 +914,13 @@ async fn flattened_tool_manifest_exact_name_survives_null_params_wrapper() {
 }
 
 #[tokio::test]
-async fn http_start_coding_task_flattened_legacy_params_do_not_revive_unknown_tool() {
-    let config = test_config(Some("secret"));
-    let (_tmp, db) = test_db();
-    let tmp_proj = tempfile::tempdir().unwrap();
-    let (runtime, _registry) = register_import_agent(tmp_proj.path()).await;
-    let service = Service::new(build_projects_router(config, db, runtime));
-
+async fn http_tools_call_rejects_flattened_arguments_with_migration_guidance() {
+    let (_tmp, service) = phase2_service();
     let mut resp = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
         .json(&json!({
-            "tool": "start_coding_task",
-            "params": null,
-            "project": "agent:importer:demo",
-            "include_runtime_status": false,
-            "include_git": false,
-            "include_recent_commits": false,
-            "include_rules": false,
-            "include_tool_manifest": true,
-            "tool_manifest_intent": "audit",
+            "tool": "git_status",
+            "project": "agent:importer:demo"
         }))
         .send(&service)
         .await;
@@ -803,7 +929,9 @@ async fn http_start_coding_task_flattened_legacy_params_do_not_revive_unknown_to
     let body: Value = resp.take_json().await.unwrap();
     assert_eq!(body["status"], 400);
     let error = body["error"].as_str().unwrap_or_default();
-    assert!(error.contains("unknown tool 'start_coding_task'"), "{body}");
+    assert!(error.contains("unexpected top-level field"), "{body}");
+    assert!(error.contains("'project'"), "{body}");
+    assert!(error.contains("'params'"), "{body}");
 }
 
 // =========================================================================
@@ -831,16 +959,21 @@ async fn http_start_coding_task_uses_ordinary_unknown_tool_path() {
 }
 
 #[test]
-fn extract_tool_call_params_precede_flattened_fields() {
-    let (tool, params) = extract_tool_call(&json!({
-        "tool": "git_status",
-        "project": "wrong",
-        "params": {"project": "right"},
-    }))
-    .unwrap();
+fn extract_tool_call_rejects_unexpected_top_level_fields_even_with_params() {
+    for params in [Value::Null, json!({"project": "right"})] {
+        let error = extract_tool_call(&json!({
+            "tool": "git_status",
+            "project": "wrong",
+            "params": params,
+        }))
+        .unwrap_err();
 
-    assert_eq!(tool, "git_status");
-    assert_eq!(params, json!({"project": "right"}));
+        assert!(error.contains("unexpected top-level field"));
+        assert!(error.contains("'project'"));
+        assert!(error.contains("'params'"));
+        assert!(!error.contains("wrong"));
+        assert!(!error.contains("right"));
+    }
 }
 
 #[test]
@@ -917,7 +1050,6 @@ fn extract_tool_call_rejects_retired_arguments_envelope() {
     for arguments in [json!(null), json!({"project": "right"})] {
         let error = extract_tool_call(&json!({
             "tool": "git_status",
-            "project": "flattened",
             "arguments": arguments,
         }))
         .unwrap_err();
@@ -928,14 +1060,16 @@ fn extract_tool_call_rejects_retired_arguments_envelope() {
 }
 
 #[test]
-fn extract_tool_call_collects_flattened_top_level_fields() {
-    let (tool, params) = extract_tool_call(&json!({
+fn extract_tool_call_keeps_recording_session_id_out_of_explicit_params() {
+    let body = json!({
         "tool": "git_status",
-        "project": "agent:oe:webcodex",
-        "session_id": "wc_sess_tool_arg",
+        "params": {
+            "project": "agent:oe:webcodex",
+            "session_id": "wc_sess_tool_arg"
+        },
         TOOL_CALL_RECORDING_SESSION_ID_FIELD: "wc_sess_recorder",
-    }))
-    .unwrap();
+    });
+    let (tool, params) = extract_tool_call(&body).unwrap();
 
     assert_eq!(tool, "git_status");
     assert_eq!(
@@ -943,23 +1077,23 @@ fn extract_tool_call_collects_flattened_top_level_fields() {
         json!({"project": "agent:oe:webcodex", "session_id": "wc_sess_tool_arg"})
     );
     assert_eq!(
-        extract_recording_session_id(
-            &json!({TOOL_CALL_RECORDING_SESSION_ID_FIELD: "wc_sess_recorder"})
-        ),
+        extract_recording_session_id(&body),
         Some("wc_sess_recorder".to_string())
     );
 }
 
 #[test]
-fn extract_tool_call_collects_flattened_session_handoff_flags() {
+fn extract_tool_call_accepts_explicit_session_handoff_params() {
     let body = json!({
         "tool": "session_handoff_summary",
-        "project": "agent:special:test-mcp",
-        "session_id": "wc_sess_test",
-        "include_validation": true,
-        "include_workspace": true,
-        "include_checkpoints": true,
-        "limit": 20,
+        "params": {
+            "project": "agent:special:test-mcp",
+            "session_id": "wc_sess_test",
+            "include_validation": true,
+            "include_workspace": true,
+            "include_checkpoints": true,
+            "limit": 20
+        },
         TOOL_CALL_RECORDING_SESSION_ID_FIELD: "wc_sess_recorder"
     });
     let (tool, params) = extract_tool_call(&body).unwrap();
@@ -989,13 +1123,15 @@ fn extract_tool_call_collects_flattened_session_handoff_flags() {
 }
 
 #[test]
-fn extract_tool_call_collects_flattened_write_project_file_fields() {
+fn extract_tool_call_accepts_explicit_write_project_file_params() {
     let (tool, params) = extract_tool_call(&json!({
         "tool": "write_project_file",
-        "project": "agent:oe:webcodex",
-        "path": "x.tmp",
-        "content": "BETA\n",
-        "overwrite": true,
+        "params": {
+            "project": "agent:oe:webcodex",
+            "path": "x.tmp",
+            "content": "BETA\n",
+            "overwrite": true
+        },
     }))
     .unwrap();
 
@@ -1008,16 +1144,14 @@ fn extract_tool_call_collects_flattened_write_project_file_fields() {
 
 #[test]
 #[cfg(feature = "workspace-checkpoints")]
-fn extract_tool_call_collects_flattened_checkpoint_restore_fields() {
-    // GPT Action flattened call for workspace_checkpoint_restore: the
-    // recorder metadata (recording_session_id) must be stripped from
-    // params while the business fields (project/checkpoint_id/confirm)
-    // are collected into params for concrete dispatch.
+fn extract_tool_call_accepts_explicit_checkpoint_restore_params() {
     let body = json!({
         "tool": "workspace_checkpoint_restore",
-        "project": "agent:special:test",
-        "checkpoint_id": "wc_ckpt_abc",
-        "confirm": true,
+        "params": {
+            "project": "agent:special:test",
+            "checkpoint_id": "wc_ckpt_abc",
+            "confirm": true
+        },
         TOOL_CALL_RECORDING_SESSION_ID_FIELD: "wc_sess_record"
     });
     let (tool, params) = extract_tool_call(&body).unwrap();
@@ -1040,19 +1174,19 @@ fn extract_tool_call_collects_flattened_checkpoint_restore_fields() {
 }
 
 #[test]
-fn extract_tool_call_collects_flattened_apply_text_edits_fields() {
-    // GPT Action flattened call for apply_text_edits: nested `changes`
-    // array and scalar flattened fields must be collected into params.
+fn extract_tool_call_accepts_explicit_apply_text_edits_params() {
     let (tool, params) = extract_tool_call(&json!({
         "tool": "apply_text_edits",
-        "project": "agent:special:test",
-        "dry_run": true,
-        "changes": [{
-            "kind": "edit",
-            "path": "a.txt",
-            "expected_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "edits": [{"kind": "replace_exact", "old_text": "a", "new_text": "b"}]
-        }]
+        "params": {
+            "project": "agent:special:test",
+            "dry_run": true,
+            "changes": [{
+                "kind": "edit",
+                "path": "a.txt",
+                "expected_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "edits": [{"kind": "replace_exact", "old_text": "a", "new_text": "b"}]
+            }]
+        }
     }))
     .unwrap();
 
@@ -1198,6 +1332,18 @@ async fn http_tools_call_rejects_malformed_and_unknown_request_matrix() {
             false,
         ),
         (
+            "missing params for argumented tool",
+            json!({"tool": "git_status"}),
+            vec!["git_status", "project"],
+            false,
+        ),
+        (
+            "null params for argumented tool",
+            json!({"tool": "git_status", "params": null}),
+            vec!["git_status", "project"],
+            false,
+        ),
+        (
             "missing outer tool",
             json!({"params": {}}),
             vec!["tool"],
@@ -1257,8 +1403,10 @@ async fn start_session_returns_session_id() {
         .bearer_auth("secret")
         .json(&json!({
             "tool": "start_session",
-            "project": "demo",
-            "title": "implement show_changes follow-up"
+            "params": {
+                "project": "demo",
+                "title": "implement show_changes follow-up"
+            }
         }))
         .send(&service)
         .await;
@@ -1291,8 +1439,10 @@ async fn session_summary_empty_session() {
         .bearer_auth("secret")
         .json(&json!({
             "tool": "session_summary",
-            "session_id": session_id,
-            "limit": 50
+            "params": {
+                "session_id": session_id,
+                "limit": 50
+            }
         }))
         .send(&service)
         .await;
@@ -1394,11 +1544,13 @@ async fn api_tools_call_accepts_hidden_testing_metadata_and_records_expectation(
         .bearer_auth("secret")
         .json(&json!({
             "tool": "job_status",
-            TOOL_CALL_RECORDING_SESSION_ID_FIELD: session_id,
-            "job_id": "missing-job",
-            "expected_failure": true,
-            "expected_failure_kind": "invalid_arguments",
-            "assertion_name": "api hidden metadata compatibility"
+            "params": {
+                "job_id": "missing-job",
+                "expected_failure": true,
+                "expected_failure_kind": "invalid_arguments",
+                "assertion_name": "api hidden metadata compatibility"
+            },
+            TOOL_CALL_RECORDING_SESSION_ID_FIELD: session_id
         }))
         .send(&service)
         .await;
@@ -1427,11 +1579,81 @@ async fn api_tools_call_accepts_hidden_testing_metadata_and_records_expectation(
 }
 
 #[tokio::test]
+async fn api_hidden_handoff_state_reads_exact_session_without_recording_it() {
+    let config = test_config(Some("secret"));
+    let (_db_tmp, db) = test_db();
+    let project_tmp = tempfile::tempdir().unwrap();
+    std::fs::write(project_tmp.path().join("README.md"), "hello\n").unwrap();
+    let (runtime, registry) = register_import_agent_with_capabilities(
+        project_tmp.path(),
+        Some(crate::runner_protocol::RunnerCapabilities {
+            shell: true,
+            git: true,
+            ..Default::default()
+        }),
+    )
+    .await;
+    let executor = spawn_startup_agent_executor(registry);
+    let service = Service::new(build_projects_router(config, db, runtime.clone()));
+    let project = "agent:importer:demo";
+
+    let mut resp = TestClient::post("http://localhost/api/tools/call")
+        .bearer_auth("secret")
+        .json(&json!({
+            "tool": "start_session",
+            "params": {"project": project, "title": "local handoff target"}
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(effective_status(&resp), StatusCode::OK);
+    let start_body: Value = resp.take_json().await.unwrap();
+    let session_id = start_body["output"]["session_id"]
+        .as_str()
+        .expect("start_session id")
+        .to_string();
+    let before = runtime
+        .sessions
+        .summary(&session_id, None)
+        .expect("business Session before hidden handoff read");
+
+    let mut resp = TestClient::post("http://localhost/api/tools/call")
+        .bearer_auth("secret")
+        .json(&json!({
+            "tool": "session_handoff_state",
+            "params": {"project": project, "session_id": session_id}
+        }))
+        .send(&service)
+        .await;
+    let status = effective_status(&resp);
+    let body: Value = resp.take_json().await.unwrap();
+    executor.abort();
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["success"], true, "{body}");
+    assert_eq!(body["output"]["project"], project);
+    assert_eq!(body["output"]["session_id"], session_id);
+    assert_eq!(
+        body["output"]["handoff_brief"]["session"]["session_id"],
+        session_id
+    );
+    assert_eq!(
+        body["output"]["handoff_brief"]["external_observations"]["provenance"],
+        "external_report"
+    );
+    let after = runtime
+        .sessions
+        .summary(&session_id, None)
+        .expect("business Session after hidden handoff read");
+    assert_eq!(after.events_total, before.events_total);
+    assert_eq!(after.updated_at, before.updated_at);
+}
+
+#[tokio::test]
 async fn api_tools_call_uses_recording_session_id_for_recorder_metadata() {
     let (_tmp, service) = phase2_service();
     let mut resp = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
-        .json(&json!({"tool": "start_session", "title": "tracking"}))
+        .json(&json!({"tool": "start_session", "params": {"title": "tracking"}}))
         .send(&service)
         .await;
     let tracking_body: Value = resp.take_json().await.unwrap();
@@ -1439,7 +1661,7 @@ async fn api_tools_call_uses_recording_session_id_for_recorder_metadata() {
 
     let mut resp = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
-        .json(&json!({"tool": "start_session", "title": "business"}))
+        .json(&json!({"tool": "start_session", "params": {"title": "business"}}))
         .send(&service)
         .await;
     let business_body: Value = resp.take_json().await.unwrap();
@@ -1449,7 +1671,7 @@ async fn api_tools_call_uses_recording_session_id_for_recorder_metadata() {
         .bearer_auth("secret")
         .json(&json!({
             "tool": "session_summary",
-            "session_id": business_session_id,
+            "params": {"session_id": business_session_id},
             TOOL_CALL_RECORDING_SESSION_ID_FIELD: tracking_session_id
         }))
         .send(&service)
@@ -1468,7 +1690,7 @@ async fn api_tools_call_uses_recording_session_id_for_recorder_metadata() {
         .bearer_auth("secret")
         .json(&json!({
             "tool": "session_summary",
-            "session_id": tracking_session_id
+            "params": {"session_id": tracking_session_id}
         }))
         .send(&service)
         .await;
@@ -1496,7 +1718,7 @@ async fn api_tools_call_message_tool_keeps_business_session_id_with_recording_se
     let (_tmp, service) = phase2_service();
     let mut resp = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
-        .json(&json!({"tool": "start_session", "title": "tracking"}))
+        .json(&json!({"tool": "start_session", "params": {"title": "tracking"}}))
         .send(&service)
         .await;
     let tracking_body: Value = resp.take_json().await.unwrap();
@@ -1504,7 +1726,7 @@ async fn api_tools_call_message_tool_keeps_business_session_id_with_recording_se
 
     let mut resp = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
-        .json(&json!({"tool": "start_session", "title": "business"}))
+        .json(&json!({"tool": "start_session", "params": {"title": "business"}}))
         .send(&service)
         .await;
     let business_body: Value = resp.take_json().await.unwrap();
@@ -1514,12 +1736,14 @@ async fn api_tools_call_message_tool_keeps_business_session_id_with_recording_se
         .bearer_auth("secret")
         .json(&json!({
             "tool": "post_session_message",
-            "session_id": business_session_id,
-            TOOL_CALL_RECORDING_SESSION_ID_FIELD: tracking_session_id,
-            "kind": "guidance",
-            "message": "Keep this behind call_runtime_tool.",
-            "tags": ["openapi", "constraint"],
-            "priority": "normal"
+            "params": {
+                "session_id": business_session_id,
+                "kind": "guidance",
+                "message": "Keep this behind call_runtime_tool.",
+                "tags": ["openapi", "constraint"],
+                "priority": "normal"
+            },
+            TOOL_CALL_RECORDING_SESSION_ID_FIELD: tracking_session_id
         }))
         .send(&service)
         .await;
@@ -1536,8 +1760,10 @@ async fn api_tools_call_message_tool_keeps_business_session_id_with_recording_se
         .bearer_auth("secret")
         .json(&json!({
             "tool": "list_session_messages",
-            "session_id": business_session_id,
-            "kind": "guidance"
+            "params": {
+                "session_id": business_session_id,
+                "kind": "guidance"
+            }
         }))
         .send(&service)
         .await;
@@ -1559,7 +1785,7 @@ async fn api_tools_call_message_tool_keeps_business_session_id_with_recording_se
         .bearer_auth("secret")
         .json(&json!({
             "tool": "session_summary",
-            "session_id": tracking_session_id
+            "params": {"session_id": tracking_session_id}
         }))
         .send(&service)
         .await;
@@ -1582,8 +1808,10 @@ async fn read_only_session_allows_post_session_message_metadata() {
         .bearer_auth("secret")
         .json(&json!({
             "tool": "start_session",
-            "title": "readonly message board",
-            "mode": "read_only"
+            "params": {
+                "title": "readonly message board",
+                "mode": "read_only"
+            }
         }))
         .send(&service)
         .await;
@@ -1595,9 +1823,11 @@ async fn read_only_session_allows_post_session_message_metadata() {
         .bearer_auth("secret")
         .json(&json!({
             "tool": "post_session_message",
-            "session_id": session_id,
-            "kind": "progress",
-            "message": "Read-only sessions may still record collaboration metadata."
+            "params": {
+                "session_id": session_id,
+                "kind": "progress",
+                "message": "Read-only sessions may still record collaboration metadata."
+            }
         }))
         .send(&service)
         .await;
@@ -1608,7 +1838,7 @@ async fn read_only_session_allows_post_session_message_metadata() {
 
     let mut resp = TestClient::post("http://localhost/api/tools/call")
         .bearer_auth("secret")
-        .json(&json!({"tool": "session_summary", "session_id": session_id}))
+        .json(&json!({"tool": "session_summary", "params": {"session_id": session_id}}))
         .send(&service)
         .await;
     assert_eq!(effective_status(&resp), StatusCode::OK);
@@ -1677,23 +1907,33 @@ async fn http_tools_call_rejects_arguments_even_when_params_are_present() {
 }
 
 #[tokio::test]
-async fn http_tools_call_rejects_app_only_work_result_state() {
+async fn http_tools_call_rejects_app_only_work_result_operations() {
     let (_tmp, service) = phase2_service();
-    let (status, body) = http_tool_call(
-        &service,
-        json!({
-            "tool": "work_result_state",
-            "params": {
+    for (tool, params) in [
+        (
+            "work_result_state",
+            json!({
                 "project": "agent:canonical:p",
                 "session_id": format!("wc_sess_{}", "1".repeat(32))
-            }
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(body["error"]
-        .as_str()
-        .is_some_and(|error| error.contains("Work Result App state")));
+            }),
+        ),
+        (
+            "work_result_send_message",
+            json!({
+                "project": "agent:canonical:p",
+                "session_id": format!("wc_sess_{}", "1".repeat(32)),
+                "message": "hello",
+                "delivery_key": "http-must-not-call-app-tool"
+            }),
+        ),
+    ] {
+        let (status, body) =
+            http_tool_call(&service, json!({"tool": tool, "params": params})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{tool}: {body}");
+        assert!(body["error"].as_str().is_some_and(|error| {
+            error.contains("Work Result App") && error.contains("Stateless MCP 2026")
+        }));
+    }
 }
 
 #[tokio::test]
@@ -2162,7 +2402,6 @@ async fn gpt_action_direct_and_gateway_admission_fail_closed() {
     for tool in [
         "present_goal_plan",
         "present_agent_continuation",
-        "export_project_artifact",
         "definitely_not_a_tool",
     ] {
         let (status, body, _) = oauth_action_call(&service, "secret", tool, json!({})).await;
@@ -2229,6 +2468,62 @@ async fn gpt_action_direct_and_gateway_admission_fail_closed() {
             .unwrap_or("")
             .contains("not available through GPT Actions"));
     }
+}
+
+#[tokio::test]
+async fn gpt_action_suggested_call_projection_preserves_canonical_generic_result() {
+    let (_tmp, service) = phase2_service();
+    let root = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(root.path())
+        .status()
+        .expect("git init");
+    assert!(status.success());
+    let path = root
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let arguments = json!({
+        "client_id": "missing-493-action-runner",
+        "path": path,
+        "instruction": "recover the unknown Runner"
+    });
+
+    let (_status, canonical) = http_tool_call(
+        &service,
+        json!({"tool": "work_on_project", "params": arguments.clone()}),
+    )
+    .await;
+    assert_eq!(canonical["success"], false, "{canonical}");
+    assert_eq!(
+        canonical["output"]["suggested_call"]["tool"],
+        "list_runners"
+    );
+
+    let (status, projected, _) =
+        oauth_action_call(&service, "secret", "work_on_project", arguments).await;
+    assert_ne!(status, StatusCode::NOT_FOUND, "{projected}");
+    assert_eq!(projected["success"], false, "{projected}");
+    let suggested = &projected["output"]["suggested_call"];
+    assert_eq!(suggested["tool"], "call_runtime_tool");
+    assert_eq!(suggested["arguments"]["tool"], "list_runners");
+    assert_eq!(
+        suggested["arguments"]["arguments"],
+        json!({"include_projects": false, "summary_only": true})
+    );
+
+    let (status, recovery, _) = oauth_action_call(
+        &service,
+        "secret",
+        suggested["tool"].as_str().unwrap(),
+        suggested["arguments"].clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{recovery}");
+    assert_eq!(recovery["success"], true, "{recovery}");
 }
 
 #[tokio::test]

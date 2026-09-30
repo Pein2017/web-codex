@@ -6,6 +6,7 @@ use super::super::helpers::*;
 use super::super::*;
 use super::support::*;
 use crate::runner_protocol::{RunnerCapabilities, RunnerResultRequest};
+use crate::tool_runtime::tool_audit::ToolCallAuditProjection;
 use crate::tool_runtime::ToolRuntime;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -552,7 +553,7 @@ fn git_diff_hunks_tool_is_known_and_schema_is_bounded() {
         assert_eq!(props[field]["maxLength"], 40);
         assert_eq!(props[field]["pattern"], "^[0-9A-Fa-f]{40}$");
     }
-    assert!(spec.input_schema["allOf"].is_array());
+    assert!(spec.input_schema.get("allOf").is_none());
     let committed_call = ToolCall::from_tool_name(
         "git_diff_hunks",
         json!({
@@ -3756,7 +3757,10 @@ async fn git_diff_hunks_binary_records_advance_across_byte_bounded_pages() {
         bytes[1] = index as u8;
         fs::write(repo.path().join(name), bytes).unwrap();
     }
-    git_test_command_ok(repo.path(), "git add -- . && git commit -m binary-baseline");
+    git_test_command_ok(
+        repo.path(),
+        "git add -- . && git commit -q -m binary-baseline",
+    );
     for (index, name) in names.iter().enumerate() {
         let mut bytes = vec![0u8; 512];
         bytes[1] = index as u8;
@@ -6175,6 +6179,22 @@ async fn show_changes_untracked_sensitive_path_preview_is_skipped() {
     );
 }
 
+#[tokio::test]
+async fn show_changes_untracked_public_dotenv_template_preview_is_visible() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    fs::write(
+        tmp.path().join(".env.example"),
+        "PUBLIC_EXAMPLE_MARKER=fake\n",
+    )
+    .unwrap();
+
+    let output = show_changes_output_from_command(tmp.path(), true);
+    let preview = preview_for_path(&output, ".env.example");
+    assert_eq!(preview["kind"], "text");
+    assert_eq!(preview["lines"][0]["text"], "PUBLIC_EXAMPLE_MARKER=fake");
+}
+
 #[test]
 fn git_diff_hunks_command_is_read_only_and_scoped_to_paths() {
     let command = git_diff_hunks_command(&["src/lib.rs".to_string()], false).unwrap();
@@ -7198,19 +7218,27 @@ fn git_review_summary_tool_schema_metadata_and_oauth_are_read_only() {
         }
         other => panic!("expected git_review_summary, got {other:?}"),
     }
-    let request_audit = crate::tool_runtime::tool_audit::session_log_arguments_for_tool_request(
-        "git_review_summary",
-        &json!({
-            "project": SAMPLE_PROJECT,
-            "base_commit": "a".repeat(40),
-            "head_commit": "b".repeat(40),
-            "source_body": "must-not-persist"
-        }),
-    );
+    let malformed_request_audit =
+        crate::tool_runtime::tool_audit::session_log_arguments_for_tool_request(
+            "git_review_summary",
+            &json!({
+                "project": SAMPLE_PROJECT,
+                "base_commit": "a".repeat(40),
+                "head_commit": "b".repeat(40),
+                "source_body": "must-not-persist"
+            }),
+        );
+    assert_eq!(malformed_request_audit, json!({}));
+    let request_audit = ToolCall::GitReviewSummary {
+        project: SAMPLE_PROJECT.to_string(),
+        base_commit: "a".repeat(40),
+        head_commit: "b".repeat(40),
+        session_id: None,
+    }
+    .session_log_arguments();
     assert_eq!(request_audit["project"], SAMPLE_PROJECT);
     assert_eq!(request_audit["base_commit"], "a".repeat(40));
     assert_eq!(request_audit["head_commit"], "b".repeat(40));
-    assert!(request_audit.get("source_body").is_none());
     assert_eq!(request_audit["base_commit_valid"], true);
     assert_eq!(request_audit["head_commit_valid"], true);
     let malformed = "source-like-invalid-value".repeat(1024);
@@ -7897,12 +7925,12 @@ async fn show_changes_degrades_gracefully_for_non_git_project() {
     assert_reason_list_contains(
         &result.output["verdict"],
         "warning_reasons",
-        "git_unavailable",
+        "non_git_project",
     );
     let actions = result.output["suggested_next_actions"].as_array().unwrap();
     assert!(actions
         .iter()
-        .any(|a| a.as_str().unwrap().contains("unavailable")));
+        .any(|a| a.as_str().unwrap().contains("not applicable")));
     assert_eq!(result.output["status_observation"]["status"], "non_git");
     assert_eq!(
         result.output["head"],
@@ -8147,11 +8175,11 @@ fn non_git_show_changes_preserves_unobserved_state() {
     assert_eq!(output["clean"], Value::Null);
     assert_eq!(output["counts"]["conflicted"], Value::Null);
     assert_eq!(output["upstream_status"], "unobserved");
-    assert_eq!(output["upstream_reason_code"], "git_unavailable");
+    assert_eq!(output["upstream_reason_code"], "non_git_project");
     assert_eq!(output["upstream"], Value::Null);
     assert_eq!(output["ahead"], Value::Null);
     assert_eq!(output["behind"], Value::Null);
-    assert_reason_list_contains(&output["verdict"], "warning_reasons", "git_unavailable");
+    assert_reason_list_contains(&output["verdict"], "warning_reasons", "non_git_project");
 }
 
 #[test]

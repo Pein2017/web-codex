@@ -6,6 +6,8 @@ mod mutations;
 mod shared;
 mod show_changes;
 
+pub(super) use self::show_changes::SHOW_CHANGES_MAX_STATUS_FILES;
+
 #[cfg(test)]
 pub(crate) use self::diff_hunks::{
     git_diff_hunks_command, parse_git_diff_hunks, GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES,
@@ -18,8 +20,6 @@ pub(crate) use self::log::{
 };
 #[cfg(test)]
 pub(crate) use self::mutations::{parse_git_commit_marker, GIT_COMMIT_RESULT_PREFIX};
-pub(crate) use self::show_changes::SHOW_CHANGES_MAX_STATUS_FILES;
-
 #[cfg(test)]
 pub(crate) use self::show_changes::{
     apply_show_changes_session, collect_show_changes_untracked_previews_for_root,

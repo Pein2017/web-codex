@@ -8,14 +8,9 @@ use crate::metadata::{
     ToolRisk::{Read, WorkflowManage},
     COMMUNICATION_MANAGE, COMMUNICATION_READ, TOOL_PROVIDER_CONTROL,
 };
-use crate::registry::input_schemas::{
-    associate_goal_agent_task_input_schema, associate_goal_workflow_session_input_schema,
-    create_goal_input_schema, get_goal_input_schema, list_goals_input_schema,
-    present_goal_plan_input_schema, update_goal_input_schema,
-};
 use webcodex_core::authority::{
     COMMUNICATION_MANAGE_SCOPES, COMMUNICATION_READ_SCOPES, SCOPE_COMMUNICATION_MANAGE,
-    SCOPE_COMMUNICATION_READ, SCOPE_SESSION_COLLABORATE,
+    SCOPE_COMMUNICATION_READ, SCOPE_PROJECT_READ, SCOPE_RUNTIME_READ, SCOPE_SESSION_COLLABORATE,
 };
 
 const GOAL_SESSION_ASSOCIATE_SCOPES: &[&str] = &[
@@ -25,6 +20,44 @@ const GOAL_SESSION_ASSOCIATE_SCOPES: &[&str] = &[
 ];
 
 pub(super) const DEFINITIONS: &[ToolDefinition] = &[
+    require_all_scopes(
+        model_spec(
+            def(
+                "prepare_goal_workflow",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::pointer("goal_id", "/goal/summary/goal_id"),
+                    super::ToolAuditResultField::pointer("lifecycle", "/goal/summary/lifecycle"),
+                    super::ToolAuditResultField::pointer("revision", "/goal/summary/revision"),
+                    super::ToolAuditResultField::pointer(
+                        "workflow_session_count",
+                        "/goal/summary/workflow_session_count",
+                    ),
+                    super::ToolAuditResultField::value("created"),
+                    super::ToolAuditResultField::value("replayed"),
+                    super::ToolAuditResultField::value("state_changed"),
+                    super::ToolAuditResultField::value("error_kind"),
+                ]),
+                ModelVisible,
+                TOOL_CATEGORY_GOAL,
+                None,
+                TOOL_PROVIDER_CONTROL,
+                super::ToolSemanticContract {
+                    effect: super::ToolEffect::Mutate,
+                    risk: WorkflowManage,
+                    approval: super::ToolApprovalPolicy::Standard,
+                    idempotency: super::ToolIdempotency::Keyed,
+                },
+                Some(COMMUNICATION_MANAGE),
+                false,
+                NoPath,
+                false,
+                false,
+                super::ToolSessionEvidencePolicy::NONE,
+            ),
+            "Atomically admit one new durable Goal together with one exact independently authorized Workflow Session correlation and an optional explicit owned controller Agent. The Store commits Goal + correlation + keyed replay identity in one transaction at revision 1. This operation is Host-neutral: it never infers identity from a Window, creates/rotates Endpoints, mounts MCP Apps, establishes Host bindings, creates Wakes, or proves continuation readiness. Use present_goal_plan separately; if automatic continuation is desired, independently establish or verify the controller through the agent_continuation_setup flow.",
+        ),
+        GOAL_SESSION_ASSOCIATE_SCOPES,
+    ),
     require_all_scopes(
         model_spec(
             def(
@@ -55,8 +88,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
             ),
-            "Create one explicit durable high-level Goal owned by the current management principal. Goal is intent/control state only: creation never selects a Project, starts a Workflow Session, claims an AgentTaskAttempt, reaches a Runner, or dispatches a Job.",
-            create_goal_input_schema,
+            "Create a durable Goal with fixed bounded completion intent and plan for substantial multi-step or cross-turn work; reuse an existing Goal when appropriate. Tiny lookups/trivial edits do not need one. Explicitly associate the current Workflow Session, then checkpoint recovery-worthy milestones. For automatic continuation supply an exact owned controller Agent and use the existing continuation carrier. Reuse an already-callable Agent from explicit durable setup or exact Wake context, never from Window inference. Controller identity routes attention only and grants no execution authority.",
         ),
         COMMUNICATION_MANAGE_SCOPES,
     ),
@@ -87,8 +119,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
             ),
-            "Read one exact caller-owned durable Goal. Unauthorized and nonexistent ids are existence-hidden. Correlations expose only bounded identities and never target-domain authority, fences, tokens, credentials, Job state, or Workflow Session ledgers.",
-            get_goal_input_schema,
+            "Read one exact caller-owned durable Goal, including its optional durable controller Agent identity. Unauthorized and nonexistent Goal ids are existence-hidden. Controller/correlation identities are routing or correlation only and never target-domain authority, Endpoint/window bindings, fences, tokens, credentials, Job state, or Workflow Session ledgers.",
         ),
         COMMUNICATION_READ_SCOPES,
     ),
@@ -128,8 +159,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                     false,
                     super::ToolSessionEvidencePolicy::NONE,
                 ),
-                "Present one exact caller-owned durable Goal as a sparse read-only Goal Plan MCP App card. Requires explicit goal_id and never infers Goal identity from Project, Workflow Session, Conversation, credential, ClientWindow, or recent activity. Presentation creates no work, grants no execution authority, and does not modify Goal lifecycle.",
-                present_goal_plan_input_schema,
+                "Present one exact caller-owned durable Goal as a sparse read-only Goal Plan MCP App card, including only the optional durable controller Agent identity and never its Endpoint/window bindings. Requires explicit goal_id and never infers Goal or controller identity from Project, Workflow Session, Conversation, credential, ClientWindow, or recent activity. Presentation creates no work, grants no execution authority, and does not modify Goal lifecycle.",
             )
             .with_gpt_action_unsupported(),
             17,
@@ -138,7 +168,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
     ),
     require_all_scopes(
         def(
-            "goal_plan_state",
+            "goal_plan_sync",
             super::ToolAuditPolicy::typed_fields(&[
                 super::ToolAuditResultField::pointer("goal_id", "/goal_plan/goal_id"),
                 super::ToolAuditResultField::pointer("lifecycle", "/goal_plan/lifecycle"),
@@ -158,12 +188,12 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             None,
             TOOL_PROVIDER_CONTROL,
             super::ToolSemanticContract {
-                effect: super::ToolEffect::Observe,
-                risk: Read,
-                approval: super::ToolApprovalPolicy::None,
-                idempotency: super::ToolIdempotency::PureRead,
+                effect: super::ToolEffect::Mutate,
+                risk: WorkflowManage,
+                approval: super::ToolApprovalPolicy::Standard,
+                idempotency: super::ToolIdempotency::DesiredState,
             },
-            Some(COMMUNICATION_READ),
+            Some(COMMUNICATION_MANAGE),
             false,
             NoPath,
             false,
@@ -174,7 +204,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             super::ToolActivityPresentation::Transport,
             super::ToolActivityInteraction::NonMeaningful,
         ),
-        COMMUNICATION_READ_SCOPES,
+        &[SCOPE_COMMUNICATION_READ, SCOPE_COMMUNICATION_MANAGE, SCOPE_RUNTIME_READ, SCOPE_SESSION_COLLABORATE, SCOPE_PROJECT_READ],
     ),
     require_all_scopes(
         model_spec(
@@ -206,9 +236,42 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 super::ToolSessionEvidencePolicy::NONE,
             ),
             "List bounded Goals visible to the current owner principal, optionally filtered by authoritative lifecycle. List projection omits objective, terminal reason, and exact correlation identities.",
-            list_goals_input_schema,
         ),
         COMMUNICATION_READ_SCOPES,
+    ),
+    require_all_scopes(
+        model_spec(
+            def(
+                "checkpoint_goal",
+                super::ToolAuditPolicy::typed_fields(&[
+                    super::ToolAuditResultField::pointer("goal_id", "/goal/summary/goal_id"),
+                    super::ToolAuditResultField::pointer("lifecycle", "/goal/summary/lifecycle"),
+                    super::ToolAuditResultField::pointer("revision", "/goal/summary/revision"),
+                    super::ToolAuditResultField::value("created"),
+                    super::ToolAuditResultField::value("replayed"),
+                    super::ToolAuditResultField::value("state_changed"),
+                    super::ToolAuditResultField::value("error_kind"),
+                ]),
+                ModelVisible,
+                TOOL_CATEGORY_GOAL,
+                None,
+                TOOL_PROVIDER_CONTROL,
+                super::ToolSemanticContract {
+                    effect: super::ToolEffect::Mutate,
+                    risk: WorkflowManage,
+                    approval: super::ToolApprovalPolicy::Standard,
+                    idempotency: super::ToolIdempotency::Keyed,
+                },
+                Some(COMMUNICATION_MANAGE),
+                false,
+                NoPath,
+                false,
+                false,
+                super::ToolSessionEvidencePolicy::NONE,
+            ),
+            "Checkpoint one exact owned active Goal at a recovery-worthy milestone. Atomically complete selected stable step ids, optionally select one current step, and record a bounded summary using the exact revision and idempotency key. The whole batch validates before mutation; completed steps never regress, at most one step is in_progress, and each new checkpoint increments revision once. Exact replay is read-only; changed replay conflicts. Terminal Goals are immutable. This is progress truth, not effect replay, execution authority, or a routine session_handoff_summary requirement.",
+        ),
+        COMMUNICATION_MANAGE_SCOPES,
     ),
     require_all_scopes(
         model_spec(
@@ -240,8 +303,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
             ),
-            "Update bounded Goal metadata or explicitly transition active to completed/cancelled using an exact revision and idempotency key. Terminal Goal state is immutable. No execution domain is mutated or inferred from this transition.",
-            update_goal_input_schema,
+            "Update bounded Goal metadata, explicitly replace its exact independently authorized durable controller Agent, or transition active to completed/cancelled using an exact revision and idempotency key. Omitted controller preserves the current routing identity; terminal Goal state is immutable. Controller routing grants no execution authority and no execution domain is inferred or mutated. Complete every plan step with checkpoint_goal and freshly verify/review before explicitly completing a Goal; the Server cannot judge natural-language completion conditions.",
         ),
         COMMUNICATION_MANAGE_SCOPES,
     ),
@@ -274,7 +336,6 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 super::ToolSessionEvidencePolicy::NONE,
             ),
             "Explicitly correlate one owned active Goal with one exact owned AgentTask after independently re-authorizing that AgentTask. The link is identity-only and grants no TaskAttempt, CodingAgentRun, Project, Runner, filesystem, or Job authority.",
-            associate_goal_agent_task_input_schema,
         ),
         COMMUNICATION_MANAGE_SCOPES,
     ),
@@ -307,7 +368,6 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 super::ToolSessionEvidencePolicy::NONE,
             ),
             "Explicitly correlate one owned active Goal with one exact Workflow Session after independently re-authorizing the Session through its existing authority fingerprint and any bound Project authorization. The Goal link is never a Session or Project credential.",
-            associate_goal_workflow_session_input_schema,
         ),
         GOAL_SESSION_ASSOCIATE_SCOPES,
     ),

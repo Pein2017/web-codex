@@ -8,7 +8,87 @@ use super::session_context::{
 use super::{permissions, session_context, sessions, ToolCall, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
 use crate::tool_runtime::project_resolution::{ProjectResolverError, ResolvedProject};
+use crate::tool_runtime::tool_audit::ToolCallAuditProjection;
+use crate::tool_runtime::tool_inputs::CodingGuidanceProfile;
 use serde_json::Value;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanonicalProjectOutput {
+    Canonical,
+    Requested,
+}
+
+/// Select only inner adapters that still perform an auth-less legacy Project
+/// lookup. The outer dispatcher has already resolved and authorized the caller's
+/// selector under the current principal; these adapters need that canonical id
+/// for execution. The output mode is decided in the same match so adding another
+/// legacy adapter cannot silently change whether its `project` field echoes the
+/// caller selector or the canonical execution target.
+fn canonical_execution_project_binding(
+    call: &mut ToolCall,
+) -> Option<(&mut String, CanonicalProjectOutput)> {
+    match call {
+        ToolCall::GitDiffHunks { project, .. }
+        | ToolCall::GitReviewSummary { project, .. }
+        | ToolCall::ShowChanges { project, .. }
+        | ToolCall::WorkspaceHygieneCheck { project, .. } => {
+            Some((project, CanonicalProjectOutput::Requested))
+        }
+        #[cfg(feature = "workspace-checkpoints")]
+        ToolCall::WorkspaceCheckpointCreate { project, .. }
+        | ToolCall::WorkspaceCheckpointList { project, .. }
+        | ToolCall::WorkspaceCheckpointShow { project, .. }
+        | ToolCall::WorkspaceCheckpointRestore { project, .. }
+        | ToolCall::WorkspaceCheckpointDelete { project, .. } => {
+            Some((project, CanonicalProjectOutput::Requested))
+        }
+        ToolCall::RunProcess { project, .. }
+        | ToolCall::RunDetachedProcess { project, .. }
+        | ToolCall::StartAgentTaskCodingRun { project, .. }
+        | ToolCall::RunScript { project, .. }
+        | ToolCall::RunShell { project, .. }
+        | ToolCall::OpenSessionShell { project, .. }
+        | ToolCall::SessionShellExec { project, .. }
+        | ToolCall::SessionShellStatus { project, .. }
+        | ToolCall::CloseSessionShell { project, .. }
+        | ToolCall::ApplyPatch { project, .. }
+        | ToolCall::ApplyUnifiedDiff { project, .. }
+        | ToolCall::DeleteProjectFiles { project, .. }
+        | ToolCall::GitRestorePaths { project, .. }
+        | ToolCall::DiscardUntracked { project, .. }
+        | ToolCall::GitCommitPaths { project, .. }
+        | ToolCall::GitStatus { project, .. }
+        | ToolCall::GitLog { project, .. }
+        | ToolCall::CargoFmt { project, .. }
+        | ToolCall::CargoCheck { project, .. }
+        | ToolCall::CargoTest { project, .. }
+        | ToolCall::GoTest { project, .. }
+        | ToolCall::ListProjectFiles { project, .. }
+        | ToolCall::ListProjectTrackedFiles { project, .. }
+        | ToolCall::ProjectOverview { project, .. }
+        | ToolCall::WriteProjectFile { project, .. }
+        | ToolCall::SaveProjectArtifact { project, .. }
+        | ToolCall::ProjectArtifact { project, .. }
+        | ToolCall::ReadProjectArtifactMetadata { project, .. }
+        | ToolCall::ReadProjectArtifact { project, .. }
+        | ToolCall::ArtifactUploadBegin { project, .. }
+        | ToolCall::ArtifactUploadChunk { project, .. }
+        | ToolCall::ArtifactUploadFinish { project, .. }
+        | ToolCall::ArtifactUploadAbort { project, .. }
+        | ToolCall::ApplyTextEdits { project, .. }
+        | ToolCall::LspStatus { project, .. }
+        | ToolCall::DocumentSymbols { project, .. }
+        | ToolCall::DocumentDiagnostics { project, .. }
+        | ToolCall::Hover { project, .. }
+        | ToolCall::WorkspaceSymbols { project, .. }
+        | ToolCall::GotoDefinition { project, .. }
+        | ToolCall::FindReferences { project, .. }
+        | ToolCall::CallHierarchy { project, .. } => {
+            Some((project, CanonicalProjectOutput::Canonical))
+        }
+        _ => None,
+    }
+}
 
 /// Add the Phase A lifecycle tuple to a definite pre-execution structured
 /// execution denial without changing generic denial helpers used by unrelated
@@ -18,10 +98,12 @@ pub(super) fn decorate_structured_execution_prestart_denial(
     result: &mut ToolResult,
     fallback_failure_kind: &'static str,
 ) {
-    if !matches!(
+    let structured_execution = matches!(
         tool_name,
-        "run_process" | "run_detached_process" | "run_script"
-    ) {
+        "run_process" | "run_detached_process" | "run_script" | "run_skill_resource"
+    );
+    let structured_mutation = tool_name == "apply_text_edits";
+    if !structured_execution && !structured_mutation {
         return;
     }
     let mut output = match std::mem::take(&mut result.output) {
@@ -43,12 +125,18 @@ pub(super) fn decorate_structured_execution_prestart_denial(
         "execution_state".to_string(),
         Value::String("not_started".to_string()),
     );
-    output.insert("command_started".to_string(), Value::Bool(false));
-    output.insert("command_completed".to_string(), Value::Bool(false));
-    output.insert("command_ok".to_string(), Value::Bool(false));
-    output.insert("exit_code".to_string(), Value::Null);
     output.insert("failure_kind".to_string(), Value::String(failure_kind));
     output.insert("tool_failure".to_string(), Value::Bool(true));
+    if structured_mutation {
+        // These Runtime gates precede business mutation dispatch, so the
+        // canonical mutation result can authoritatively prove no state changed.
+        output.insert("state_changed".to_string(), Value::Bool(false));
+    } else {
+        output.insert("command_started".to_string(), Value::Bool(false));
+        output.insert("command_completed".to_string(), Value::Bool(false));
+        output.insert("command_ok".to_string(), Value::Bool(false));
+        output.insert("exit_code".to_string(), Value::Null);
+    }
     result.output = Value::Object(output);
 }
 
@@ -176,15 +264,16 @@ fn sparsify_structured_validation_runtime_metadata(tool_name: &str, result: &mut
 /// structured execution, but only after the complete ToolResult has already
 /// been recorded into the Session ledger. Failure/uncertain/Job projections
 /// remain explicit because they participate in retry and reconciliation safety.
-pub(super) fn sparsify_terminal_structured_execution_success(
-    tool_name: &str,
-    result: &mut ToolResult,
-) {
+fn sparsify_terminal_structured_execution_success(tool_name: &str, result: &mut ToolResult) {
     if is_structured_validation_tool(tool_name) {
         sparsify_terminal_structured_validation_success(tool_name, result);
         return;
     }
-    if !matches!(tool_name, "run_process" | "run_script") || !result.success {
+    if !matches!(
+        tool_name,
+        "run_process" | "run_script" | "run_skill_resource"
+    ) || !result.success
+    {
         return;
     }
     let Some(output) = result.output.as_object_mut() else {
@@ -257,7 +346,7 @@ pub(super) fn sparsify_terminal_structured_execution_success(
     }
 
     let summary_key = match tool_name {
-        "run_process" => "process_summary",
+        "run_process" | "run_skill_resource" => "process_summary",
         "run_script" => "script_summary",
         _ => unreachable!("structured execution sparsifier is tool-gated"),
     };
@@ -311,7 +400,10 @@ pub(super) fn sparsify_failure_model_result_metadata(tool_name: &str, result: &m
     }
     output.remove("session_recorded");
     output.remove("session_event_id");
-    if matches!(tool_name, "run_process" | "run_script") {
+    if matches!(
+        tool_name,
+        "run_process" | "run_script" | "run_skill_resource"
+    ) {
         for key in [
             "executor",
             "duration_ms",
@@ -322,7 +414,7 @@ pub(super) fn sparsify_failure_model_result_metadata(tool_name: &str, result: &m
             output.remove(key);
         }
         output.remove(match tool_name {
-            "run_process" => "process_summary",
+            "run_process" | "run_skill_resource" => "process_summary",
             "run_script" => "script_summary",
             _ => unreachable!("structured failure sparsifier is tool-gated"),
         });
@@ -356,6 +448,22 @@ fn add_run_process_expectation_projection(
         "expectation_satisfied".to_string(),
         Value::Bool(expectation_satisfied),
     );
+}
+
+fn apply_text_edits_model_projection(result: &mut ToolResult) {
+    if !result.success {
+        return;
+    }
+    let Some(files) = result.output.get_mut("files").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for file in files {
+        let Some(file) = file.as_object_mut() else {
+            continue;
+        };
+        file.remove("old_sha256");
+        file.remove("new_sha256");
+    }
 }
 
 enum SearchModelProjection {
@@ -398,6 +506,7 @@ enum ModelFacingProjection {
     None,
     JobHandoff,
     AgentWait,
+    ApplyTextEdits,
     Read(super::read_files::ReadModelProjection),
     Search(SearchModelProjection),
 }
@@ -408,6 +517,7 @@ enum ModelFacingProjection {
 /// so callers cannot branch on tool-specific result policy.
 pub(super) struct ModelFacingProjectionPlan {
     projection: ModelFacingProjection,
+    tool_name: &'static str,
 }
 
 impl ModelFacingProjectionPlan {
@@ -416,8 +526,10 @@ impl ModelFacingProjectionPlan {
             ToolCall::WaitForAgentEvents { .. }
             | ToolCall::ReadAgentWait { .. }
             | ToolCall::CancelAgentWait { .. } => ModelFacingProjection::AgentWait,
+            ToolCall::ApplyTextEdits { .. } => ModelFacingProjection::ApplyTextEdits,
             ToolCall::RunJob { .. }
             | ToolCall::RunProcess { .. }
+            | ToolCall::RunSkillResource { .. }
             | ToolCall::RunScript { .. }
             | ToolCall::RunShell { .. }
             | ToolCall::RunDetachedProcess { .. }
@@ -433,7 +545,10 @@ impl ModelFacingProjectionPlan {
             }
             _ => ModelFacingProjection::None,
         };
-        Self { projection }
+        Self {
+            projection,
+            tool_name: call.tool_name(),
+        }
     }
 
     pub(super) fn bind_resolved_project(&mut self, resolved: Option<&ResolvedProject>) {
@@ -459,6 +574,7 @@ impl ModelFacingProjectionPlan {
             ModelFacingProjection::AgentWait => {
                 super::agent_wait::agent_wait_model_projection(result)
             }
+            ModelFacingProjection::ApplyTextEdits => apply_text_edits_model_projection(result),
             ModelFacingProjection::JobHandoff => {
                 super::jobs::sparsify_job_handoff_model_result(result)
             }
@@ -523,6 +639,8 @@ impl ModelFacingProjectionPlan {
                 }
             }
         }
+        sparsify_terminal_structured_execution_success(self.tool_name, result);
+        sparsify_structured_validation_runtime_metadata(self.tool_name, result);
     }
 }
 
@@ -962,13 +1080,18 @@ impl ToolRuntime {
     /// the owner boundary and capability requirements through
     /// `authorize_runner_tool`; local-executor tools are unaffected. Wrappers
     /// stay thin: they only forward the depot `AuthContext` here.
-    pub async fn dispatch_with_auth(
-        &self,
+    pub fn dispatch_with_auth<'a>(
+        &'a self,
         call: ToolCall,
-        auth: Option<&AuthContext>,
-    ) -> ToolResult {
-        self.dispatch_with_auth_transport(call, auth, sessions::SessionTransport::Api)
-            .await
+        auth: Option<&'a AuthContext>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ToolResult> + Send + 'a>> {
+        // The canonical dispatcher has grown into a large multi-specialist future. Keep that
+        // state on the heap at the public dispatch boundary so direct callers do not need a
+        // multi-megabyte stack frame merely to enter ToolRuntime.
+        Box::pin(async move {
+            self.dispatch_with_auth_transport(call, auth, sessions::SessionTransport::Api)
+                .await
+        })
     }
 
     pub(crate) async fn dispatch_with_auth_transport(
@@ -1088,6 +1211,15 @@ impl ToolRuntime {
     /// plan after the same authoritative Project resolution used for execution.
     /// The returned ToolResult is still canonical with respect to domain-local
     /// budgeting and sparse projection so an outer recorder can consume it first.
+    fn context_guidance_profile(call: &ToolCall) -> CodingGuidanceProfile {
+        match call {
+            ToolCall::WorkOnProject {
+                guidance_profile, ..
+            } => *guidance_profile,
+            _ => CodingGuidanceProfile::default(),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context_with_result_projection(
         &self,
@@ -1106,6 +1238,7 @@ impl ToolRuntime {
         super::window_activity::ToolCallCorrelation,
     ) {
         let mut result_projection = ModelFacingProjectionPlan::capture(&call);
+        let context_guidance_profile = Self::context_guidance_profile(&call);
         let immediate_tool_name = call.tool_name();
         let immediate_expectation = recorder_metadata.expectation.clone();
         let mut correlation = super::window_activity::ToolCallCorrelation::default();
@@ -1139,12 +1272,14 @@ impl ToolRuntime {
         // answering the explicit sidecar request conservatively: static material
         // remains available, but project-scoped material must not guess a target.
         if !context_request.is_empty() && result.output.get("context_projection").is_none() {
-            self.add_requested_context_projection(
+            self.add_requested_context_projection_with_guidance(
                 &mut result,
                 &context_request,
                 None,
                 auth,
                 material_capabilities,
+                context_guidance_profile,
+                window,
             )
             .await;
         }
@@ -1180,6 +1315,15 @@ impl ToolRuntime {
                 } => Some(crate::runner_http::process_preview(
                     executable,
                     args.iter().map(String::as_str),
+                )),
+                ToolCall::RunSkillResource {
+                    skill_id,
+                    path,
+                    args,
+                    ..
+                } => Some(format!(
+                    "trusted skill resource {skill_id}:{path} ({} args)",
+                    args.len()
                 )),
                 ToolCall::RunDetachedProcess { args, .. } => {
                     Some(format!("detached process ({} args)", args.len()))
@@ -1217,7 +1361,7 @@ impl ToolRuntime {
         if model_facing {
             let session_output =
                 super::tool_audit::session_log_result_for_tool(tool_name, &result.output);
-            let recorded = self.sessions.record_model_facing_tool_call_finished(
+            self.sessions.record_tool_call_finished(
                 start,
                 success,
                 &session_output,
@@ -1225,14 +1369,12 @@ impl ToolRuntime {
                 error_kind,
             );
             add_session_hint(result, &self.sessions, session_id);
-            if let Some(recorded) = recorded.as_ref() {
-                session_context::add_session_context_continuity(result, recorded);
-            }
             if let Some(ack) = ack_observation {
                 session_context::add_session_attention_projection(
                     result,
                     &self.sessions,
                     session_id,
+                    "business_session",
                     ack,
                     ack_requested,
                 );
@@ -1272,11 +1414,10 @@ impl ToolRuntime {
                 recorder_metadata.recording_session_id.as_deref(),
                 auth,
                 transport,
-                &recorder_metadata.ack_session_message_ids,
             )
             .await
             {
-                Ok(invocation) => invocation.to_tool_result(self),
+                Ok(invocation) => invocation.to_tool_result(),
                 Err(crate::tool_runtime::specialized::SpecializedGovernanceDenial::Scope {
                     required_scope,
                     description,
@@ -1351,6 +1492,7 @@ impl ToolRuntime {
         } else {
             resolved_project.cloned()
         };
+        let context_guidance_profile = Self::context_guidance_profile(&call);
         // work_on_project.session_id is explicit coding-resume business input,
         // never a generic tool recorder. Its implementation delegates exact
         // Session/project/lifecycle/authority handling to the coding workflow
@@ -1397,7 +1539,7 @@ impl ToolRuntime {
         } else {
             None
         };
-        let session_contract = super::sessions::session_tool_contract(call.tool_name());
+        let mut session_contract = super::sessions::session_tool_contract(call.tool_name());
         let session_project_mismatch = session_id.as_deref().and_then(|session_id| {
             match (
                 self.sessions.session_project(session_id),
@@ -1460,6 +1602,7 @@ impl ToolRuntime {
                     if matches!(
                         &call,
                         ToolCall::RunProcess { .. }
+                            | ToolCall::RunSkillResource { .. }
                             | ToolCall::RunDetachedProcess { .. }
                             | ToolCall::RunScript { .. }
                             | ToolCall::RunShell { .. }
@@ -1475,6 +1618,64 @@ impl ToolRuntime {
                     call = call.with_session_execution_context(&execution_context);
                 }
             }
+        }
+        // Recovery is admitted only after the existing helper proves an exact
+        // canonical shell call. Re-enter all later guards with RunShell as the
+        // authoritative tool identity; RunProcess never dispatches shell text.
+        let mut shell_normalization = None;
+        if let Some(recovery) = self
+            .process_shell_recovery_call(
+                &call,
+                &recorder_metadata.expectation,
+                ssh_resource.as_deref(),
+                resolved_project,
+            )
+            .await
+        {
+            let arguments = recovery["arguments"].clone();
+            let login = arguments["login"] == true;
+            if let Err(error) = super::kernel::check_runtime_tool_scope(auth, "run_shell") {
+                let detail = match error {
+                    super::kernel::ToolCallErrorStatus::InsufficientScope {
+                        description, ..
+                    } => description,
+                    super::kernel::ToolCallErrorStatus::InvalidArguments { message } => message,
+                };
+                return ToolResult::err_with_output(
+                    detail,
+                    serde_json::json!({
+                        "failure_kind": "insufficient_scope", "execution_state": "not_started",
+                        "command_started": false, "requested_surface": "run_process",
+                        "execution_source": "run_shell"
+                    }),
+                );
+            }
+            call = ToolCall::from_tool_name("run_shell", arguments)
+                .expect("recovery helper validated canonical run_shell");
+            if let Some(session_id) = session_id.as_deref() {
+                if let Err(mut denial) = self
+                    .authorize_session_target(session_id, "run_shell", auth)
+                    .await
+                {
+                    decorate_structured_execution_prestart_denial(
+                        "run_shell",
+                        &mut denial,
+                        "session_authority_denied",
+                    );
+                    return denial;
+                }
+            }
+            session_contract = super::sessions::session_tool_contract("run_shell");
+            shell_normalization = Some(if login {
+                "run_process_bash_lc_to_login_run_shell"
+            } else {
+                match &call {
+                    ToolCall::RunShell {
+                        shell: Some(shell), ..
+                    } if shell.as_str() == "sh" => "run_process_sh_c_to_run_shell",
+                    _ => "run_process_bash_c_to_run_shell",
+                }
+            });
         }
         if let Some(session_id) = session_id.as_deref() {
             // Lifecycle denial is orthogonal to mode/guards and wins first.
@@ -1596,7 +1797,7 @@ impl ToolRuntime {
         let permission = super::permissions::evaluate_permission_for_tool(
             &self.permission_evaluator,
             call.tool_name(),
-            call.project(),
+            activity_project.as_deref().or_else(|| call.project()),
         );
         if let Some(decision) = permission.as_ref() {
             if !decision.allows_execution() {
@@ -1630,6 +1831,7 @@ impl ToolRuntime {
         let activity_context =
             Self::capture_workspace_activity_context(&call, activity_project.as_deref());
         let validation_assertion_name = recorder_metadata.expectation.assertion_name.as_deref();
+        let logical_invocation_id = recorder_metadata.logical_invocation_id.as_deref();
         let tool_name = call.tool_name();
         let trusted_recording_session_id = recorder_metadata
             .recording_session_authorized
@@ -1639,21 +1841,78 @@ impl ToolRuntime {
             .recording_session_authorized
             .then(|| recorder_metadata.recording_session_project.as_deref())
             .flatten();
-        let mut result = self
-            .dispatch_authorized_inner(
-                call,
-                auth,
-                transport,
-                window,
-                ssh_resource.as_deref(),
-                validation_assertion_name,
-                project_resolution,
-                trusted_recording_session_id,
-                trusted_recording_session_project,
-                protocol_capabilities,
-                correlation,
+        let source_mutation = if super::validation_source::observes_potential_mutation(&call) {
+            activity_project
+                .as_deref()
+                .and_then(|project| self.validation_sources.begin(project))
+        } else {
+            None
+        };
+        // Resolve model-facing Project selectors exactly once under the current
+        // authenticated principal, then bind only legacy inner adapters that still
+        // perform auth-less ProjectConfig lookups to the authorized canonical id.
+        // Do not rewrite every Project-bearing ToolCall: work_on_project preserves
+        // the caller selector in its output, Work Result deliberately requires an
+        // exact canonical input, and newer adapters consume the retained
+        // ResolvedProject or re-resolve with the current AuthContext themselves.
+        let mut requested_project_output = None;
+        if let Some(resolved) = project_resolution
+            .as_ref()
+            .and_then(|resolution| resolution.as_ref().ok())
+        {
+            if let Some((project, output_mode)) = canonical_execution_project_binding(&mut call) {
+                if output_mode == CanonicalProjectOutput::Requested {
+                    requested_project_output = Some(project.clone());
+                }
+                project.clone_from(&resolved.resolved_id);
+            }
+        }
+        let read_scope = super::read_cache::ReadScope::new(
+            auth,
+            session_id.as_deref().or(trusted_recording_session_id),
+        );
+        let mut result = super::read_cache::READ_SCOPE
+            .scope(
+                read_scope,
+                self.dispatch_authorized_inner(
+                    call,
+                    auth,
+                    transport,
+                    window,
+                    ssh_resource.as_deref(),
+                    validation_assertion_name,
+                    project_resolution,
+                    trusted_recording_session_id,
+                    trusted_recording_session_project,
+                    logical_invocation_id,
+                    protocol_capabilities,
+                    correlation,
+                ),
             )
             .await;
+        if let Some(requested_project) = requested_project_output {
+            if result.output.get("project").is_some() {
+                result.output["project"] = serde_json::Value::String(requested_project);
+            }
+        }
+        if let Some(observation) = source_mutation {
+            observation.finish(&result);
+        }
+        if let Some(code) = shell_normalization {
+            result.output["requested_surface"] = serde_json::json!("run_process");
+            result.output["execution_source"] = serde_json::json!("run_shell");
+            if result.success {
+                let hint = match code {
+                    "run_process_bash_lc_to_login_run_shell" => {
+                        "normalized run_process bash -lc → run_shell(login=true)"
+                    }
+                    "run_process_sh_c_to_run_shell" => "normalized run_process sh -c → run_shell",
+                    _ => "normalized run_process bash -c → run_shell",
+                };
+                result.output["input_normalization"] =
+                    serde_json::json!({"code": code, "hint": hint});
+            }
+        }
         let permission = permission.filter(|_| {
             !permissions::is_hard_denied_output(&result.output, result.error.as_deref())
         });
@@ -1717,22 +1976,16 @@ impl ToolRuntime {
                 );
             }
         }
-        self.add_requested_context_projection(
+        self.add_requested_context_projection_with_guidance(
             &mut result,
             &context_request,
             context_projection_project.as_ref(),
             auth,
             material_capabilities,
+            context_guidance_profile,
+            window,
         )
         .await;
-        // A kernel call with a trusted outer recording Session has not yet
-        // recorded its canonical execution result. Preserve direct process and
-        // script facts until that outer recorder has consumed them; the kernel
-        // applies the same compact model projection afterwards.
-        if inner_model_facing_recording || !matches!(tool_name, "run_process" | "run_script") {
-            sparsify_terminal_structured_execution_success(tool_name, &mut result);
-        }
-        sparsify_structured_validation_runtime_metadata(tool_name, &mut result);
         result
     }
 
@@ -1747,6 +2000,7 @@ impl ToolRuntime {
         project_resolution: Option<Result<ResolvedProject, ProjectResolverError>>,
         trusted_recording_session_id: Option<&str>,
         trusted_recording_session_project: Option<&str>,
+        _logical_invocation_id: Option<&str>,
         protocol_capabilities: super::kernel::ToolProtocolCapabilities,
         correlation: &mut super::window_activity::ToolCallCorrelation,
     ) -> ToolResult {
@@ -1757,6 +2011,14 @@ impl ToolRuntime {
             | ToolCall::ReadToolTrace { .. }
             | ToolCall::ToolManifest { .. }) => {
                 self.dispatch_discovery_tool(call, auth, protocol_capabilities)
+                    .await
+            }
+
+            ToolCall::CurrentWindowActivity {
+                limit,
+                include_nonmeaningful,
+            } => {
+                self.current_window_activity(window, auth, limit, include_nonmeaningful)
                     .await
             }
 
@@ -1776,11 +2038,35 @@ impl ToolRuntime {
                 )
             }
 
+            ToolCall::PostPeerMessage {
+                peer_id,
+                kind,
+                message,
+                tags,
+                priority,
+                requires_ack,
+                delivery_key,
+            } => self.post_peer_message_tool(
+                peer_id,
+                kind,
+                message,
+                tags,
+                priority,
+                requires_ack,
+                delivery_key,
+                auth,
+                window,
+                trusted_recording_session_id,
+                trusted_recording_session_project,
+            ),
+
             call @ (ToolCall::StartSession { .. }
             | ToolCall::SessionSummary { .. }
             | ToolCall::UpdateSessionContext { .. }
             | ToolCall::CloseSession { .. }
             | ToolCall::ValidationSummary { .. }
+            | ToolCall::RecordExternalObservation { .. }
+            | ToolCall::ListExternalObservations { .. }
             | ToolCall::PostSessionMessage { .. }
             | ToolCall::ListSessionMessages { .. }
             | ToolCall::GetSessionAssignment { .. }
@@ -1788,7 +2074,14 @@ impl ToolRuntime {
             | ToolCall::ResolveSessionMessage { .. }
             | ToolCall::CompleteSessionMessage { .. }
             | ToolCall::SessionDiscussionSummary { .. }) => {
-                self.dispatch_session_tool(call, auth, transport).await
+                self.dispatch_session_tool(
+                    call,
+                    auth,
+                    transport,
+                    window,
+                    trusted_recording_session_id,
+                )
+                .await
             }
 
             call @ (ToolCall::WorkOnProject { .. } | ToolCall::FinishCodingTask { .. }) => {
@@ -1809,24 +2102,48 @@ impl ToolRuntime {
             ToolCall::PresentWorkResult {
                 project,
                 session_id,
-            } => self.present_work_result(project, session_id, auth).await,
+            } => {
+                self.present_work_result_for_window(project, session_id, auth, window)
+                    .await
+            }
 
             ToolCall::WorkResultState {
                 project,
                 session_id,
-            } => self.work_result_state(project, session_id, auth).await,
+            } => {
+                self.work_result_state_for_window(project, session_id, auth, window)
+                    .await
+            }
 
-            call @ ToolCall::SessionHandoffSummary { .. } => {
-                let context_continuity_capable = protocol_capabilities.context_continuity
-                    && super::tool_definition::runtime_tool_accepts_context_ack(call.tool_name());
-                self.dispatch_handoff_tool(
-                    call,
+            ToolCall::WorkResultSendMessage {
+                project,
+                session_id,
+                message,
+                delivery_key,
+            } => {
+                self.work_result_send_message(
+                    project,
+                    session_id,
+                    message,
+                    delivery_key,
                     auth,
-                    context_continuity_capable,
-                    trusted_recording_session_id,
+                    window,
                 )
                 .await
             }
+
+            ToolCall::ChangesFileDiff {
+                project,
+                session_id,
+                snapshot_id,
+                path,
+            } => {
+                self.changes_file_diff(project, session_id, snapshot_id, path, auth)
+                    .await
+            }
+
+            call @ (ToolCall::SessionHandoffSummary { .. }
+            | ToolCall::SessionHandoffState { .. }) => self.dispatch_handoff_tool(call, auth).await,
 
             #[cfg(feature = "workspace-checkpoints")]
             call @ (ToolCall::WorkspaceCheckpointCreate { .. }
@@ -1837,27 +2154,102 @@ impl ToolRuntime {
                 self.dispatch_workspace_checkpoint_tool(call).await
             }
 
-            call @ (ToolCall::ComputerListTargets
-            | ToolCall::ComputerListWindows { .. }
-            | ToolCall::ComputerListApplications { .. }
-            | ToolCall::ComputerListDisplays { .. }
-            | ToolCall::ComputerLaunchApplication { .. }
-            | ToolCall::ComputerAccessibilityStatus { .. }
-            | ToolCall::ComputerAccessibilityTree { .. }
-            | ToolCall::ComputerFindElements { .. }
-            | ToolCall::ComputerElementState { .. }
-            | ToolCall::ComputerActivateWindow { .. }
-            | ToolCall::ComputerControl { .. }
-            | ToolCall::ComputerScrollToElement { .. }
-            | ToolCall::ComputerKeyInput { .. }
-            | ToolCall::ComputerReadClipboard { .. }
-            | ToolCall::ComputerWriteClipboard { .. }
-            | ToolCall::ComputerInputText { .. }
-            | ToolCall::ComputerSnapshot { .. }
-            | ToolCall::ComputerSnapshotDisplay { .. }
-            | ToolCall::ComputerPointerMove { .. }
-            | ToolCall::ComputerPointerClick { .. }
-            | ToolCall::ComputerSaveSnapshot { .. }) => {
+            #[cfg(feature = "experimental-code-mode")]
+            ToolCall::CodeModeExec {
+                project: _,
+                session_id,
+                source,
+                timeout_ms,
+            } => {
+                let project = match project_resolution {
+                    Some(Ok(project)) => project,
+                    Some(Err(error)) => return error.into_tool_result(),
+                    None => return ToolResult::err("code_mode_exec requires a resolved Project"),
+                };
+                let (result, composition) = self
+                    .code_mode_exec(
+                        project,
+                        session_id,
+                        source,
+                        timeout_ms,
+                        auth,
+                        transport,
+                        _logical_invocation_id.map(str::to_string),
+                    )
+                    .await;
+                correlation.code_mode_composition = Some(composition);
+                result
+            }
+
+            #[cfg(feature = "experimental-code-mode")]
+            ToolCall::CodeModeExecEffectful {
+                project: _,
+                session_id,
+                source,
+                timeout_ms,
+            } => {
+                let project = match project_resolution {
+                    Some(Ok(project)) => project,
+                    Some(Err(error)) => return error.into_tool_result(),
+                    None => {
+                        return ToolResult::err(
+                            "code_mode_exec_effectful requires a resolved Project",
+                        )
+                    }
+                };
+                let (result, composition) = self
+                    .code_mode_exec_effectful(
+                        project,
+                        session_id,
+                        source,
+                        timeout_ms,
+                        auth,
+                        transport,
+                        _logical_invocation_id.map(str::to_string),
+                    )
+                    .await;
+                correlation.code_mode_composition = Some(composition);
+                result
+            }
+
+            #[cfg(feature = "experimental-code-mode")]
+            ToolCall::CodeModeExecMutating {
+                project: _,
+                session_id,
+                source,
+                timeout_ms,
+            } => {
+                let project = match project_resolution {
+                    Some(Ok(project)) => project,
+                    Some(Err(error)) => return error.into_tool_result(),
+                    None => {
+                        return ToolResult::err(
+                            "code_mode_exec_mutating requires a resolved Project",
+                        )
+                    }
+                };
+                let (result, composition) = self
+                    .code_mode_exec_mutating(
+                        project,
+                        session_id,
+                        source,
+                        timeout_ms,
+                        auth,
+                        transport,
+                        _logical_invocation_id.map(str::to_string),
+                    )
+                    .await;
+                correlation.code_mode_composition = Some(composition);
+                result
+            }
+
+            ToolCall::BrowserObserve(_) | ToolCall::BrowserAct(_) => ToolResult::err(
+                "Browser gateways must pass action-sensitive specialized governance".to_string(),
+            ),
+            ToolCall::ComputerObserve(_) | ToolCall::ComputerControl(_) => ToolResult::err(
+                "Computer gateways must pass action-sensitive specialized governance".to_string(),
+            ),
+            call @ ToolCall::ComputerSaveSnapshot { .. } => {
                 self.dispatch_computer_tool(call, auth).await
             }
 
@@ -1914,6 +2306,52 @@ impl ToolRuntime {
 
             call @ (ToolCall::ApplyPatch { .. } | ToolCall::ApplyUnifiedDiff { .. }) => {
                 self.dispatch_patch_tool(call).await
+            }
+
+            ToolCall::RunSkillResource {
+                skill_id,
+                path,
+                expected_definition_revision,
+                expected_package_revision,
+                args,
+                session_id,
+                timeout_secs,
+                sync_wait_secs,
+                cwd,
+                purpose,
+                ..
+            } => {
+                let project = match project_resolution {
+                    Some(Ok(project)) => project,
+                    Some(Err(error)) => return error.into_tool_result(),
+                    None => {
+                        return ToolResult::err("run_skill_resource requires a resolved Project")
+                    }
+                };
+                self.run_skill_resource(
+                    &project,
+                    skill_id,
+                    path,
+                    expected_definition_revision,
+                    expected_package_revision,
+                    args,
+                    cwd,
+                    timeout_secs,
+                    sync_wait_secs,
+                    purpose,
+                    session_id,
+                    auth,
+                )
+                .await
+            }
+
+            ToolCall::SkillLoad { name, .. } => {
+                let project = match project_resolution {
+                    Some(Ok(project)) => project,
+                    Some(Err(error)) => return error.into_tool_result(),
+                    None => return ToolResult::err("skill_load requires a resolved Project"),
+                };
+                self.skill_load(&project, name, auth).await
             }
 
             ToolCall::SkillList {
@@ -2042,9 +2480,7 @@ impl ToolRuntime {
                     Some(Ok(project)) => project,
                     Some(Err(error)) => return error.into_tool_result(),
                     None => {
-                        return ToolResult::err(
-                            "skill_remove_revision requires a resolved Project",
-                        );
+                        return ToolResult::err("skill_remove_revision requires a resolved Project")
                     }
                 };
                 self.skill_remove_revision(
@@ -2058,39 +2494,116 @@ impl ToolRuntime {
                 .await
             }
 
+            ToolCall::PrepareGoalWorkflow {
+                session_id,
+                title,
+                objective,
+                controller_agent_id,
+                completion_conditions,
+                steps,
+                idempotency_key,
+            } => {
+                self.prepare_goal_workflow(
+                    auth,
+                    session_id,
+                    crate::db::NewGoal {
+                        title,
+                        objective,
+                        controller_agent_id,
+                        completion_conditions,
+                        idempotency_key,
+                        steps: steps
+                            .into_iter()
+                            .map(|step| crate::db::NewGoalStep {
+                                id: step.id,
+                                title: step.title,
+                            })
+                            .collect(),
+                    },
+                )
+                .await
+            }
+
             ToolCall::CreateGoal {
                 title,
                 objective,
+                controller_agent_id,
+                completion_conditions,
+                steps,
                 idempotency_key,
-            } => self.create_goal(auth, title, objective, idempotency_key),
+            } => self.create_goal_with_plan(
+                auth,
+                crate::db::NewGoal {
+                    title,
+                    objective,
+                    controller_agent_id,
+                    completion_conditions,
+                    idempotency_key,
+                    steps: steps
+                        .into_iter()
+                        .map(|step| crate::db::NewGoalStep {
+                            id: step.id,
+                            title: step.title,
+                        })
+                        .collect(),
+                },
+            ),
+
+            ToolCall::CheckpointGoal {
+                goal_id,
+                expected_revision,
+                completed_step_ids,
+                current_step_id,
+                summary,
+                idempotency_key,
+            } => self.checkpoint_goal(
+                auth,
+                goal_id,
+                expected_revision,
+                crate::db::GoalCheckpoint {
+                    completed_step_ids,
+                    current_step_id,
+                    summary,
+                },
+                idempotency_key,
+            ),
 
             ToolCall::GetGoal { goal_id } => self.get_goal(auth, goal_id),
 
             ToolCall::PresentGoalPlan { goal_id } => self.present_goal_plan(auth, goal_id).await,
 
-            ToolCall::GoalPlanState { goal_id } => self.goal_plan_state(auth, goal_id).await,
+            ToolCall::GoalPlanSync { goal_id } => {
+                self.goal_plan_sync_for_window(auth, window, goal_id).await
+            }
 
             ToolCall::ListGoals {
                 lifecycle,
                 offset,
                 limit,
-            } => self.list_goals(auth, lifecycle, offset, limit),
+            } => self.list_goals(
+                auth,
+                lifecycle.map(|value| value.as_str().to_string()),
+                offset,
+                limit,
+            ),
 
             ToolCall::UpdateGoal {
                 goal_id,
                 expected_revision,
                 title,
                 objective,
+                controller_agent_id,
                 lifecycle,
                 terminal_reason,
                 idempotency_key,
-            } => self.update_goal(
+            } => self.update_goal_with_controller(
                 auth,
                 goal_id,
                 expected_revision,
                 title,
                 objective,
-                lifecycle,
+                controller_agent_id,
+                lifecycle.map(|value| value.as_str().to_string()),
                 terminal_reason,
                 idempotency_key,
             ),
@@ -2114,6 +2627,8 @@ impl ToolRuntime {
                 agent_id,
                 endpoint_id,
                 expected_controller_generation,
+                mode,
+                goal_id,
                 events,
                 idempotency_key,
             } => self.wait_for_agent_events(
@@ -2121,6 +2636,8 @@ impl ToolRuntime {
                 agent_id,
                 endpoint_id,
                 expected_controller_generation,
+                mode,
+                goal_id,
                 events,
                 idempotency_key,
             ),
@@ -2438,6 +2955,54 @@ impl ToolRuntime {
                 binding_id,
             ),
 
+            ToolCall::PresentJobTerminalContinuation { wait_id } => {
+                self.present_job_terminal_continuation(auth, wait_id).await
+            }
+
+            ToolCall::JobTerminalContinuationBind {
+                wait_id,
+                binding_id,
+            } => {
+                self.job_terminal_continuation_bind_for_window(auth, window, wait_id, binding_id)
+                    .await
+            }
+
+            ToolCall::JobTerminalContinuationState {
+                wait_id,
+                binding_id,
+            } => {
+                self.job_terminal_continuation_state_for_window(auth, window, wait_id, binding_id)
+                    .await
+            }
+
+            ToolCall::JobTerminalContinuationPrepare {
+                wait_id,
+                binding_id,
+            } => {
+                self.job_terminal_continuation_prepare_for_window(auth, window, wait_id, binding_id)
+                    .await
+            }
+
+            ToolCall::JobTerminalContinuationFinish {
+                wait_id,
+                binding_id,
+                attempt_id,
+                outcome,
+            } => {
+                self.job_terminal_continuation_finish_for_window(
+                    auth, window, wait_id, binding_id, attempt_id, outcome,
+                )
+                .await
+            }
+
+            ToolCall::JobTerminalContinuationUnbind {
+                wait_id,
+                binding_id,
+            } => {
+                self.job_terminal_continuation_unbind_for_window(auth, window, wait_id, binding_id)
+                    .await
+            }
+
             ToolCall::DetachAgentEndpoint { endpoint_id } => {
                 self.detach_agent_endpoint(auth, endpoint_id)
             }
@@ -2666,9 +3231,11 @@ impl ToolRuntime {
             | ToolCall::ListProjectTrackedFiles { .. }
             | ToolCall::ProjectOverview { .. }
             | ToolCall::SearchProjectTexts { .. }
+            | ToolCall::SearchAndRead { .. }
             | ToolCall::WriteProjectFile { .. }
             | ToolCall::SaveProjectArtifact { .. }
-            | ToolCall::ExportProjectArtifact { .. }
+            | ToolCall::TransferProjectArtifact { .. }
+            | ToolCall::ProjectArtifact { .. }
             | ToolCall::ReadProjectArtifactMetadata { .. }
             | ToolCall::ReadProjectArtifact { .. }
             | ToolCall::ArtifactUploadBegin { .. }
@@ -2697,6 +3264,7 @@ impl ToolRuntime {
             call @ (ToolCall::RunJob { .. }
             | ToolCall::StopJob { .. }
             | ToolCall::ObserveJobs { .. }
+            | ToolCall::WaitForJobTerminal { .. }
             | ToolCall::ListJobs { .. }
             | ToolCall::JobTail { .. }) => self.dispatch_job_tool(call, auth, ssh_resource).await,
 
@@ -2718,6 +3286,68 @@ impl ToolRuntime {
 mod structured_execution_sparse_projection_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn project_execution_binding_preserves_specialized_selector_semantics() {
+        let mut shell = ToolCall::RunShell {
+            login: false,
+            project: "~p7".to_string(),
+            command: "true".to_string(),
+            session_id: None,
+            timeout_secs: None,
+            sync_wait_secs: None,
+            cwd: None,
+            purpose: None,
+            shell: None,
+        };
+        let (shell_project, shell_output) = canonical_execution_project_binding(&mut shell)
+            .expect("legacy shell execution needs canonical binding");
+        assert_eq!(shell_output, CanonicalProjectOutput::Canonical);
+        shell_project.clone_from(&"agent:special:webcodex".to_string());
+        assert_eq!(shell.project(), Some("agent:special:webcodex"));
+
+        let mut hygiene = ToolCall::WorkspaceHygieneCheck {
+            project: "~p7".to_string(),
+            max_findings: None,
+            include_tracked: None,
+            session_id: None,
+        };
+        let (_, hygiene_output) = canonical_execution_project_binding(&mut hygiene).unwrap();
+        assert_eq!(hygiene_output, CanonicalProjectOutput::Requested);
+
+        let mut show_changes = ToolCall::ShowChanges {
+            project: "~p7".to_string(),
+            session_id: None,
+            include_diff: Some(false),
+            max_hunks: None,
+            max_hunk_lines: None,
+            session_event_limit: None,
+        };
+        let (_, show_changes_output) =
+            canonical_execution_project_binding(&mut show_changes).unwrap();
+        assert_eq!(show_changes_output, CanonicalProjectOutput::Requested);
+
+        let mut work_on_project = ToolCall::WorkOnProject {
+            project: "~p7".to_string(),
+            client_id: None,
+            path: None,
+            mode: None,
+            base_ref: None,
+            instruction: "inspect".to_string(),
+            guidance_profile: CodingGuidanceProfile::default(),
+            include_extension_catalog: false,
+            session_id: None,
+        };
+        assert!(canonical_execution_project_binding(&mut work_on_project).is_none());
+        assert_eq!(work_on_project.project(), Some("~p7"));
+
+        let mut work_result = ToolCall::WorkResultState {
+            project: "demo".to_string(),
+            session_id: "wc_sess_x".to_string(),
+        };
+        assert!(canonical_execution_project_binding(&mut work_result).is_none());
+        assert_eq!(work_result.project(), Some("demo"));
+    }
 
     fn terminal_process_result(execution_source: &str) -> ToolResult {
         ToolResult::ok(json!({

@@ -47,6 +47,14 @@ const MAX_GIT_LIST_BYTES: usize = 1024 * 1024;
 const MAX_GIT_IDENTITY_BYTES: usize = 4096;
 const MAX_CONTEXT_FILE_BYTES: u64 = 512 * 1024;
 const MAX_FINGERPRINT_WARNINGS: usize = 16;
+const RULE_CANDIDATES: &[&str] = &[
+    "AGENTS.md",
+    "agents.md",
+    "CLAUDE.md",
+    ".codex/AGENTS.md",
+    ".github/copilot-instructions.md",
+];
+
 #[derive(Debug, Clone)]
 struct ProjectContextBudget {
     max_untracked_file_count: usize,
@@ -854,16 +862,14 @@ fn rule_paths(root: &Path, target_directory: &str) -> Vec<String> {
 }
 
 fn first_rule(root: &Path, directory: &str) -> Option<String> {
-    webcodex_core::project_instructions::effective_instruction_candidate_paths()
-        .iter()
-        .find_map(|candidate| {
-            let path = if directory.is_empty() {
-                candidate.to_string()
-            } else {
-                format!("{directory}/{candidate}")
-            };
-            root.join(&path).is_file().then_some(path)
-        })
+    RULE_CANDIDATES.iter().find_map(|candidate| {
+        let path = if directory.is_empty() {
+            (*candidate).to_string()
+        } else {
+            format!("{directory}/{candidate}")
+        };
+        root.join(&path).is_file().then_some(path)
+    })
 }
 
 fn manifest_paths(root: &Path, git_available: bool, state: &mut CaptureState) -> Vec<String> {
@@ -1157,48 +1163,6 @@ mod tests {
         assert!(refresh.rules.refreshed.is_empty());
         assert!(refresh.manifests.refreshed.is_empty());
         assert_eq!(refresh.rules.reused, ["AGENTS.md"]);
-    }
-
-    #[test]
-    fn project_instruction_sidecar_honors_claude_exclusion_without_reindexing() {
-        let repo = repo("context-claude-policy");
-        std::fs::remove_file(repo.path().join("AGENTS.md")).unwrap();
-        std::fs::write(repo.path().join("CLAUDE.md"), "claude-only rules\n").unwrap();
-
-        let previous = std::env::var_os(
-            webcodex_core::project_instructions::CLAUDE_INSTRUCTIONS_EXCLUSION_ENV,
-        );
-        std::env::remove_var(
-            webcodex_core::project_instructions::CLAUDE_INSTRUCTIONS_EXCLUSION_ENV,
-        );
-        let default_context = capture_project_context(repo.path(), None).unwrap();
-
-        std::env::set_var(
-            webcodex_core::project_instructions::CLAUDE_INSTRUCTIONS_EXCLUSION_ENV,
-            "1",
-        );
-        let excluded_context = capture_project_context(repo.path(), None).unwrap();
-
-        match previous {
-            Some(value) => std::env::set_var(
-                webcodex_core::project_instructions::CLAUDE_INSTRUCTIONS_EXCLUSION_ENV,
-                value,
-            ),
-            None => std::env::remove_var(
-                webcodex_core::project_instructions::CLAUDE_INSTRUCTIONS_EXCLUSION_ENV,
-            ),
-        }
-
-        assert_eq!(
-            default_context
-                .rules
-                .iter()
-                .map(|file| file.path.as_str())
-                .collect::<Vec<_>>(),
-            ["CLAUDE.md"]
-        );
-        assert!(excluded_context.rules.is_empty());
-        assert!(excluded_context.completeness.complete);
     }
 
     #[test]

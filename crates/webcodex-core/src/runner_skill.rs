@@ -4,18 +4,23 @@
 //! sources and lifecycles. This module only unifies their cross-process request
 //! family, source identity, and bounded read/list/resolve responses.
 
+use crate::runner_protocol::{
+    PROCESS_ARGV_MAX_BYTES, PROCESS_ARG_MAX_BYTES, PROCESS_ARG_MAX_COUNT,
+};
 use crate::runtime_contract::{MAX_SKILL_READ_LINES, MAX_SKILL_RESOURCE_PATH_CHARS};
 use crate::skill_metadata::{MAX_SKILL_DESCRIPTION_CHARS, MAX_SKILL_NAME_CHARS};
 use crate::skill_store::{
     valid_lower_sha256, valid_package_revision, valid_skill_key, MAX_SKILL_STORE_VERSIONS_LIMIT,
 };
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use std::path::{Component, Path};
 
 pub const RUNNER_SKILL_REQUEST_KIND: &str = "skill";
 pub const RUNNER_SKILL_RESPONSE_FORMAT: &str = "webcodex.runner_skill.v1";
 pub const RUNNER_SKILL_REQUEST_MAX_BYTES: usize = 32 * 1024;
 pub const RUNNER_SKILL_RESPONSE_MAX_BYTES: usize = 512 * 1024;
+pub const RUNNER_SKILL_EXECUTION_REQUEST_KIND: &str = "skill_resource_execution";
+pub const RUNNER_SKILL_EXECUTION_REQUEST_MAX_BYTES: usize = 128 * 1024;
 pub const MAX_RUNNER_SKILLS: usize = 512;
 pub const MAX_RUNNER_SKILL_DIAGNOSTICS: usize = 8;
 pub const MAX_RUNNER_SKILL_READ_TEXT_BYTES: usize = 48 * 1024;
@@ -119,6 +124,68 @@ impl RunnerSkillDescriptor {
             if !valid_skill_key(skill_key) || !valid_package_revision(package_revision) {
                 return Err("invalid managed Runner Skill descriptor");
             }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerSkillExecutionRequest {
+    pub skill_id: String,
+    pub expected_source: RunnerSkillSource,
+    pub path: String,
+    pub expected_definition_revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_package_revision: Option<String>,
+    pub expected_resource_sha256: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+impl RunnerSkillExecutionRequest {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !valid_runner_skill_id(&self.skill_id)
+            || !valid_lower_sha256(&self.expected_definition_revision)
+            || !valid_lower_sha256(&self.expected_resource_sha256)
+        {
+            return Err("invalid Runner Skill execution request");
+        }
+        let path = normalize_runner_skill_resource_path(&self.path)?;
+        let extension = Path::new(&path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !path.starts_with("scripts/") || !matches!(extension.as_str(), "py" | "sh") {
+            return Err("invalid Runner Skill executable resource");
+        }
+        match self.expected_source {
+            RunnerSkillSource::Configured if self.expected_package_revision.is_some() => {
+                return Err("configured Runner Skill cannot pin package revision");
+            }
+            RunnerSkillSource::Managed => {
+                let Some(revision) = self.expected_package_revision.as_deref() else {
+                    return Err("managed Runner Skill execution requires package revision");
+                };
+                if !valid_package_revision(revision) {
+                    return Err("invalid Runner Skill package revision");
+                }
+            }
+            RunnerSkillSource::Configured => {}
+        }
+        if self.args.len() > PROCESS_ARG_MAX_COUNT {
+            return Err("too many Runner Skill execution arguments");
+        }
+        let mut total = 0usize;
+        for arg in &self.args {
+            if arg.len() > PROCESS_ARG_MAX_BYTES || arg.contains('\0') {
+                return Err("invalid Runner Skill execution argument");
+            }
+            total = total.saturating_add(1).saturating_add(arg.len());
+        }
+        if total > PROCESS_ARGV_MAX_BYTES {
+            return Err("Runner Skill execution arguments are too large");
         }
         Ok(())
     }
@@ -267,77 +334,8 @@ pub struct RunnerSkillListResponse {
     pub format: String,
     pub skills: Vec<RunnerSkillDescriptor>,
     pub invalid_count: usize,
-    pub diagnostics: Vec<RunnerSkillDiagnostic>,
+    pub diagnostics: Vec<String>,
     pub discovery_truncated: bool,
-}
-
-/// Bounded, path-free diagnostic for a Runner-local Skill discovery candidate.
-///
-/// Older Runners sent reason-only entries, so the identity fields remain
-/// optional on the wire. A candidate name is descriptive only; it never
-/// creates a callable Skill identity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct RunnerSkillDiagnostic {
-    pub reason_code: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub candidate_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_scope: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RunnerSkillDiagnosticStructured {
-    reason_code: String,
-    #[serde(default)]
-    candidate_name: Option<String>,
-    #[serde(default)]
-    source_scope: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RunnerSkillDiagnosticWire {
-    Structured(RunnerSkillDiagnosticStructured),
-    Legacy(String),
-}
-
-impl<'de> Deserialize<'de> for RunnerSkillDiagnostic {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        match RunnerSkillDiagnosticWire::deserialize(deserializer)? {
-            RunnerSkillDiagnosticWire::Structured(diagnostic) => Ok(Self {
-                reason_code: diagnostic.reason_code,
-                candidate_name: diagnostic.candidate_name,
-                source_scope: diagnostic.source_scope,
-            }),
-            RunnerSkillDiagnosticWire::Legacy(reason_code) => Ok(Self {
-                reason_code,
-                candidate_name: None,
-                source_scope: None,
-            }),
-        }
-    }
-}
-
-impl RunnerSkillDiagnostic {
-    pub fn validate(&self) -> Result<(), &'static str> {
-        if !valid_diagnostic_reason(&self.reason_code)
-            || self
-                .candidate_name
-                .as_deref()
-                .is_some_and(|name| !valid_diagnostic_candidate_name(name))
-            || self
-                .source_scope
-                .as_deref()
-                .is_some_and(|scope| scope != "runner")
-        {
-            return Err("invalid Runner Skill diagnostic");
-        }
-        Ok(())
-    }
 }
 
 impl RunnerSkillListResponse {
@@ -348,7 +346,7 @@ impl RunnerSkillListResponse {
             || self
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.validate().is_err())
+                .any(|reason| !valid_diagnostic_reason(reason))
         {
             return Err("invalid Runner Skill list response");
         }
@@ -471,15 +469,6 @@ fn valid_diagnostic_reason(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-}
-
-fn valid_diagnostic_candidate_name(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 160
-        && !value.contains(['/', '\\'])
-        && value != "."
-        && value != ".."
-        && !value.chars().any(char::is_control)
 }
 
 #[cfg(test)]
@@ -621,6 +610,57 @@ mod tests {
     }
 
     #[test]
+    fn execution_request_pins_source_package_and_supported_script_shape() {
+        let configured_request = RunnerSkillExecutionRequest {
+            skill_id: configured().skill_id().to_string(),
+            expected_source: RunnerSkillSource::Configured,
+            path: "scripts/probe.py".to_string(),
+            expected_definition_revision: "b".repeat(64),
+            expected_package_revision: None,
+            expected_resource_sha256: "c".repeat(64),
+            args: vec!["literal argument".to_string()],
+        };
+        configured_request.validate().unwrap();
+        let mut uppercase_configured = configured_request.clone();
+        uppercase_configured.path = "scripts/probe.PY".to_string();
+        uppercase_configured.validate().unwrap();
+        let encoded = serde_json::to_string(&configured_request).unwrap();
+        assert!(encoded.len() <= RUNNER_SKILL_EXECUTION_REQUEST_MAX_BYTES);
+        assert_eq!(
+            serde_json::from_str::<RunnerSkillExecutionRequest>(&encoded).unwrap(),
+            configured_request
+        );
+
+        let mut invalid_configured = configured_request.clone();
+        invalid_configured.expected_package_revision =
+            managed().package_revision().map(str::to_string);
+        assert!(invalid_configured.validate().is_err());
+
+        let mut invalid_path = configured_request.clone();
+        invalid_path.path = "scripts/probe.rb".to_string();
+        assert!(invalid_path.validate().is_err());
+
+        let mut invalid_arg = configured_request.clone();
+        invalid_arg.args = vec!["bad\0arg".to_string()];
+        assert!(invalid_arg.validate().is_err());
+
+        let managed_descriptor = managed();
+        let managed_request = RunnerSkillExecutionRequest {
+            skill_id: managed_descriptor.skill_id().to_string(),
+            expected_source: RunnerSkillSource::Managed,
+            path: "scripts/probe.sh".to_string(),
+            expected_definition_revision: managed_descriptor.definition_revision().to_string(),
+            expected_package_revision: managed_descriptor.package_revision().map(str::to_string),
+            expected_resource_sha256: "d".repeat(64),
+            args: Vec::new(),
+        };
+        managed_request.validate().unwrap();
+        let mut missing_package = managed_request;
+        missing_package.expected_package_revision = None;
+        assert!(missing_package.validate().is_err());
+    }
+
+    #[test]
     fn list_and_resolve_responses_fail_closed_on_identity_inconsistency() {
         let duplicate = configured();
         let response = RunnerSkillListResponse {
@@ -639,38 +679,6 @@ mod tests {
         assert!(resolve
             .validate_for_request(configured().skill_id())
             .is_err());
-    }
-
-    #[test]
-    fn list_diagnostics_accept_legacy_reason_only_entries_and_bound_structured_identity() {
-        let response: RunnerSkillListResponse = serde_json::from_value(serde_json::json!({
-            "format": RUNNER_SKILL_RESPONSE_FORMAT,
-            "skills": [],
-            "invalid_count": 1,
-            "diagnostics": ["missing_skill_definition"],
-            "discovery_truncated": false,
-        }))
-        .unwrap();
-        assert!(response.validate().is_ok());
-        assert_eq!(
-            response.diagnostics[0].reason_code,
-            "missing_skill_definition"
-        );
-        assert!(response.diagnostics[0].candidate_name.is_none());
-
-        let invalid: RunnerSkillListResponse = serde_json::from_value(serde_json::json!({
-            "format": RUNNER_SKILL_RESPONSE_FORMAT,
-            "skills": [],
-            "invalid_count": 1,
-            "diagnostics": [{
-                "reason_code": "missing_skill_definition",
-                "candidate_name": "/private/path",
-                "source_scope": "runner",
-            }],
-            "discovery_truncated": false,
-        }))
-        .unwrap();
-        assert!(invalid.validate().is_err());
     }
 
     #[test]

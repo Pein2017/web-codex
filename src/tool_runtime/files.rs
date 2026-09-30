@@ -24,8 +24,8 @@ use super::tool_result::{SuggestedToolCall, ToolResult};
 use super::{file_listing, permissions, project_instructions};
 use super::{SearchPatternMode, SearchResultMode, ToolRuntime};
 use crate::artifact_policy::{
-    has_safe_octet_stream_artifact_extension, octet_stream_safe_extension_error,
-    ooxml_extension_for_mime, MAX_MCP_IMAGE_BYTES,
+    canonical_known_mime, export_presentation_mime, mime_is_compatible_with_path,
+    ooxml_extension_for_mime, GENERIC_BINARY_MIME, MAX_MCP_IMAGE_BYTES,
 };
 use crate::auth::AuthContext;
 use crate::project_overview::{
@@ -44,15 +44,19 @@ mod mutations;
 mod search;
 
 pub(crate) use artifacts::{
+    artifact_upload_begin_failure_is_definite, artifact_upload_failure_is_definite,
     validate_artifact_file_path, validate_artifact_mime_for_path,
     validate_project_artifact_export_snapshot, ProjectArtifactExportSnapshot,
-    MAX_PROJECT_ARTIFACT_EXPORT_BYTES, MAX_PROJECT_ARTIFACT_UPLOAD_CHUNK_BYTES,
-    MAX_READ_PROJECT_ARTIFACT_LENGTH,
+    INTERNAL_ARTIFACT_TRANSFER_CHUNK_BYTES, MAX_PROJECT_ARTIFACT_EXPORT_BYTES,
+    MAX_PROJECT_ARTIFACT_UPLOAD_BYTES, MAX_PROJECT_ARTIFACT_UPLOAD_CHUNK_BYTES,
 };
 #[cfg(test)]
-pub(crate) use artifacts::{MAX_PROJECT_ARTIFACT_BYTES, MAX_PROJECT_ARTIFACT_UPLOAD_BYTES};
+pub(crate) use artifacts::{MAX_PROJECT_ARTIFACT_BYTES, MAX_READ_PROJECT_ARTIFACT_LENGTH};
 #[cfg(all(test, windows))]
 pub(crate) use inspection::LIST_TRACKED_STDERR_MAX_CHARS;
+pub(crate) use inspection::{
+    effective_read_file_range, slice_read_file_result, slice_read_file_success_output,
+};
 #[cfg(test)]
 pub(crate) use inspection::{
     page_file_list_entries, parse_file_list_entries, LIST_TRACKED_SOURCE_MAX_BYTES,

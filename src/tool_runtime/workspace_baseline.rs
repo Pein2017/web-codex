@@ -2,13 +2,13 @@
 //! command wrapping, or actor/Session authorship inference.
 
 use super::git::SHOW_CHANGES_MAX_STATUS_FILES;
-use super::sessions::{
-    WorkspaceBaseline, WorkspaceBaselineEntry, MAX_WORKSPACE_BASELINE_METADATA_BYTES,
-    MAX_WORKSPACE_BASELINE_PATH_BYTES,
-};
 use super::ToolResult;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use webcodex_workflow_session::{
+    WorkspaceBaseline, WorkspaceBaselineEntry, MAX_WORKSPACE_BASELINE_METADATA_BYTES,
+    MAX_WORKSPACE_BASELINE_PATH_BYTES,
+};
 
 /// The Git source already bounded every status record to 4 KiB and 200 files.
 /// Presentation has a separate ceiling: no long path or huge dirty worktree

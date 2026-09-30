@@ -4,6 +4,7 @@ use crate::RunnerAccessGroup;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{oneshot, watch, Notify};
 use webcodex_core::coding_agent::{
     CodingAgentProvider, CodingAgentResponse, CodingAgentRunInventory,
@@ -121,6 +122,9 @@ pub(super) struct RunnerRecord {
 #[derive(Debug, Clone)]
 pub struct RunnerSemanticView {
     pub view: RunnerView,
+    /// Captured with the record under the registry lock, not after an awaiting
+    /// caller resumes. This preserves identity-observation order across tasks.
+    pub observed_at: std::time::Instant,
     pub(super) runner_features: RunnerFeatureSet,
 }
 
@@ -134,6 +138,7 @@ impl RunnerSemanticView {
         let runner_features = RunnerFeatureSet::from_wire_for_test(&view.capabilities);
         Self {
             view,
+            observed_at: std::time::Instant::now(),
             runner_features,
         }
     }
@@ -243,10 +248,19 @@ pub(super) struct PendingShellRequest {
     /// Revalidated at dequeue so neither check nor reload can silently retarget
     /// a replacement process using the same client_id.
     pub(super) expected_runner_config_runner_instance_id: Option<String>,
+    /// Exact Runner process lease captured for configured-instruction observation.
+    /// Revalidated at dequeue so a replacement process cannot inherit the request.
+    pub(super) expected_instruction_runner_instance_id: Option<String>,
     /// Exact Runner process lease plus source/read/manage mode captured for a
     /// Runner-global Skill request. Revalidated at dequeue so a replacement
     /// process using the same client_id cannot inherit authority.
     pub(super) skill_fence: Option<SkillDispatchFence>,
+    /// Server-process monotonic enqueue instant for queue-wait and request
+    /// round-trip observability. It is never serialized or exposed on the wire.
+    pub(super) enqueued_at: Instant,
+    /// Transport that authoritatively dequeued this request. Captured at
+    /// dispatch so a later same-instance reconnect cannot relabel its result.
+    pub(super) dispatched_transport: Option<RunnerTransport>,
     pub(super) dispatched: bool,
 }
 
@@ -367,6 +381,9 @@ pub(super) struct JobObservationState {
     /// and never controls Server registry retention.
     pub(super) terminal_observed_at: Option<i64>,
     pub(super) receipt_candidates: Option<crate::receipts::ReceiptCandidates>,
+    /// Exact terminal-event candidates consumed by a post-registry-lock sink.
+    /// This owns no Job truth: authoritative terminal state remains on the Job.
+    pub(super) terminal_event_candidates: Option<crate::receipts::TerminalEventCandidates>,
     /// Fixed historical deadline, also identifies a receipt with no live lease.
     pub(super) receipt_expires_at: Option<i64>,
 }
@@ -379,6 +396,7 @@ impl JobObservationState {
             notify: Arc::new(Notify::new()),
             terminal_observed_at: None,
             receipt_candidates: None,
+            terminal_event_candidates: None,
             receipt_expires_at: None,
         }
     }
