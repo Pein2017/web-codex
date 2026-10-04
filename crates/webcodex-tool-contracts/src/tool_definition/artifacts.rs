@@ -1,5 +1,5 @@
 use super::RunnerCapabilityRequirement::{FileRead, FileWrite};
-use super::ToolVisibility::ModelVisible;
+use super::ToolVisibility::{ModelHidden, ModelVisible};
 use super::{
     adaptive_runtime_direct, def, model_spec, permission_risk, require_all_scopes,
     requires_artifact_upload_path_binding, ToolDefinition, PERMISSION_RISK_ARTIFACT_WRITE,
@@ -130,7 +130,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         def(
             "read_project_artifact_metadata",
             super::ToolAuditPolicy::TYPED_CANONICAL,
-            ModelVisible,
+            ModelHidden,
             TOOL_CATEGORY_ARTIFACT,
             Some(FileRead),
             TOOL_PROVIDER_RUNNER,
@@ -153,7 +153,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         def(
             "read_project_artifact",
             super::ToolAuditPolicy::TYPED_CANONICAL,
-            ModelVisible,
+            ModelHidden,
             TOOL_CATEGORY_ARTIFACT,
             Some(FileRead),
             TOOL_PROVIDER_RUNNER,
@@ -176,7 +176,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         def(
             "artifact_upload_begin",
             super::ToolAuditPolicy::TYPED_CANONICAL,
-            ModelVisible,
+            ModelHidden,
             TOOL_CATEGORY_ARTIFACT,
             Some(FileWrite),
             TOOL_PROVIDER_RUNNER,
@@ -199,7 +199,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
         def(
             "artifact_upload_chunk",
             super::ToolAuditPolicy::TYPED_CANONICAL,
-            ModelVisible,
+            ModelHidden,
             TOOL_CATEGORY_ARTIFACT,
             Some(FileWrite),
             TOOL_PROVIDER_RUNNER,
@@ -223,7 +223,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             def(
             "artifact_upload_finish",
             super::ToolAuditPolicy::TYPED_CANONICAL,
-            ModelVisible,
+            ModelHidden,
             TOOL_CATEGORY_ARTIFACT,
             Some(FileWrite),
             TOOL_PROVIDER_RUNNER,
@@ -249,7 +249,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             def(
             "artifact_upload_abort",
             super::ToolAuditPolicy::TYPED_CANONICAL,
-            ModelVisible,
+            ModelHidden,
             TOOL_CATEGORY_ARTIFACT,
             Some(FileWrite),
             TOOL_PROVIDER_RUNNER,

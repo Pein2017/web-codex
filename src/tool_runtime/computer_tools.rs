@@ -1886,8 +1886,8 @@ fn computer_snapshot_artifact_lifecycle_failure(
     );
     computer_suggested_recovery(
         result,
-        "read_project_artifact_metadata",
-        json!({"project": project, "path": path}),
+        "project_artifact",
+        json!({"action": "metadata", "project": project, "path": path}),
     )
 }
 

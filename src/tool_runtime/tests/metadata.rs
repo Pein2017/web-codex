@@ -2163,7 +2163,7 @@ async fn tool_manifest_exact_route_is_parser_ready_for_direct_and_gateway_tools(
 }
 
 #[tokio::test]
-async fn bounded_list_tools_hides_schemas_and_finds_artifact_upload_tools() {
+async fn bounded_list_tools_hides_schemas_and_finds_canonical_artifact_tools() {
     let runtime = test_runtime();
     let full = runtime
         .dispatch(ToolCall::ListTools {
@@ -2178,7 +2178,7 @@ async fn bounded_list_tools_hides_schemas_and_finds_artifact_upload_tools() {
     let bounded = runtime
         .dispatch(ToolCall::ListTools {
             category: Some("artifact".to_string()),
-            features: Some("artifact_upload".to_string()),
+            features: None,
             summary_only: true,
             limit: Some(10),
         })
@@ -2190,10 +2190,10 @@ async fn bounded_list_tools_hides_schemas_and_finds_artifact_upload_tools() {
     let tools = bounded.output["tools"].as_array().unwrap();
     let names = bounded.output["names"].as_array().unwrap();
     for tool in [
-        "artifact_upload_begin",
-        "artifact_upload_chunk",
-        "artifact_upload_finish",
-        "artifact_upload_abort",
+        "project_artifact",
+        "import_conversation_files_to_project",
+        "transfer_project_artifact",
+        "save_project_artifact",
     ] {
         assert!(names.iter().any(|name| name == tool), "missing {tool}");
     }
@@ -2221,8 +2221,8 @@ async fn bounded_list_tools_limit_reports_truncation() {
     let runtime = test_runtime();
     let result = runtime
         .dispatch(ToolCall::ListTools {
-            category: None,
-            features: Some("artifact_upload".to_string()),
+            category: Some("artifact".to_string()),
+            features: None,
             summary_only: true,
             limit: Some(2),
         })

@@ -491,11 +491,6 @@ fn tool_categories_and_recommended_flows_are_well_formed() {
         "transfer_project_artifact",
         "project_artifact",
         "save_project_artifact",
-        "read_project_artifact",
-        "artifact_upload_begin",
-        "artifact_upload_chunk",
-        "artifact_upload_finish",
-        "artifact_upload_abort",
     ] {
         assert!(
             file_transfer.iter().any(|value| value == name),
@@ -746,8 +741,7 @@ fn tool_categories_include_projects_with_management_tools() {
 
 #[test]
 fn tool_manifest_intents_reference_only_known_model_visible_tools() {
-    // High-level intent views rank canonical choices; exact compatibility
-    // primitives remain discoverable by tool_name without becoming peer choices.
+    // High-level intent views rank canonical model-visible choices.
 
     let expected = [
         "coding",

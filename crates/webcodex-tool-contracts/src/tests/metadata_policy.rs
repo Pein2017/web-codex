@@ -76,7 +76,7 @@ fn tool_specs_annotations_are_canonical_semantic_projections() {
         let metadata = lookup_tool_metadata(name).unwrap();
         assert_eq!(metadata.effect, effect, "{name}");
         assert_eq!(metadata.idempotency, idempotency, "{name}");
-        let annotations = &spec_named(&specs, name).annotations;
+        let annotations = tool_annotations(name);
         assert_eq!(
             annotations["readOnlyHint"],
             effect == ToolEffect::Observe,
@@ -122,7 +122,7 @@ fn tool_specs_annotations_are_canonical_semantic_projections() {
         let metadata = lookup_tool_metadata(name).unwrap();
         assert!(metadata.destructive, "{name}");
         assert_eq!(
-            spec_named(&specs, name).annotations["destructiveHint"],
+            tool_annotations(name)["destructiveHint"],
             true,
             "{name} may replace, restore, delete, or discard existing state"
         );
@@ -145,7 +145,7 @@ fn tool_specs_annotations_are_canonical_semantic_projections() {
         let metadata = lookup_tool_metadata(name).unwrap();
         assert!(!metadata.destructive, "{name}");
         assert_eq!(
-            spec_named(&specs, name).annotations["destructiveHint"],
+            tool_annotations(name)["destructiveHint"],
             false,
             "{name} is intentionally additive-only"
         );

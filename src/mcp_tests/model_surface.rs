@@ -1,5 +1,159 @@
 use super::*;
 
+#[tokio::test]
+async fn consolidated_artifact_and_endpoint_tools_are_denied_by_model_surface() {
+    let runtime = test_runtime();
+    let auth = adaptive_direct_auth();
+    for (tool, arguments) in [
+        (
+            "attach_agent_endpoint",
+            json!({"agent_id": "wc_dagent_AAAAAAAAAAAAAAAA", "host": "test", "idempotency_key": "endpoint-probe"}),
+        ),
+        (
+            "read_project_artifact_metadata",
+            json!({"project": "missing-project", "path": "artifact.bin"}),
+        ),
+        (
+            "read_project_artifact",
+            json!({"project": "missing-project", "path": "artifact.bin"}),
+        ),
+        (
+            "artifact_upload_begin",
+            json!({"project": "missing-project", "path": "artifact.bin", "mime_type": "application/octet-stream", "expected_bytes": 1}),
+        ),
+        (
+            "artifact_upload_chunk",
+            json!({"project": "missing-project", "path": "artifact.bin", "upload_id": "probe", "offset": 0, "content_base64": "YQ=="}),
+        ),
+        (
+            "artifact_upload_finish",
+            json!({"project": "missing-project", "path": "artifact.bin", "upload_id": "probe"}),
+        ),
+        (
+            "artifact_upload_abort",
+            json!({"project": "missing-project", "path": "artifact.bin", "upload_id": "probe"}),
+        ),
+    ] {
+        crate::tool_runtime::ToolCall::from_tool_name(tool, arguments.clone())
+            .unwrap_or_else(|error| panic!("internal parser must retain {tool}: {error}"));
+        for (gateway, params) in [
+            (false, json!({"name": tool, "arguments": arguments})),
+            (
+                true,
+                json!({"name": "call_runtime_tool", "arguments": {"tool": tool, "arguments": arguments}}),
+            ),
+        ] {
+            let outcome = handle_mcp_request(
+                &runtime,
+                rpc("tools/call", Some(json!(67)), mcp_2026_params(params)),
+                Some(&auth),
+            )
+            .await;
+            if gateway {
+                let McpOutcome::Ok(value) = outcome else {
+                    panic!("gateway denial for {tool}: {outcome:?}");
+                };
+                assert_eq!(
+                    value["result"]["structuredContent"]["success"], false,
+                    "{tool}"
+                );
+                assert_eq!(
+                    value["result"]["structuredContent"]["output"]["error_kind"], "unknown_tool",
+                    "{tool}"
+                );
+            } else {
+                assert!(
+                    matches!(outcome, McpOutcome::BadRequest(_)),
+                    "direct invocation admitted {tool}: {outcome:?}"
+                );
+            }
+        }
+        assert_eq!(
+            crate::model_surface::adaptive_runtime_tool_invocation_route(tool),
+            ("unavailable", None),
+            "{tool}"
+        );
+        let McpOutcome::Ok(value) = handle_mcp_request(
+            &runtime,
+            rpc(
+                "tools/call",
+                Some(json!(68)),
+                mcp_2026_params(json!({"name": "tool_manifest", "arguments": {"tool_name": tool}})),
+            ),
+            Some(&auth),
+        )
+        .await
+        else {
+            panic!("manifest response for {tool}");
+        };
+        assert_eq!(
+            value["result"]["structuredContent"]["success"], false,
+            "{tool}"
+        );
+        assert_eq!(
+            value["result"]["structuredContent"]["output"]["code"], "unknown_tool_manifest_tool",
+            "{tool}"
+        );
+    }
+    assert!(runtime.runner_registry.list_runners().await.is_empty());
+    let McpOutcome::Ok(value) = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(69)),
+            mcp_2026_params(json!({"name": "tool_manifest", "arguments": {}})),
+        ),
+        Some(&auth),
+    )
+    .await
+    else {
+        panic!("full manifest");
+    };
+    let output = &value["result"]["structuredContent"]["output"];
+    let names = output["categories"]
+        .as_object()
+        .expect("manifest categories")
+        .values()
+        .flat_map(|category| category.as_array().expect("category tool names"))
+        .map(|name| name.as_str().expect("manifest tool name"))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(output["tool_count"].as_u64(), Some(names.len() as u64));
+    for canonical in [
+        "rotate_agent_continuation_endpoint",
+        "project_artifact",
+        "import_conversation_files_to_project",
+        "transfer_project_artifact",
+    ] {
+        assert!(names.contains(canonical), "{canonical}");
+    }
+    for name in [
+        "attach_agent_endpoint",
+        "read_project_artifact_metadata",
+        "read_project_artifact",
+        "artifact_upload_begin",
+        "artifact_upload_chunk",
+        "artifact_upload_finish",
+        "artifact_upload_abort",
+    ] {
+        assert!(!names.contains(name), "{name}");
+    }
+    let McpOutcome::Ok(listed) = handle_mcp_request(
+        &runtime,
+        rpc("tools/list", Some(json!(70)), mcp_2026_params(json!({}))),
+        Some(&auth),
+    )
+    .await
+    else {
+        panic!("direct inventory");
+    };
+    println!(
+        "model_surface_inventory manifest_tool_count={} manifest_unique_names={} direct_descriptors={}",
+        output["tool_count"],
+        names.len(),
+        tool_names(&listed).len()
+    );
+}
+
 fn adaptive_direct_auth() -> crate::auth::AuthContext {
     let mut auth = crate::auth::shared_key_context("adaptive-direct-test");
     auth.scopes.extend([

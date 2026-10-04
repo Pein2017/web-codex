@@ -2402,6 +2402,13 @@ async fn gpt_action_direct_and_gateway_admission_fail_closed() {
     for tool in [
         "present_goal_plan",
         "present_agent_continuation",
+        "attach_agent_endpoint",
+        "read_project_artifact_metadata",
+        "read_project_artifact",
+        "artifact_upload_begin",
+        "artifact_upload_chunk",
+        "artifact_upload_finish",
+        "artifact_upload_abort",
         "definitely_not_a_tool",
     ] {
         let (status, body, _) = oauth_action_call(&service, "secret", tool, json!({})).await;
@@ -2453,6 +2460,13 @@ async fn gpt_action_direct_and_gateway_admission_fail_closed() {
     for target in [
         "present_goal_plan",
         "start_session",
+        "attach_agent_endpoint",
+        "read_project_artifact_metadata",
+        "read_project_artifact",
+        "artifact_upload_begin",
+        "artifact_upload_chunk",
+        "artifact_upload_finish",
+        "artifact_upload_abort",
         "definitely_not_a_tool",
     ] {
         let (status, body, _) = oauth_action_call(

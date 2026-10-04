@@ -2,9 +2,8 @@ use super::*;
 
 #[test]
 fn read_project_artifact_uses_only_canonical_length_bound() {
-    let specs = registered_tool_specs();
-    let spec = spec_named(&specs, "read_project_artifact");
-    let props = spec.input_schema["properties"].as_object().unwrap();
+    let schema = input_schema_for_tool("read_project_artifact");
+    let props = schema["properties"].as_object().unwrap();
     assert!(props.contains_key("length"));
     assert_eq!(props["length"]["maximum"], 65536);
     let expected_sha256 = &props["expected_sha256"];
@@ -20,35 +19,42 @@ fn read_project_artifact_uses_only_canonical_length_bound() {
 
 #[test]
 fn read_project_artifact_metadata_schema_exposes_allow_missing() {
-    let specs = registered_tool_specs();
-    let spec = spec_named(&specs, "read_project_artifact_metadata");
-    let props = spec.input_schema["properties"].as_object().unwrap();
+    let schema = input_schema_for_tool("read_project_artifact_metadata");
+    let props = schema["properties"].as_object().unwrap();
+    let description = lookup_tool_definition("read_project_artifact_metadata")
+        .unwrap()
+        .model_spec
+        .unwrap()
+        .description;
     assert!(props.contains_key("allow_missing"));
     assert!(
-        spec.description.contains("allow_missing=true")
-            && spec.description.contains("exists=false"),
+        description.contains("allow_missing=true") && description.contains("exists=false"),
         "description should explain successful missing assertions: {}",
-        spec.description
+        description
     );
 }
 
 #[test]
 fn artifact_upload_followup_descriptions_explain_required_path_binding() {
-    let specs = registered_tool_specs();
     for name in [
         "artifact_upload_chunk",
         "artifact_upload_finish",
         "artifact_upload_abort",
     ] {
-        let spec = spec_named(&specs, name);
+        let description = lookup_tool_definition(name)
+            .unwrap()
+            .model_spec
+            .unwrap()
+            .description;
         assert!(
-            spec.description.contains("path is required")
-                && spec.description.contains("artifact_upload_begin")
-                && spec.description.contains("binds upload_id"),
+            description.contains("path is required")
+                && description.contains("artifact_upload_begin")
+                && description.contains("binds upload_id"),
             "{name}: {}",
-            spec.description
+            description
         );
-        let path_desc = spec.input_schema["properties"]["path"]["description"]
+        let schema = input_schema_for_tool(name);
+        let path_desc = schema["properties"]["path"]["description"]
             .as_str()
             .unwrap();
         assert!(

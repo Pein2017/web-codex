@@ -183,7 +183,12 @@ fn tool_specs_describe_default_coding_loop_preferences() {
             "project_artifact: {phrase}"
         );
     }
-    let read_artifact_desc = desc("read_project_artifact");
+    let read_artifact_desc = lookup_tool_definition("read_project_artifact")
+        .unwrap()
+        .model_spec
+        .unwrap()
+        .description
+        .to_lowercase();
     for phrase in [
         "bounded chunk inspection api",
         "parser-ready suggested_call",
@@ -198,7 +203,12 @@ fn tool_specs_describe_default_coding_loop_preferences() {
             "read_project_artifact: {phrase}"
         );
     }
-    let upload_begin_desc = desc("artifact_upload_begin");
+    let upload_begin_desc = lookup_tool_definition("artifact_upload_begin")
+        .unwrap()
+        .model_spec
+        .unwrap()
+        .description
+        .to_lowercase();
     for phrase in [
         "low-level chunked binary artifact upload",
         "not the preferred path for a current chatgpt/host attachment",

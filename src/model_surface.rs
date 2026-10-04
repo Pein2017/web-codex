@@ -613,7 +613,7 @@ mod tests {
         for expected in [
             "list_runners",
             "git_log",
-            "read_project_artifact",
+            "project_artifact",
             "skill_versions",
         ] {
             assert!(
@@ -657,11 +657,6 @@ mod tests {
                 "git_log",
                 "git_log",
                 json!({"project": "demo", "head_commit": "0123456789012345678901234567890123456789", "limit": 20, "skip": 20}),
-            ),
-            (
-                "read_project_artifact",
-                "read_project_artifact",
-                json!({"project": "demo", "path": "out.bin", "encoding": "base64", "offset": 65536, "length": 65536, "expected_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}),
             ),
             (
                 "skill_install",

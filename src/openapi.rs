@@ -478,6 +478,13 @@ mod tests {
             "present_agent_continuation",
             "rotate_agent_continuation_endpoint",
             "present_work_result",
+            "attach_agent_endpoint",
+            "read_project_artifact_metadata",
+            "read_project_artifact",
+            "artifact_upload_begin",
+            "artifact_upload_chunk",
+            "artifact_upload_finish",
+            "artifact_upload_abort",
         ] {
             assert!(!webcodex_tool_contracts::gpt_action_tool_supported(tool));
             assert!(!serialized.contains(&format!("\"{tool}\"")));

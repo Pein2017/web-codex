@@ -187,7 +187,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                     super::ToolAuditResultField::value("state_changed"),
                     super::ToolAuditResultField::value("error_kind"),
                 ])),
-                ModelVisible,
+                ModelHidden,
                 TOOL_CATEGORY_COMMUNICATION,
                 None,
                 TOOL_PROVIDER_CONTROL,

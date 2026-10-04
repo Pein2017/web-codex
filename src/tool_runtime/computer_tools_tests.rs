@@ -1826,8 +1826,8 @@ fn computer_save_snapshot_lifecycle_distinguishes_not_started_from_unknown() {
     assert!(unknown.output.get("recovery_kind").is_none());
     assert_computer_suggested_call(
         &unknown,
-        "read_project_artifact_metadata",
-        json!({"project": "agent:target:demo", "path": "artifacts/ui.jpg"}),
+        "project_artifact",
+        json!({"action": "metadata", "project": "agent:target:demo", "path": "artifacts/ui.jpg"}),
     );
     assert_eq!(unknown.output["project"], "agent:target:demo");
     assert_eq!(unknown.output["path"], "artifacts/ui.jpg");

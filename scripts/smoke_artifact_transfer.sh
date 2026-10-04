@@ -472,8 +472,8 @@ check_openapi "$schema" || true
 
 body="$(api_post /api/tools/list '{"summary_only":true,"category":"artifact","limit":20}')"
 if json_tools_include "$body" tools \
-    artifact_upload_begin artifact_upload_chunk artifact_upload_finish \
-    artifact_upload_abort read_project_artifact_metadata read_project_artifact >/dev/null; then
+    import_conversation_files_to_project transfer_project_artifact \
+    project_artifact save_project_artifact >/dev/null; then
     pass "bounded listRuntimeTools summary exposes artifact transfer tools"
 else
     fail "bounded listRuntimeTools summary missing expected artifact tools ($(body_preview "$body"))"
@@ -482,8 +482,8 @@ fi
 body="$(call_tool tool_manifest "$(make_json_object category artifact include_recommended_flows __false__ include_risk_summary __false__)")"
 if check_success "tool_manifest(category=artifact) succeeds" "$body"; then
     if json_tools_include "$body" output.tools \
-        artifact_upload_begin artifact_upload_chunk artifact_upload_finish \
-        artifact_upload_abort read_project_artifact_metadata read_project_artifact >/dev/null; then
+        import_conversation_files_to_project transfer_project_artifact \
+        project_artifact save_project_artifact >/dev/null; then
         pass "tool_manifest(category=artifact) exposes artifact transfer tools"
     else
         fail "tool_manifest(category=artifact) missing expected artifact tools"

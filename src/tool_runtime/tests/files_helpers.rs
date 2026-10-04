@@ -254,13 +254,9 @@ async fn read_project_artifact_emits_parser_ready_snapshot_fenced_continuation()
         &mut projected_first,
         &|target| crate::model_surface::suggested_tool_call_route(target, false),
     );
-    let projected_next = &projected_first.output["suggested_call"];
-    assert_eq!(
-        projected_next["tool"],
-        crate::model_surface::ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME
-    );
-    assert_eq!(projected_next["arguments"]["tool"], "read_project_artifact");
-    assert_eq!(projected_next["arguments"]["arguments"], next["arguments"]);
+    // Model projection cannot advertise a hidden internal reader; typed/REST
+    // consumers keep the raw parser-ready continuation exercised below.
+    assert!(projected_first.output.get("suggested_call").is_none());
 
     let second_task = tokio::spawn({
         let runtime = runtime.clone();

@@ -694,15 +694,16 @@ fn computer_suggested_recovery_schema() -> Value {
                 "Parser-ready advisory display snapshot re-observation. It intentionally omits the spent snapshot_generation and grants no retry authority."
             ),
             suggested_tool_call_schema(
-                "read_project_artifact_metadata",
+                "project_artifact",
                 json!({
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
+                        "action": {"type": "string", "const": "metadata"},
                         "project": {"type": "string", "minLength": 1},
                         "path": {"type": "string", "minLength": 1, "maxLength": 4096}
                     },
-                    "required": ["project", "path"]
+                    "required": ["action", "project", "path"]
                 }),
                 "Parser-ready advisory artifact reconciliation using only the exact project/path already owned by the snapshot-save request. It grants no authority."
             )
@@ -718,7 +719,7 @@ fn apply_computer_recovery_contract(schema: &mut Value) {
         "reconcile_with".to_string(),
         json!({
             "type": "string",
-            "enum": ["computer_observe", "read_project_artifact_metadata"],
+            "enum": ["computer_observe", "project_artifact"],
             "description": "Non-actionable recovery family hint used only when a complete safe invocation cannot be proven. It is not execution authority."
         }),
     );

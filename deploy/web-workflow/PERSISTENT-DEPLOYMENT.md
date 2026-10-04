@@ -13,6 +13,39 @@ for publication. Work on source in this checkout; no new GitHub repository or
 push is part of relocation. Source and deployment-script edits do not require
 rebuilding the native binaries when Rust source is unchanged.
 
+## Local tool surface and upstream updates
+
+The local source uses the existing `ToolDefinition` visibility contract, not a
+second registry or a runtime profile. The model uses
+`rotate_agent_continuation_endpoint` and `project_artifact` with its
+`metadata`, `inspect`, `image` and `export` actions. The duplicate
+`attach_agent_endpoint`, `read_project_artifact_metadata`,
+`read_project_artifact`, and four `artifact_upload_*` primitives are
+`ModelHidden`: they remain available to authorized typed/internal consumers,
+but are not discoverable or callable through the model's MCP/GPT Actions
+gateway. Host attachment import and project-to-project transfer retain their
+internal upload protocol, authorization and content fences.
+
+This intentionally narrows the local model interface; it does not change the
+Server/Runner wire protocol, durable replay identities or persisted state.
+With the same features and protocol extensions as the original deployment,
+source discovery has seven fewer tools (151 to 144). This is a source change:
+the installed `app/` binaries change only through an explicitly authorized
+build and deployment. Refresh the Host connection's metadata after deployment
+and verify an actual gateway call in a new conversation.
+
+Upstream synchronization is explicit operator work. When authorized, fetch
+`upstream`, inspect the selected revision and divergence, and merge reviewed
+upstream changes into `coordexp/web-workflow` without overwriting local work or
+rewriting its history. Recheck the local visibility declarations, discovery
+catalog and recovery suggestions alongside the affected upstream contracts;
+then run focused model-admission and internal artifact-transfer/import checks.
+Keep source integration separate from deployment, with matching Server/Runner
+builds and rollback under the controlled-update procedure below. An existing
+remote-tracking ref is only the last fetched snapshot, not proof that this
+checkout matches current upstream. No automatic merge, deployment or push is
+performed, and conflict-free future updates are not guaranteed.
+
 ## Layout and prerequisites
 
 Paths below are relative to `deployment/` unless stated otherwise.

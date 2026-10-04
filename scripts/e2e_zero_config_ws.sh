@@ -644,13 +644,15 @@ done
 for tname in list_tools list_projects workspace_hygiene_check finish_coding_task \
     project_overview apply_patch apply_unified_diff go_test validation_summary git_status \
     goto_definition computer_observe computer_control computer_save_snapshot post_session_message \
-    coding_agent_start artifact_upload_begin; do
+    coding_agent_start; do
     if mcp_tool_present "$tname"; then
         adaptive_present=0
         fail "MCP tools/list must keep long-tail tool $tname behind call_runtime_tool"
     fi
 done
-for retired in read_file search_project_text job_status job_log git_diff git_diff_summary; do
+for retired in read_file search_project_text job_status job_log git_diff git_diff_summary \
+    attach_agent_endpoint read_project_artifact_metadata read_project_artifact \
+    artifact_upload_begin artifact_upload_chunk artifact_upload_finish artifact_upload_abort; do
     if mcp_tool_present "$retired"; then
         adaptive_present=0
         fail "MCP tools/list must not expose retired tool $retired"

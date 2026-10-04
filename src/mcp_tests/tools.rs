@@ -849,7 +849,7 @@ fn stateless_invocation_metadata_stays_typed_and_business_arguments_stay_clean()
 }
 
 #[test]
-fn read_project_artifact_stays_gateway_only_without_changing_generic_schema() {
+fn internal_artifact_reader_is_hidden_without_changing_wire_schema() {
     let payload = mcp_tools_list_payload_with_compact(false);
     assert!(payload["tools"]
         .as_array()
@@ -858,21 +858,16 @@ fn read_project_artifact_stays_gateway_only_without_changing_generic_schema() {
         .all(|tool| tool["name"] != "read_project_artifact"));
     assert_eq!(
         crate::model_surface::adaptive_runtime_tool_invocation_route("read_project_artifact"),
-        ("gateway", Some("call_runtime_tool"))
+        ("unavailable", None)
     );
-
-    let generic_tool = registered_tool_specs()
-        .into_iter()
-        .find(|tool| tool.name == "read_project_artifact")
-        .expect("generic read_project_artifact");
+    assert!(!registered_tool_specs()
+        .iter()
+        .any(|tool| tool.name == "read_project_artifact"));
+    let generic_schema = webcodex_tool_contracts::input_schema_for_tool("read_project_artifact");
     assert!(
-        generic_tool.input_schema["properties"]
-            .get("as_image")
-            .is_none(),
+        generic_schema["properties"].get("as_image").is_none(),
         "MCP image presentation must not change the generic REST/GPT Actions schema"
     );
-
-    assert!(generic_tool.description.to_lowercase().contains("bounded"));
 }
 
 #[test]

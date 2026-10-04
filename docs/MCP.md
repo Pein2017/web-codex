@@ -412,8 +412,13 @@ payloads through model text:
   are short-lived process-local presentation state, and the normal size, MIME,
   path, and authorization bounds remain in force.
 
-The lower-level `read_project_artifact_metadata` and `read_project_artifact`
-tools remain operator/gateway primitives. The legacy `export_project_artifact`
+The lower-level `read_project_artifact_metadata`, `read_project_artifact`, and
+four `artifact_upload_*` tools remain internal/CLI primitives, with their
+authorization, upload lifecycle and content fences unchanged. They are
+`ModelHidden`: model discovery and `call_runtime_tool` do not expose them.
+Models use `project_artifact`, host attachment import and direct Project
+transfer instead of selecting duplicate readers or orchestrating binary chunks.
+The legacy `export_project_artifact`
 compatibility tool has been removed; complete host delivery is exposed only as
 `project_artifact(action=export)`. Office artifacts such as DOCX/PPTX/XLSX and
 PDFs use the same underlying artifact transport and can therefore move between

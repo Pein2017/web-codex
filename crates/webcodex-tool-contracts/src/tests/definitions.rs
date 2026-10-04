@@ -1,6 +1,53 @@
 use super::*;
 
 #[test]
+fn consolidated_artifact_and_endpoint_tools_are_internal_only() {
+    let registered = registered_tool_names();
+    for name in [
+        "attach_agent_endpoint",
+        "read_project_artifact_metadata",
+        "read_project_artifact",
+        "artifact_upload_begin",
+        "artifact_upload_chunk",
+        "artifact_upload_finish",
+        "artifact_upload_abort",
+    ] {
+        let definition = lookup_tool_definition(name).expect("retained internal definition");
+        assert!(definition.visibility.is_model_hidden(), "{name}");
+        assert!(
+            !registered.iter().any(|candidate| candidate == name),
+            "{name}"
+        );
+        assert!(
+            definition.model_spec.is_some(),
+            "retained wire contract for {name}"
+        );
+        assert!(input_schema_for_tool(name).is_object(), "{name}");
+        assert!(output_schema_for_tool(name).is_object(), "{name}");
+        for group in TOOL_DISCOVERY_GROUPS {
+            assert!(!group.tools.contains(&name), "{}: {name}", group.name);
+        }
+        for flow in TOOL_RECOMMENDED_FLOWS {
+            assert!(!flow.tools.contains(&name), "{}: {name}", flow.name);
+        }
+        for intent in TOOL_MANIFEST_INTENTS {
+            assert!(!intent.tools.contains(&name), "{}: {name}", intent.name);
+        }
+    }
+    for canonical in [
+        "rotate_agent_continuation_endpoint",
+        "project_artifact",
+        "import_conversation_files_to_project",
+        "transfer_project_artifact",
+    ] {
+        assert!(
+            registered.iter().any(|name| name == canonical),
+            "{canonical}"
+        );
+    }
+}
+
+#[test]
 fn tool_definition_source_has_no_module_wide_dead_code_allowance() {
     let source = include_str!("../tool_definition.rs");
     assert!(
@@ -802,14 +849,8 @@ fn adaptive_runtime_direct_declarations_are_visible_ranked_and_unique() {
         "session_shell_exec",
         "session_shell_status",
         "close_session_shell",
-        "attach_agent_endpoint",
         "apply_patch",
         "save_project_artifact",
-        "read_project_artifact",
-        "artifact_upload_begin",
-        "artifact_upload_chunk",
-        "artifact_upload_finish",
-        "artifact_upload_abort",
         "go_test",
     ] {
         let definition = lookup_tool_definition(name).expect("model-visible long-tail definition");

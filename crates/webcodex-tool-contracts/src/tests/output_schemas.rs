@@ -1042,8 +1042,7 @@ fn ssh_resource_declares_explicit_canonical_action_output_fields() {
 fn key_tool_output_schemas_include_expected_fields() {
     let specs = registered_tool_specs();
     let has_output_field = |name: &str, field: &str| {
-        let spec = spec_named(&specs, name);
-        spec.output_schema["properties"]["output"]["properties"]
+        output_schema_for_tool(name)["properties"]["output"]["properties"]
             .as_object()
             .is_some_and(|props| props.contains_key(field))
     };
@@ -1821,9 +1820,9 @@ fn key_tool_output_schemas_include_expected_fields() {
             "read_project_artifact missing {field}"
         );
     }
-    let artifact_specs = registered_tool_specs();
-    let artifact_next = &spec_named(&artifact_specs, "read_project_artifact").output_schema
-        ["properties"]["output"]["properties"]["suggested_call"]["properties"]["arguments"];
+    let artifact_schema = output_schema_for_tool("read_project_artifact");
+    let artifact_next = &artifact_schema["properties"]["output"]["properties"]["suggested_call"]
+        ["properties"]["arguments"];
     assert_eq!(
         artifact_next["required"],
         json!([
@@ -2282,9 +2281,18 @@ fn computer_recovery_output_schemas_use_canonical_action_shapes() {
             false
         );
     }
-    assert!(variants.iter().any(|variant| {
-        variant["properties"]["tool"]["const"] == "read_project_artifact_metadata"
-    }));
+    let metadata = variants
+        .iter()
+        .find(|variant| variant["properties"]["tool"]["const"] == "project_artifact")
+        .expect("canonical artifact metadata recovery");
+    assert_eq!(
+        metadata["properties"]["arguments"]["properties"]["action"]["const"],
+        "metadata"
+    );
+    assert_eq!(
+        metadata["properties"]["arguments"]["required"],
+        json!(["action", "project", "path"])
+    );
 
     let schema = output_schema_for_tool("computer_observe");
     let canonical_recovery = json!({

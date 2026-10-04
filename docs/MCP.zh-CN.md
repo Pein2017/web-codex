@@ -315,8 +315,12 @@ stderr、provider stderr 或任意 provider prose。
   URI 本身不是独立 bearer authority；export handle 只是短期、process-local 的
   presentation state，现有大小、MIME、路径与 authorization 边界继续生效。
 
-底层 `read_project_artifact_metadata` 与 `read_project_artifact` 继续作为
-operator/gateway primitive 保留。旧的 `export_project_artifact` compatibility tool 已
+底层 `read_project_artifact_metadata`、`read_project_artifact` 和四个
+`artifact_upload_*` 工具继续作为内部/CLI primitive 保留，授权、上传生命周期和
+内容 fence 不变。它们标记为 `ModelHidden`，不再通过模型目录或
+`call_runtime_tool` 暴露。模型使用 `project_artifact`、host 附件导入和 Project
+间直接传输，不再选择重复读取入口或编排二进制 chunk。
+旧的 `export_project_artifact` compatibility tool 已
 删除；完整 host 交付统一通过 `project_artifact(action=export)` 暴露。DOCX/PPTX/XLSX
 等 Office artifact 与 PDF 仍复用同一底层 artifact transport，因此在支持这些 host
 能力的 ChatGPT 中，可以在 project 与 host 之间直接传递，而不需要模型手工搬运 Base64。
