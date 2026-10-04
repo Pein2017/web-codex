@@ -17,32 +17,41 @@ rebuilding the native binaries when Rust source is unchanged.
 
 Paths below are relative to `deployment/` unless stated otherwise.
 
-- `releases/<id>/`: immutable matching Server/Runner/CLI binaries, guidance, and the **complete**
+- `app/`: the single installed application directory, with matching native
+  Server/Runner/CLI binaries in `bin/`, guidance in `AGENTS.md`, and the complete
   workflow Plugin bundle (`plugin.mjs`, `pytest_report.py`, package metadata).
-- `current`: symlink selecting one release; state is never stored beneath it.
+  The directory contains the retained application bytes; moving them does not
+  change their build identity. Historical release directories remain evidence.
 - `config/`: private Server env, Runner TOML and Tunnel control-plane credentials.
+  `config/regular-tunnel-runtime/` holds the native CLI's fixed-path Tunnel
+  runtime state as a real directory.
 - `state/server/`: existing Server database, Workflow Sessions and private state;
   `state/project-registry/`: registered canonical worktrees.
 - `state/xdg/{config,data,cache,state}/`: dedicated XDG roots, including CLI
   state at `state/xdg/state/webcodex/`. The relocation includes the former
   `/data/CoordExp/.local/state/webcodex/` and all other dedicated state.
 - `bin/control.sh`, `bin/service.sh`: persistent startup/recovery entrypoints;
-  `bin/webcodex`: CLI entrypoint selecting `current/bin/webcodex-cli` and
+  `bin/webcodex`: CLI entrypoint executing `app/bin/webcodex-cli` and
   explicitly binding all four XDG roots without loading private credentials.
 - `logs/`, `verification/`, `rollback/`: private operational records and backups.
+  `rollback/simplify-install-20261004/retired-packages/` is the recoverable
+  holding area for removed legacy packages and the unused old CLI; none is
+  an active dependency. These bytes have not been permanently purged.
 - `verification/historical-local/`: retained historical material from the old
   `.local` layout. Old receipts preserve the paths and identities observed at
   their original acceptance; those recorded paths are not current commands.
-- `runtime/bin/`: persistent native CLI/Tunnel, a dedicated rg binary and a
-  link to the relocated Node package; `runtime/git/`: a self-contained newer
-  Git prefix. `../dependencies/` owns the dedicated Node package, CodeGraph
-  package at `../dependencies/codegraph/`, and retained historical dependency
-  material. The handwritten CodeGraph adapter and check script are tracked
-  source at `../deploy/codegraph/`. Unused legacy npm
-  and git-tools packages are historical material, not qualified active runtimes.
+- `runtime/bin/`: dedicated Tunnel client and rg binaries; `runtime/git/`: a
+  self-contained newer Git prefix. `../dependencies/codegraph/` owns CodeGraph
+  and its packaged Node executable at
+  `node_modules/@colbymchenry/codegraph-linux-x64/node`. Service PATH starts with
+  that package directory, then `runtime/bin` and `runtime/git/bin`; Runner adds
+  the selected ms Conda environment after those operator tools. The handwritten
+  CodeGraph adapter and check script are tracked source at `../deploy/codegraph/`.
 
-The standard-PATH `/data/CoordExp/.local/bin/webcodex` alias is only a symlink to
-`deployment/bin/webcodex`; its executable and dedicated data live in this tree.
+Use `/data/CoordExp/codex-tools/web-codex/deployment/bin/webcodex` directly, or
+explicitly add `deployment/bin` to your own PATH. Application entrypoints are
+real files in this tree; ordinary system and dependency-package links retain
+their standard roles.
 Shared system tools, the Conda environment, `/data/CoordExp/.codex` Skills and
 memories, and canonical research/project checkouts remain external prerequisites.
 
@@ -54,7 +63,8 @@ Selected Git configuration and GitHub credentials are copied privately into
 Training environments/GPU drivers are independent prerequisites, not recreated by WebCodex startup.
 The CoordExp Runner requires `/root/miniconda3/envs/ms/bin/python` and `python3`;
 its children default to that environment without activation. Persistent operator
-tools remain ahead of Conda on PATH; Server/Tunnel PATH is unchanged. The `ms`
+tools remain ahead of Conda on PATH; Server/Tunnel use the operator PATH without
+Conda. The `ms`
 environment is an explicit non-persistent container prerequisite: restore it after
 container recreation before starting Runner. Missing interpreters stop Runner
 startup rather than silently choosing system Python. Git must support `check-attr --source=HEAD`;
@@ -70,7 +80,7 @@ the externally hosted ChatGPT conversation can reach the Tunnel.
 ```bash
 bash /data/CoordExp/codex-tools/web-codex/deployment/bin/control.sh start
 bash /data/CoordExp/codex-tools/web-codex/deployment/bin/control.sh status
-webcodex --help
+/data/CoordExp/codex-tools/web-codex/deployment/bin/webcodex --help
 ```
 
 The dedicated tmux socket lives in `state/tmux.sock`; this does not touch the
@@ -83,51 +93,48 @@ Credentials remain the existing private files; do not paste them into commands.
 `WEBCODEX_DEPLOY_ROOT` can select an explicit alternate operator root. Each tmux
 window receives that root and `XDG_STATE_HOME=<root>/state/xdg/state` in its launch
 command, so a cached tmux environment cannot send state back to the former tree.
-The source `service.sh` also exports and creates the XDG state root alongside
-the config, data and cache roots. Existing immutable release launchers are
-selected unchanged; the explicit environment binds their deployment/state paths.
+`control.sh` always invokes `bin/service.sh`. That script exports and creates
+all four XDG roots, executes the binaries under `app/bin`, and points Server
+guidance at `app/AGENTS.md`. Startup requires the installed application and
+complete Plugin bundle, dedicated Node, Git, rg, Tunnel client and private
+configuration before it creates service windows.
 
-## Controlled update and rollback
+## Controlled update and recovery
 
-New deployment bundles include executable `service.sh` at their release root and
-their matching CLI at `bin/webcodex-cli`.
-`bin/control.sh` uses that versioned launcher when present; older releases use
-the retained `bin/service.sh`. Thus switching back also restores the former
-execution environment. Relocating the tree changes filesystem paths, not the
-immutable release's build identity or historical acceptance. The current native
-0.4.3 CLI and ms Runner environment remain selected. A configuration-only release
-may reuse unchanged native binaries: record the deployment source commit separately from their actual build
-commit, and verify hashes instead of claiming the binaries were rebuilt.
+`control.sh` supports only `start`, `stop` and `status`. Installation changes
+are explicit operator work on the real `app/` directory. Preserve the native
+0.4.3 build identity and selected ms Runner environment unless the authorized
+update changes them. An entrypoint-only update can reuse unchanged application
+bytes; record source and binary build identities separately.
 
 First inspect live Jobs and in-flight work through the authenticated runtime.
-Do not stop active research or execution just to switch a release. Save a
+Do not stop active research or execution merely to update the installation. Save a
 consistent stopped-state backup of `state/server`, `config` and the project
-registry, preserving permissions. Keep the previous immutable release untouched.
+registry, preserving permissions. Retain historical application bundles and
+backups for explicit recovery.
 
 ```bash
 bash /data/CoordExp/codex-tools/web-codex/deployment/bin/control.sh stop
-# Verify exact old Server/Runner/CLI/tunnel-client processes have exited.
-bash /data/CoordExp/codex-tools/web-codex/deployment/bin/control.sh switch <existing-release>
+# Verify exact Server/Runner/CLI/tunnel-client processes have exited.
+# Perform the explicitly authorized installation update or backup recovery.
 bash /data/CoordExp/codex-tools/web-codex/deployment/bin/control.sh start
 ```
 
-Switching is refused while the dedicated tmux session exists and never changes
-persistent state. Use the same sequence for the recorded rollback release. Do not
-restore a database backup over newer accepted work; restoring state is a separate
-explicit recovery decision. Validate matching Server/Runner build identities,
+Recovery uses a specifically selected retained backup or historical application
+bundle after services stop and process exit is verified. State restoration is a
+separate explicit decision; startup never restores a database automatically.
+Do not overwrite newer accepted work with an older database. Validate matching Server/Runner build identities,
 existing Session records, canonical projects, Skills, Plugin describe/call,
 pytest report parsing and Tunnel connectivity. Inspect permissions and remove no
 old data merely because the new process started.
 
-The migration receipt names the exact source/build, dependency checksums, backup
-and tested rollback target. A rollback package may repair an omitted packaging
-file without modifying the original immutable release; its identity and
-provenance must be recorded separately.
-
-The [ms Python acceptance](PYTHON-ENVIRONMENT-ACCEPTANCE.md) and OpenSpec
+The [clean-install acceptance](CLEAN-INSTALL-ACCEPTANCE.md) owns the current
+single-directory installation and its recovery locators.
+The [relocation acceptance](RELOCATION-ACCEPTANCE.md),
+[ms Python acceptance](PYTHON-ENVIRONMENT-ACCEPTANCE.md) and OpenSpec
 acceptance records are sealed historical evidence and retain their original
 path references. The former deployment's `verification/<id>/` and
 `rollback/<id>/` material now resides beneath the same relative paths in
 `/data/CoordExp/codex-tools/web-codex/deployment/`; other retained old-layout
-material is under `verification/historical-local/`. Consult the relocation
-receipt for exact retained locators instead of rewriting historical receipts.
+material is under `verification/historical-local/`. Consult the current
+clean-install receipt for operational paths instead of rewriting historical receipts.

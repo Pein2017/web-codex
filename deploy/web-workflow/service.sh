@@ -4,7 +4,8 @@ umask 077
 root="${WEBCODEX_DEPLOY_ROOT:-/data/CoordExp/codex-tools/web-codex/deployment}"
 service="${1:?Expected server, runner or tunnel}"
 case "$service" in server|runner|tunnel) ;; *) exit 2 ;; esac
-export PATH="$root/runtime/bin:$root/runtime/git/bin:/usr/bin:/bin"
+node_dir="$root/../dependencies/codegraph/node_modules/@colbymchenry/codegraph-linux-x64"
+export PATH="$node_dir:$root/runtime/bin:$root/runtime/git/bin:/usr/bin:/bin"
 export GIT_EXEC_PATH="$root/runtime/git/libexec/git-core"
 export GIT_TEMPLATE_DIR="$root/runtime/git/share/git-core/templates"
 export GIT_CONFIG_GLOBAL="$root/config/gitconfig"
@@ -22,9 +23,9 @@ case "$service" in
   server)
     export WEBCODEX_AUTHORITY_MODE=trusted_agent
     export WEBCODEX_MCP_COMPACT_SCHEMAS=true
-    export WEBCODEX_MCP_INSTRUCTIONS_FILE="$root/current/AGENTS.md"
+    export WEBCODEX_MCP_INSTRUCTIONS_FILE="$root/app/AGENTS.md"
     export WEBCODEX_ENV_FILE="$root/config/server.env"
-    command=("$root/current/bin/webcodex-server")
+    command=("$root/app/bin/webcodex-server")
     ;;
   runner)
     # This deployment's execution environment; do not change Server/Tunnel PATH.
@@ -32,15 +33,15 @@ case "$service" in
       test -x "$executable" || { echo "Missing ms interpreter: $executable; restore the Conda environment before starting Runner." >&2; exit 1; }
     done
     # Keep persistent operator tools (notably Git) ahead of Conda tools.
-    export PATH="$root/runtime/bin:$root/runtime/git/bin:/root/miniconda3/envs/ms/bin:/usr/bin:/bin"
-    command=("$root/current/bin/webcodex-runner" --config "$root/config/runner.toml")
+    export PATH="$node_dir:$root/runtime/bin:$root/runtime/git/bin:/root/miniconda3/envs/ms/bin:/usr/bin:/bin"
+    command=("$root/app/bin/webcodex-runner" --config "$root/config/runner.toml")
     ;;
   tunnel)
     set -a
     source "$root/config/tunnel.env"
     set +a
     export WEBCODEX_TUNNEL_CLIENT_BIN="$root/runtime/bin/tunnel-client"
-    command=("$root/current/bin/webcodex-cli" server tunnel --provider openai
+    command=("$root/app/bin/webcodex-cli" server tunnel --provider openai
       --env-file "$root/config/server.env" --json --stop-on-stdin-eof)
     ;;
 esac

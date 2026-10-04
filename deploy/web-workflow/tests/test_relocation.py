@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -49,20 +50,21 @@ if action == 'kill-session':
 if action == 'list-panes':
     print('webcodex:server pid=fixture dead=0')
 """)
-        self.release = self.root / "releases" / "fixture"
+        self.release = self.root / "app"
         self.release.mkdir(parents=True)
-        (self.root / "current").symlink_to("releases/fixture")
         for name in ("bin/webcodex-server", "bin/webcodex-runner", "bin/webcodex-cli"):
             self.executable(self.release / name, "#!/usr/bin/env bash\nexit 0\n")
-        for name in ("runtime/bin/webcodex-cli", "runtime/bin/tunnel-client",
-                     "runtime/bin/node", "runtime/git/bin/git"):
+        for name in ("runtime/bin/tunnel-client", "runtime/bin/rg", "runtime/git/bin/git"):
             self.executable(self.root / name, "#!/usr/bin/env bash\nexit 0\n")
+        self.node_dir = (self.root.parent / "dependencies/codegraph/node_modules"
+                         / "@colbymchenry/codegraph-linux-x64")
+        self.executable(self.node_dir / "node", "#!/usr/bin/env bash\necho package-node\n")
         for name in ("AGENTS.md", "plugins/web-workflow/plugin.mjs",
-                     "plugins/web-workflow/pytest_report.py"):
+                     "plugins/web-workflow/pytest_report.py", "plugins/web-workflow/package.json"):
             self.touch(self.release / name)
         for name in ("server.env", "runner.toml", "tunnel.env"):
             self.touch(self.root / "config" / name)
-        for path in (self.release / "service.sh", self.root / "bin" / "service.sh"):
+        for path in (self.root / "bin" / "service.sh",):
             self.executable(path, """#!/usr/bin/env python3
 import json, os, sys
 with open(os.environ['FAKE_SERVICE_CALLS'], 'a') as out:
@@ -83,10 +85,22 @@ with open(os.environ['FAKE_SERVICE_CALLS'], 'a') as out:
     def run_control(self, *args, env=None):
         return subprocess.run(["bash", str(SCRIPTS / "control.sh"), *args],
                               env=self.env if env is None else env,
-                              text=True, capture_output=True, timeout=10)
+                              stdin=subprocess.DEVNULL, text=True, capture_output=True, timeout=10)
 
     def recorded(self, path):
         return [json.loads(line) for line in path.read_text().splitlines()]
+
+    def legacy_fixture(self):
+        """Old paths are present only to prove that entrypoints never use them."""
+        old = self.root / "releases/fixture"
+        shutil.copytree(self.release, old)
+        shutil.copyfile(self.root / "bin/service.sh", old / "service.sh")
+        (old / "service.sh").chmod(0o755)
+        (self.root / "current").symlink_to("releases/fixture")
+        for name in ("webcodex-cli", "node"):
+            self.executable(self.root / "runtime/bin" / name,
+                            "#!/usr/bin/env bash\necho legacy-runtime\n")
+        return old
 
     def test_default_root_status(self):
         env = self.env.copy()
@@ -97,7 +111,7 @@ with open(os.environ['FAKE_SERVICE_CALLS'], 'a') as out:
                          ["-S", DEFAULT_ROOT + "/state/tmux.sock"])
 
     def test_three_launchers_override_cached_tmux_environment(self):
-        before = (self.release / "service.sh").read_bytes()
+        before = (self.root / "bin/service.sh").read_bytes()
         result = self.run_control("start")
         self.assertEqual(result.returncode, 0, result.stderr)
         launches = [args for args in self.recorded(self.calls)
@@ -108,22 +122,51 @@ with open(os.environ['FAKE_SERVICE_CALLS'], 'a') as out:
             command = shlex.split(args[-1])
             self.assertEqual(command, ["env", "WEBCODEX_DEPLOY_ROOT=" + str(self.root),
                                       "XDG_STATE_HOME=" + str(self.root / "state/xdg/state"),
-                                      str(self.root / "current/service.sh"), service])
+                                      str(self.root / "bin/service.sh"), service])
         self.assertEqual([row["service"] for row in self.recorded(self.executions)],
                          ["server", "runner", "tunnel"])
         for row in self.recorded(self.executions):
             self.assertEqual(row["root"], str(self.root))
             self.assertEqual(row["state"], str(self.root / "state/xdg/state"))
-        self.assertEqual((self.release / "service.sh").read_bytes(), before)
+        self.assertEqual((self.root / "bin/service.sh").read_bytes(), before)
+        self.assertFalse((self.root / "current").exists())
 
-    def test_legacy_launcher_fallback(self):
-        (self.release / "service.sh").unlink()
+    def test_legacy_launcher_is_never_selected(self):
+        self.legacy_fixture()
         result = self.run_control("start")
         self.assertEqual(result.returncode, 0, result.stderr)
         for row in self.recorded(self.executions):
             self.assertEqual(row["script"], str(self.root / "bin/service.sh"))
             self.assertEqual(row["root"], str(self.root))
             self.assertEqual(row["state"], str(self.root / "state/xdg/state"))
+
+    def test_missing_app_fails_despite_complete_old_current(self):
+        self.legacy_fixture()
+        shutil.rmtree(self.release)
+        result = self.run_control("start")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertFalse(self.executions.exists())
+
+    def test_preflight_requires_installed_assets_and_direct_node(self):
+        self.legacy_fixture()
+        paths = [self.release / name for name in
+                 ("bin/webcodex-cli", "AGENTS.md", "plugins/web-workflow/plugin.mjs",
+                  "plugins/web-workflow/pytest_report.py", "plugins/web-workflow/package.json")]
+        paths += [self.root / "runtime/bin/rg", self.node_dir / "node",
+                  self.root / "bin/service.sh"]
+        for path in paths:
+            with self.subTest(path=path):
+                saved = path.read_bytes()
+                mode = path.stat().st_mode
+                path.unlink()
+                try:
+                    result = self.run_control("start")
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertFalse(self.executions.exists())
+                finally:
+                    path.write_bytes(saved)
+                    path.chmod(mode)
+                    self.executions.unlink(missing_ok=True)
 
     def test_existing_session_start_status_stop(self):
         self.live.touch()
@@ -132,7 +175,7 @@ with open(os.environ['FAKE_SERVICE_CALLS'], 'a') as out:
         self.assertFalse(self.executions.exists())
         result = self.run_control("status")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("releases/fixture", result.stdout)
+        self.assertNotIn("No current release", result.stdout)
         self.assertIn("pid=fixture", result.stdout)
         result = self.run_control("stop")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -140,36 +183,35 @@ with open(os.environ['FAKE_SERVICE_CALLS'], 'a') as out:
         result = self.run_control("status")
         self.assertIn("services are stopped", result.stdout)
 
-    def test_switch_requires_stopped_complete_named_release(self):
+    def test_switch_is_rejected_without_mutation(self):
+        self.legacy_fixture()
         state = self.root / "state" / "retained"
         self.touch(state)
         state.write_text("persistent fixture")
-        self.live.touch()
-        result = self.run_control("switch", "fixture")
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(os.readlink(self.root / "current"), "releases/fixture")
-        self.live.unlink()
-        for version in ("../fixture", "missing"):
+        before = os.readlink(self.root / "current")
+        for version in ("fixture", "../fixture", "missing"):
             result = self.run_control("switch", version)
-            self.assertEqual(result.returncode, 1)
-        (self.root / "current").unlink()
-        result = self.run_control("switch", "fixture")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(os.readlink(self.root / "current"), "releases/fixture")
+            self.assertEqual(result.returncode, 2)
+        self.assertEqual(os.readlink(self.root / "current"), before)
         self.assertEqual(state.read_text(), "persistent fixture")
         self.assertEqual(list(self.root.glob(".current.*.tmp")), [])
 
     def test_service_owns_xdg_state_root(self):
         self.executable(self.release / "bin/webcodex-server", """#!/usr/bin/env python3
-import json, os, signal
+import json, os, signal, shutil, subprocess
 with open(os.environ['FAKE_SERVICE_CALLS'], 'a') as out:
-    out.write(json.dumps({key: os.environ.get(key) for key in
+    row = {key: os.environ.get(key) for key in
               ('XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME',
-               'WEBCODEX_MCP_INSTRUCTIONS_FILE')}) + '\\n')
+               'WEBCODEX_MCP_INSTRUCTIONS_FILE')}
+    row['node'] = shutil.which('node')
+    row['node_probe'] = subprocess.check_output(['node', '--version'], text=True).strip()
+    out.write(json.dumps(row) + '\\n')
 os.kill(os.getppid(), signal.SIGTERM)
 """)
+        self.legacy_fixture()
         result = subprocess.run(["bash", str(SCRIPTS / "service.sh"), "server"],
-                                env=self.env, text=True, capture_output=True, timeout=10)
+                                env=self.env, stdin=subprocess.DEVNULL,
+                                text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         row = self.recorded(self.executions)[0]
         for key, suffix in (("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"),
@@ -178,21 +220,25 @@ os.kill(os.getppid(), signal.SIGTERM)
             self.assertEqual(row[key], str(expected))
             self.assertTrue(expected.is_dir())
         self.assertEqual(row["WEBCODEX_MCP_INSTRUCTIONS_FILE"],
-                         str(self.root / "current/AGENTS.md"))
+                         str(self.root / "app/AGENTS.md"))
+        self.assertEqual(Path(row["node"]).resolve(), (self.node_dir / "node").resolve())
+        self.assertEqual(row["node_probe"], "package-node")
 
     def test_cli_wrapper_preserves_arguments_and_binds_xdg_roots(self):
         self.executable(self.release / "bin/webcodex-cli", """#!/usr/bin/env python3
 import json, os, sys
-print(json.dumps({'args': sys.argv[1:], 'xdg': {key: os.environ.get(key) for key in
+print(json.dumps({'script': sys.argv[0], 'args': sys.argv[1:], 'xdg': {key: os.environ.get(key) for key in
       ('XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME')}}))
 """)
+        self.legacy_fixture()
         env = dict(self.env, XDG_CONFIG_HOME="/stale/config", XDG_DATA_HOME="/stale/data",
                    XDG_CACHE_HOME="/stale/cache", XDG_STATE_HOME="/stale/state")
         args = ["--help", "argument with spaces", "", "$literal;$(not-a-command)"]
         result = subprocess.run([str(SCRIPTS / "webcodex"), *args], env=env,
-                                text=True, capture_output=True, timeout=10)
+                                stdin=subprocess.DEVNULL, text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         row = json.loads(result.stdout)
+        self.assertEqual(row["script"], str(self.root / "app/bin/webcodex-cli"))
         self.assertEqual(row["args"], args)
         for key, suffix in (("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"),
                             ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state")):
