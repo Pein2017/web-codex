@@ -7,6 +7,8 @@ __pycache__/
 
 # Local runtime data (SQLite DB and durable runtime state)
 data*
+/deployment/
+/dependencies/
 
 # Local Codex CLI workspace
 .codex

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root="${WEBCODEX_DEPLOY_ROOT:-/data/CoordExp/codex-tools/web-codex/deployment}"
+export XDG_CONFIG_HOME="$root/state/xdg/config"
+export XDG_DATA_HOME="$root/state/xdg/data"
+export XDG_CACHE_HOME="$root/state/xdg/cache"
+export XDG_STATE_HOME="$root/state/xdg/state"
+exec "$root/current/bin/webcodex-cli" "$@"

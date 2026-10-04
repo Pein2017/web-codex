@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Operator-local lifecycle; dedicated tmux socket never targets research sessions.
 set -euo pipefail
-root="${WEBCODEX_DEPLOY_ROOT:-/data/CoordExp/.local/webcodex-custom}"
+root="${WEBCODEX_DEPLOY_ROOT:-/data/CoordExp/codex-tools/web-codex/deployment}"
 socket="$root/state/tmux.sock"
 session=webcodex
 action="${1:-status}"
@@ -29,7 +29,10 @@ case "$action" in
     # New releases own their environment; old releases retain the legacy launcher.
     service_script="$root/current/service.sh"
     if [[ ! -x "$service_script" ]]; then service_script="$root/bin/service.sh"; fi
-    printf -v launcher '%q' "$service_script"
+    # tmux may retain an environment from before relocation. Bind every window
+    # explicitly without modifying the selected immutable release launcher.
+    printf -v launcher 'env %q %q %q' "WEBCODEX_DEPLOY_ROOT=$root" \
+      "XDG_STATE_HOME=$root/state/xdg/state" "$service_script"
     tmux -S "$socket" new-session -d -s "$session" -n server -c /data/CoordExp "$launcher server"
     tmux -S "$socket" new-window -d -t "$session" -n runner -c /data/CoordExp "$launcher runner"
     tmux -S "$socket" new-window -d -t "$session" -n tunnel -c /data/CoordExp "$launcher tunnel"

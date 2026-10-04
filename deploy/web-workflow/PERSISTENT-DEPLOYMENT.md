@@ -1,10 +1,21 @@
 # CoordExp container recovery
 
-The operator root is `/data/CoordExp/.local/webcodex-custom/`. Source remains at
-`/data/CoordExp/.local/src/webcodex-mcp-instructions`. Only `/data` is assumed durable.
+The source checkout is `/data/CoordExp/codex-tools/web-codex/`; its operator root
+is `deployment/` and dedicated dependency packages live in `dependencies/`.
+Only `/data` is assumed durable. Both runtime directories are root-anchored
+Git ignores, including their private configuration and credentials.
 This is a named Linux dogfood deployment, not an npm or GitHub release.
 
+This complete Git checkout is the local fork, with its existing history and
+`coordexp/web-workflow` branch preserved. `upstream` already points to
+`https://github.com/yyjeqhc/webcodex.git`; the existing `origin` remains optional
+for publication. Work on source in this checkout; no new GitHub repository or
+push is part of relocation. Source and deployment-script edits do not require
+rebuilding the native binaries when Rust source is unchanged.
+
 ## Layout and prerequisites
+
+Paths below are relative to `deployment/` unless stated otherwise.
 
 - `releases/<id>/`: immutable matching Server/Runner/CLI binaries, guidance, and the **complete**
   workflow Plugin bundle (`plugin.mjs`, `pytest_report.py`, package metadata).
@@ -12,11 +23,28 @@ This is a named Linux dogfood deployment, not an npm or GitHub release.
 - `config/`: private Server env, Runner TOML and Tunnel control-plane credentials.
 - `state/server/`: existing Server database, Workflow Sessions and private state;
   `state/project-registry/`: registered canonical worktrees.
-- `bin/control.sh`, `bin/service.sh`: persistent startup/recovery entrypoints.
+- `state/xdg/{config,data,cache,state}/`: dedicated XDG roots, including CLI
+  state at `state/xdg/state/webcodex/`. The relocation includes the former
+  `/data/CoordExp/.local/state/webcodex/` and all other dedicated state.
+- `bin/control.sh`, `bin/service.sh`: persistent startup/recovery entrypoints;
+  `bin/webcodex`: CLI entrypoint selecting `current/bin/webcodex-cli` and
+  explicitly binding all four XDG roots without loading private credentials.
 - `logs/`, `verification/`, `rollback/`: private operational records and backups.
-- `runtime/bin/`: persistent native CLI/Tunnel and links to persistent Node/rg;
-  `runtime/git/`: a self-contained newer Git prefix. Existing CodeGraph package,
-  adapter, projects, Skills and memories already live under `/data` and remain there.
+- `verification/historical-local/`: retained historical material from the old
+  `.local` layout. Old receipts preserve the paths and identities observed at
+  their original acceptance; those recorded paths are not current commands.
+- `runtime/bin/`: persistent native CLI/Tunnel, a dedicated rg binary and a
+  link to the relocated Node package; `runtime/git/`: a self-contained newer
+  Git prefix. `../dependencies/` owns the dedicated Node package, CodeGraph
+  package at `../dependencies/codegraph/`, and retained historical dependency
+  material. The handwritten CodeGraph adapter and check script are tracked
+  source at `../deploy/codegraph/`. Unused legacy npm
+  and git-tools packages are historical material, not qualified active runtimes.
+
+The standard-PATH `/data/CoordExp/.local/bin/webcodex` alias is only a symlink to
+`deployment/bin/webcodex`; its executable and dedicated data live in this tree.
+Shared system tools, the Conda environment, `/data/CoordExp/.codex` Skills and
+memories, and canonical research/project checkouts remain external prerequisites.
 
 The container image must provide Linux x86-64 with compatible glibc/libstdc++,
 Bash, coreutils, tmux, Python >=3.10, system CA certificates and ordinary local
@@ -40,8 +68,9 @@ the externally hosted ChatGPT conversation can reach the Tunnel.
 ## Restore after container recreation
 
 ```bash
-bash /data/CoordExp/.local/webcodex-custom/bin/control.sh start
-bash /data/CoordExp/.local/webcodex-custom/bin/control.sh status
+bash /data/CoordExp/codex-tools/web-codex/deployment/bin/control.sh start
+bash /data/CoordExp/codex-tools/web-codex/deployment/bin/control.sh status
+webcodex --help
 ```
 
 The dedicated tmux socket lives in `state/tmux.sock`; this does not touch the
@@ -51,6 +80,12 @@ Jobs before stopping/restarting; do not blindly launch a second runtime. Service
 loops append private logs and retry unexpected exits. Restore network access,
 then check the Tunnel ready event as well as authenticated Server/Runner status.
 Credentials remain the existing private files; do not paste them into commands.
+`WEBCODEX_DEPLOY_ROOT` can select an explicit alternate operator root. Each tmux
+window receives that root and `XDG_STATE_HOME=<root>/state/xdg/state` in its launch
+command, so a cached tmux environment cannot send state back to the former tree.
+The source `service.sh` also exports and creates the XDG state root alongside
+the config, data and cache roots. Existing immutable release launchers are
+selected unchanged; the explicit environment binds their deployment/state paths.
 
 ## Controlled update and rollback
 
@@ -58,20 +93,22 @@ New deployment bundles include executable `service.sh` at their release root and
 their matching CLI at `bin/webcodex-cli`.
 `bin/control.sh` uses that versioned launcher when present; older releases use
 the retained `bin/service.sh`. Thus switching back also restores the former
-execution environment. A configuration-only release may reuse unchanged native
-binaries: record the deployment source commit separately from their actual build
+execution environment. Relocating the tree changes filesystem paths, not the
+immutable release's build identity or historical acceptance. The current native
+0.4.3 CLI and ms Runner environment remain selected. A configuration-only release
+may reuse unchanged native binaries: record the deployment source commit separately from their actual build
 commit, and verify hashes instead of claiming the binaries were rebuilt.
 
 First inspect live Jobs and in-flight work through the authenticated runtime.
 Do not stop active research or execution just to switch a release. Save a
 consistent stopped-state backup of `state/server`, `config` and the project
-registry, preserving permissions. Keep the old deployment untouched.
+registry, preserving permissions. Keep the previous immutable release untouched.
 
 ```bash
-bash /data/CoordExp/.local/webcodex-custom/bin/control.sh stop
+bash /data/CoordExp/codex-tools/web-codex/deployment/bin/control.sh stop
 # Verify exact old Server/Runner/CLI/tunnel-client processes have exited.
-bash /data/CoordExp/.local/webcodex-custom/bin/control.sh switch <existing-release>
-bash /data/CoordExp/.local/webcodex-custom/bin/control.sh start
+bash /data/CoordExp/codex-tools/web-codex/deployment/bin/control.sh switch <existing-release>
+bash /data/CoordExp/codex-tools/web-codex/deployment/bin/control.sh start
 ```
 
 Switching is refused while the dedicated tmux session exists and never changes
@@ -86,3 +123,11 @@ The migration receipt names the exact source/build, dependency checksums, backup
 and tested rollback target. A rollback package may repair an omitted packaging
 file without modifying the original immutable release; its identity and
 provenance must be recorded separately.
+
+The [ms Python acceptance](PYTHON-ENVIRONMENT-ACCEPTANCE.md) and OpenSpec
+acceptance records are sealed historical evidence and retain their original
+path references. The former deployment's `verification/<id>/` and
+`rollback/<id>/` material now resides beneath the same relative paths in
+`/data/CoordExp/codex-tools/web-codex/deployment/`; other retained old-layout
+material is under `verification/historical-local/`. Consult the relocation
+receipt for exact retained locators instead of rewriting historical receipts.

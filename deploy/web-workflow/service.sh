@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
-root="${WEBCODEX_DEPLOY_ROOT:-/data/CoordExp/.local/webcodex-custom}"
+root="${WEBCODEX_DEPLOY_ROOT:-/data/CoordExp/codex-tools/web-codex/deployment}"
 service="${1:?Expected server, runner or tunnel}"
 case "$service" in server|runner|tunnel) ;; *) exit 2 ;; esac
 export PATH="$root/runtime/bin:$root/runtime/git/bin:/usr/bin:/bin"
@@ -12,10 +12,11 @@ export GH_CONFIG_DIR="$root/config/gh"
 export XDG_CONFIG_HOME="$root/state/xdg/config"
 export XDG_DATA_HOME="$root/state/xdg/data"
 export XDG_CACHE_HOME="$root/state/xdg/cache"
+export XDG_STATE_HOME="$root/state/xdg/state"
 export HTTP_PROXY=http://127.0.0.1:9090 HTTPS_PROXY=http://127.0.0.1:9090 ALL_PROXY=http://127.0.0.1:9090
 export http_proxy="$HTTP_PROXY" https_proxy="$HTTPS_PROXY" all_proxy="$ALL_PROXY"
 export NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost
-mkdir -p "$root/logs" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME"
+mkdir -p "$root/logs" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME"
 exec >> "$root/logs/$service.log" 2>&1
 case "$service" in
   server)
