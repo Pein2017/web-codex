@@ -11,6 +11,23 @@ impl std::fmt::Debug for SqliteJobReceiptStore {
 }
 
 impl JobReceiptStore for SqliteJobReceiptStore {
+    fn upsert_archive(
+        &self,
+        receipt: &webcodex_core::runner_job_receipt::ArchivedJobReceipt,
+    ) -> Result<(), String> {
+        self.0
+            .upsert_job_archive(receipt, chrono::Utc::now().timestamp())
+            .map_err(|_| "Job archive write failed".into())
+    }
+    fn load_archive(
+        &self,
+        job_id: &str,
+        now: i64,
+    ) -> Result<Option<webcodex_core::runner_job_receipt::ArchivedJobReceipt>, String> {
+        self.0
+            .load_job_archive(job_id, now)
+            .map_err(|_| "Job archive read failed".into())
+    }
     fn upsert(&self, receipt: &RetainedJobReceipt) -> Result<(), String> {
         self.0
             .upsert_job_receipt(receipt, chrono::Utc::now().timestamp())

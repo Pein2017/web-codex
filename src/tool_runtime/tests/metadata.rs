@@ -373,6 +373,7 @@ async fn register_agent_projects_for_auth(
                 host_context: None,
                 capabilities: crate::test_support::current_runner_capabilities(
                     RunnerCapabilities {
+                        job_output_archive: false,
                         shell: true,
                         explicit_shell_selection: false,
                         bash_login_shell: false,
@@ -998,6 +999,7 @@ async fn repository_knowledge_association_revalidates_identity_availability_and_
     let target_fingerprint = format!("wc_projroot_{}", "2".repeat(64));
     let base_sha = "a".repeat(40);
     let caps = RunnerCapabilities {
+        job_output_archive: false,
         shell: true,
         file_read: true,
         file_write: true,
@@ -1250,6 +1252,7 @@ async fn replacement_runner_pending_inventory_has_zero_project_routing_authority
     let path_b = path_b.path().to_string_lossy().to_string();
     let project_id = crate::tool_runtime::runner_project_runtime_id(client_id, "demo");
     let capabilities = RunnerCapabilities {
+        job_output_archive: false,
         shell: true,
         file_read: true,
         file_write: true,
@@ -1437,6 +1440,7 @@ async fn replacement_runner_removed_project_never_inherits_old_authority() {
     let old_root = old_root.path().to_string_lossy().to_string();
     let project_id = crate::tool_runtime::runner_project_runtime_id(client_id, "demo");
     let capabilities = RunnerCapabilities {
+        job_output_archive: false,
         shell: true,
         file_read: true,
         file_write: true,
@@ -1729,6 +1733,7 @@ async fn unique_short_agent_project_id_is_resolved_by_runtime_surface() {
         "oe",
         None,
         RunnerCapabilities {
+            job_output_archive: false,
             shell: true,
             ..Default::default()
         },
@@ -1789,6 +1794,7 @@ async fn runner_capability_rejection_matrix_names_required_capability() {
         (
             "cap-shell",
             RunnerCapabilities {
+                job_output_archive: false,
                 shell: false,
                 ..Default::default()
             },
@@ -1798,6 +1804,7 @@ async fn runner_capability_rejection_matrix_names_required_capability() {
         (
             "cap-git",
             RunnerCapabilities {
+                job_output_archive: false,
                 shell: false,
                 ..Default::default()
             },

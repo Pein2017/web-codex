@@ -353,6 +353,7 @@ pub fn generated_runner_config_toml(opts: &RunnerInitOptions) -> Result<String, 
             // be inferred from computer_control in generated static config.
             computer_text_input: false,
             job_state_reconciliation: false,
+            job_output_archive: false,
             // ACP autonomous coding is a runtime-only capability and must not be
             // silently enabled by generated legacy agent config.
             coding_agent_runs: false,

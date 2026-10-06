@@ -496,6 +496,81 @@ fn generic_assertion_success_cannot_resolve_structured_failure_with_hidden_asser
 }
 
 #[test]
+fn expected_negative_cannot_resolve_real_assertion_failure_or_certify_source() {
+    let store = SessionStore::default();
+    let project = "agent:validation-identity:negative";
+    let session = store.start_session(Some(project.to_string()), None);
+    let assertion = "same stable assertion";
+    record_run_process(
+        &store,
+        &session.session_id,
+        project,
+        "test",
+        "real-failure",
+        Some(assertion),
+        false,
+    );
+    let mut request = run_process_request(project, "test", "expected-negative", Some(assertion));
+    request["result_expectation"] = json!("failure");
+    let (call, metadata) =
+        crate::tool_runtime::parse_tool_call_with_recorder_metadata("run_process", request)
+            .unwrap();
+    let start = store.record_tool_call_started_with_metadata(
+        Some(&session.session_id),
+        SessionTransport::Mcp,
+        "run_process",
+        &call.session_log_arguments(),
+        Some(project.to_string()),
+        metadata,
+        crate::tool_runtime::sessions::session_tool_contract("run_process"),
+    );
+    store.record_tool_call_finished(
+        start,
+        false,
+        &json!({
+            "exit_code":1,"purpose":"test","execution_state":"completed",
+            "command_started":true,"command_completed":true,
+            "stdout_tail":"validation failed\n","stderr_tail":"",
+        }),
+        Some("expected negative"),
+        None,
+    );
+    let validation =
+        validation_summary_for_session(&store.summary(&session.session_id, Some(20)).unwrap());
+    assert_eq!(validation["expected_results"], 1);
+    assert_eq!(validation["unresolved_failures"]["count"], 1);
+    assert_eq!(validation["resolved_failures"]["count"], 0);
+    assert_eq!(validation["latest"]["validation_passed"], false);
+    record_run_process(
+        &store,
+        &session.session_id,
+        project,
+        "test",
+        "unrelated-pass",
+        Some("other assertion"),
+        true,
+    );
+    let validation =
+        validation_summary_for_session(&store.summary(&session.session_id, Some(20)).unwrap());
+    assert_eq!(validation["unresolved_failures"]["count"], 1);
+    record_run_process(
+        &store,
+        &session.session_id,
+        project,
+        "test",
+        "repaired-pass",
+        Some(assertion),
+        true,
+    );
+    let validation =
+        validation_summary_for_session(&store.summary(&session.session_id, Some(20)).unwrap());
+    assert_eq!(validation["unresolved_failures"]["count"], 0);
+    assert_eq!(validation["resolved_failures"]["count"], 1);
+    assert_eq!(validation["latest_status"], "passed");
+    assert_eq!(validation["current_evidence"]["status"], "unproven");
+}
+
+#[test]
 fn assertion_name_is_inert_for_non_validation_execution() {
     let store = SessionStore::default();
     let project = "agent:validation-identity:diagnostic";

@@ -475,7 +475,38 @@ fn observe_jobs_batch_followup_arguments_schema() -> Value {
     schema
 }
 
+fn archive_stream_schema() -> Value {
+    json!({
+        "type": "object", "additionalProperties": false,
+        "properties": {
+            "retained_bytes": {"type": "integer", "minimum": 0, "maximum": 16777216},
+            "next_line": {"type": "integer", "minimum": 1},
+            "loss_reason": {"anyOf": [{"type": "null"}, {"type": "string", "enum": ["stream_limit", "quota", "backpressure", "storage_failure"]}]}
+        },
+        "required": ["retained_bytes", "next_line", "loss_reason"]
+    })
+}
+
 fn observe_jobs_output_schema() -> Value {
+    let terminal_fact = json!({
+        "type": "object", "additionalProperties": false,
+        "description": "Authenticated immutable terminal facts only when a fresh Server cannot verify the offline Runner's current Project. This is not output, metadata or execution authority.",
+        "properties": {
+            "job_id": {"type": "string", "minLength": 1},
+            "status": {"type": "string", "enum": ["completed", "failed", "timed_out", "cancelled", "lost"]},
+            "exit_code": nullable_schema("integer", "Recorded exit code, not a new execution.")
+        },
+        "required": ["job_id", "status", "exit_code"]
+    });
+    let archive = json!({
+        "type": "object", "additionalProperties": false,
+        "description": "Root-verified retained decoded output bounds; no filesystem locator. Quota/expiry may make bytes unavailable before the maximum retention age.",
+        "properties": {
+            "committed_at": {"type": "integer"},
+            "stdout": archive_stream_schema(), "stderr": archive_stream_schema()
+        },
+        "required": ["committed_at", "stdout", "stderr"]
+    });
     let mut job_observation = json!({
         "type": "object",
         "additionalProperties": true,
@@ -623,6 +654,15 @@ fn observe_jobs_output_schema() -> Value {
             "observation_token"
         ]
     });
+    for observation in [&mut job_observation, &mut sparse_job_observation] {
+        observation["properties"]["archive"] =
+            json!({"anyOf": [archive.clone(), {"type": "null"}]});
+        observation["properties"]["archive_unavailable"] = schema_type("boolean", "Committed output is missing, expired, capped or unsupported; this is not empty complete output.");
+        observation["properties"]["archive_unavailable_reason"] = nullable_schema(
+            "string",
+            "Bounded archive availability diagnostic, never a filesystem path.",
+        );
+    }
     let summary_detail_call = suggested_tool_call_schema(
         "observe_jobs",
         json!({
@@ -677,7 +717,7 @@ fn observe_jobs_output_schema() -> Value {
             "index": {"type": "integer", "minimum": 0, "maximum": 7},
             "job_id": {"anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]},
             "success": {"type": "boolean"},
-            "output": {"anyOf": [job_observation.clone(), {"type": "null"}]},
+            "output": {"anyOf": [job_observation.clone(), terminal_fact.clone(), {"type": "null"}]},
             "error_kind": {"anyOf": [{"type": "string"}, {"type": "null"}]},
             "recovery_kind": recovery_kind_schema(),
             "suggested_call": list_jobs_recovery_call_schema(false),
@@ -696,7 +736,7 @@ fn observe_jobs_output_schema() -> Value {
             "then": {
                 "properties": {
                     "job_id": {"type": "string", "minLength": 1},
-                    "output": job_observation,
+                    "output": {"anyOf": [job_observation, terminal_fact.clone()]},
                     "error_kind": {"type": "null"},
                     "recovery_kind": {"type": "null", "const": "__forbidden_on_success__"},
                     "suggested_call": {"type": "null", "const": "__forbidden_on_success__"},
@@ -798,7 +838,7 @@ fn observe_jobs_output_schema() -> Value {
                 "type": "array",
                 "minItems": 1,
                 "maxItems": 8,
-                "items": sparse_job_observation
+                "items": {"anyOf": [sparse_job_observation, terminal_fact]}
             },
             "wait": {
                 "type": "object",

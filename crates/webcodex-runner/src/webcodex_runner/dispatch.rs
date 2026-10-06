@@ -396,6 +396,25 @@ pub(crate) fn dispatch_request_with_outcome(
     let shell = &config.shell;
 
     let dispatch_result = match invocation.operation {
+        RunnerOperation::JobArchiveRead(read) => {
+            let result = jobs.read_archive(&read, project_registry_dir);
+            let (stdout, error) = match result {
+                Ok(page) => (serde_json::to_string(&page).ok(), None),
+                Err(error) => (None, Some(error)),
+            };
+            let result = CommandResult {
+                stdout,
+                stderr: None,
+                exit_code: Some(if error.is_none() { 0 } else { 1 }),
+                duration_ms: Some(0),
+                error,
+            };
+            sink.submit_result_with_metadata(request_id, result, config, runtime)?;
+            return Ok(RunnerDispatchOutcome {
+                handled: true,
+                project_cache_invalidation_required: false,
+            });
+        }
         RunnerOperation::CodingAgent(operation) => {
             let response = match runtime.coding_agents() {
                 Some(manager) => manager.handle(operation, project_registry_dir),

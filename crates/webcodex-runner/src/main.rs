@@ -1414,6 +1414,7 @@ fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabilities {
     capabilities.explicit_shell_selection = true;
     capabilities.bash_login_shell = true;
     capabilities.jobs = true;
+    capabilities.job_output_archive = cfg!(unix);
     capabilities.file_read = true;
     capabilities.file_write = true;
     // This binary implements the narrow internal seek/read export-chunk path.

@@ -12,6 +12,7 @@ pub(crate) mod dispatch;
 pub(crate) mod exit_diagnostics;
 pub(crate) mod external_tools;
 pub(crate) mod files;
+pub(crate) mod job_archive;
 pub(crate) mod job_manager;
 pub(crate) mod lsp;
 pub(crate) mod managed_ssh;

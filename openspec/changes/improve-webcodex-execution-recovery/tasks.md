@@ -1,0 +1,41 @@
+## 1. Baseline, critical seams and lifecycle reproduction
+
+- [x] 1.1 Recheck the physical fork HEAD/dirty ownership, installed Server/Runner identity and live Jobs; create one compact `verification.md` at this change with exact source/runtime locators and prove unrelated checkout work is excluded.
+- [x] 1.2 Before expanding archive/preflight effort, complete their smallest real caller-to-consumer vertical slice on disposable Server/Runner state: verify exact archive lookup/restart plus previous-app reading candidate-written small metadata, and the supported native sandbox probe in the actual Runner context. Retain real terminal evidence and any HOLD; mocks alone cannot close these integration risks.
+- [x] 1.3 Reproduce the recorded `structured_job_lifecycle_invalid` using bounded disposable real Server/Runner shell admission/start/terminal paths and correlated full trace; retain the exact invalid update and consumer rejection, or mark the protocol repair HOLD without claiming a root cause.
+- [x] 1.4 Add a deterministic regression for that producer/ordering defect and implement the narrow correction; prove baseline RED/candidate GREEN, unchanged invalid-state rejection and exactly one payload side effect in the real caller path.
+
+## 2. Bounded same-Job evidence retention
+
+- [ ] 2.1 Extend the native Runner output/Job owner with exact decoded capped streams and atomic terminal receipts in the stable Server-endpoint/Runner-client namespace; verify live-tail/archive overflow, receipt crash boundaries, disk failure and bounded buffering without blocking pipe drain or changing exit truth, plus concurrent owned-root total quota including temporary files and receipt/index overhead.
+- [x] 2.2 Integrate bounded authenticated archive locators in the existing Server receipt owner and exact-id historical lookup through existing Job readers, separately from live inventory/24-hour expiry; verify progressing pages from line 1 through output larger than 64 KiB and reads after more than 64 terminal Jobs and simulated age beyond 24 hours, with original identity and no redispatch or archive-wide registration.
+- [ ] 2.3 Qualify restart, archive expiry/quota and access boundaries on disposable real Server/Runner instances; verify committed terminal recovery across transient instance replacement, offline-Runner output unavailable, and the user-approved fresh-Server/offline dedicated three-field terminal-fact projection under current authentication/admission ownership without output or metadata disclosure/dispatch/deadline renewal. Verify lost/unknown ordinary active Jobs, archive-unavailable old receipts, unauthorized/revoked/retargeted Project reads and path/symlink rejection, with active archives and unrelated state preserved and exact evidence distinct from sanitized diagnostics.
+
+## 3. Authorized Work Result selectors
+
+- [x] 3.1 Remove the redundant original-spelling rejection after authenticated canonical resolution and update the stale dispatch comment; verify canonical id, current principal Project reference and unique short name return the same explicit Session result through the existing runtime/MCP path.
+- [x] 3.2 Retain semantic fences and add negative consumer checks; prove ambiguous/stale/other-principal references, revoked targets and explicit cross-Project Session conflicts fail without target inference, hidden recording or mutation.
+
+## 4. No-effect source observations
+
+- [x] 4.1 Refine existing potential-writer accounting with atomic completion/generation/active-count updates and a small named set of authoritative internal pre-first-write proofs; verify a rejected guarded edit that never began a write does not alone stale earlier evidence, while evidence remains unproven and active writers remain non-quiescent.
+- [x] 4.2 Prove counterexamples for weak no-effect claims, write-then-rollback overlapping validation (including the retained parent-creation fixture), concurrent real/unknown writers, asynchronous handoff, abandoned guards, cancellation, epoch/capacity exhaustion and restart; verify no generation rollback or uncertainty clearing, and no blanket commit/exit-zero/net-zero exemption.
+- [x] 4.3 Verify Session validation/finish consumers retain actual FAIL/PASS, predeclared negatives, stable-assertion supersession and source limits; demonstrate an expected negative cannot resolve a real failure and no-op handling cannot fabricate current-workspace certification.
+
+## 5. Native worker sandbox preflight
+
+- [x] 5.1 Add the small deployment-owned non-model preflight helper for the single inspected `codex-cli 0.159.2` native sandbox/config route, explicit executable/cwd inputs and a 10-second bound; invoke through the actual Runner user/environment/namespace context and verify known mount/path failures are reported before any substantive worker invocation with bounded/sanitized diagnostics.
+- [ ] 5.2 Qualify the native setup/read probe and selected-input equivalence with an accessible disposable checkout and the blocked mount/path control; prove host-read success alone, differently nested invocation, unsupported route or unprovable policy cannot certify readiness or future commands, and no failure path adds bypass flags, reconstructs arbitrary policy, changes checkout or launches a replacement worker.
+- [ ] 5.3 Update deployed guidance and complete assets to use the helper through existing execution tools; verify a fake/controlled worker launch counter stays zero after blocked preflight and generic exit-zero/blocked worker reports remain separate from task acceptance, without paid model calls or a new ACP/provider/tool surface.
+
+## 6. Integrated qualification and source delivery
+
+- [x] 6.1 Run one disposable real caller-to-consumer CPU acceptance across lifecycle, archived output/restart, selectors, no-effect validation and sandbox admission; retain commands, actual exits, negative controls, boundedness and exact terminal evidence in the change verification owner, with each of the five acceptance rows explicitly PASS or HOLD.
+- [x] 6.2 Finalize affected canonical schema/ToolDefinition/protocol, current durable-session restoration, focused tests and documentation checks; run final Rust formatting where relevant, whitespace and strict OpenSpec validation, then review exact owned source paths and create the clean local source commit required for deployment, without push/tag/version bump.
+
+## 7. Local dogfood build, reinstall and acceptance
+
+- [ ] 7.1 Build matching native Server/Runner/CLI with the `dogfood` profile and assemble the complete guidance/Plugin/preflight assets under `deployment/`; verify candidate source commit, clean build identity, Linux target, packaged asset identities and no legacy-path aliases or soft links.
+- [ ] 7.2 Before any live activation, qualify the exact candidate-write/retained-previous-app-read and pruning boundary on disposable Session/receipt/archive state; prove existing behavior and evidence survive without database restoration, independently of mixed-version wire capability checks. Any failure holds activation pending compatible correction or an explicit changed recovery ruling.
+- [ ] 7.3 Deferred by the user's explicit no-install ruling; require a later explicit installation request as well as all five gates and pre-activation downgrade checks. Then recheck active Jobs and follow the named controlled lifecycle for consistent private state/config/registry backup and retained application rollback; verify exact owned processes exit before replacing the single real application directory, never stopping external work or restoring an older database automatically.
+- [ ] 7.4 Activate and independently check authenticated Tunnel MCP routing, matching Server/Runner clean source, protocol/capability alignment, canonical Projects, retained Sessions/evidence, Python/Skills/Plugin access and disposable five-point smoke; retain runtime/read-back evidence and prove full trace remains enabled with its private retention settings. If activation fails, restore only the already-qualified retained previous app through the controlled lifecycle and verify its consumer path without discarding newer accepted state; record final outcome, outstanding gates and recovery locator.

@@ -257,12 +257,28 @@ async fn refresh_once(
     session_id: &str,
     auth: &crate::auth::AuthContext,
 ) -> ToolResult {
-    let task = tokio::spawn({
+    refresh_work_result_once(runtime, client_id, project, session_id, auth, false).await
+}
+
+async fn refresh_work_result_once(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    project: &str,
+    session_id: &str,
+    auth: &crate::auth::AuthContext,
+    present: bool,
+) -> ToolResult {
+    let mut task = tokio::spawn({
         let runtime = runtime.clone();
         let project = project.to_string();
         let session_id = session_id.to_string();
         let auth = auth.clone();
         async move {
+            if present {
+                return runtime
+                    .present_work_result(project, session_id, Some(&auth))
+                    .await;
+            }
             runtime
                 .dispatch_with_auth(
                     ToolCall::WorkResultState {
@@ -274,7 +290,10 @@ async fn refresh_once(
                 .await
         }
     });
-    let request = wait_for_patch_agent_request(runtime, client_id).await;
+    let request = tokio::select! {
+        result = &mut task => return result.unwrap(),
+        request = wait_for_patch_agent_request(runtime, client_id) => request,
+    };
     assert_eq!(request.kind, "run_internal_posix_script");
     complete_agent_request_by_running_locally(runtime, client_id, request).await;
     task.await.unwrap()
@@ -286,9 +305,27 @@ async fn work_result_state_reauthorizes_exact_identity_and_refresh_does_not_reco
     let tmp = tempfile::tempdir().unwrap();
     init_git_repo(tmp.path());
     commit_file(tmp.path(), "README.md", "hello\n", "initial");
-    let runtime = test_runtime();
+    let refs_tmp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime().with_project_reference_database(std::sync::Arc::new(
+        crate::Database::open(&refs_tmp.path().join("refs.db")).unwrap(),
+    ));
     let project =
         register_runner_project_at_path(&runtime, "work-result", "demo", tmp.path()).await;
+    let mut registered = named_registered_project(
+        "work-result",
+        "demo",
+        "demo",
+        &tmp.path().to_string_lossy(),
+        1,
+    );
+    registered.root_fingerprint = Some(format!("wc_projroot_{}", "1".repeat(64)));
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        "work-result",
+        "inst",
+        vec![registered],
+    )
+    .await;
     let auth = auth_context(None, true);
     let session = runtime.sessions.start_session(
         Some(project.clone()),
@@ -335,42 +372,28 @@ async fn work_result_state_reauthorizes_exact_identity_and_refresh_does_not_reco
         first_version
     );
 
-    let alias_state = runtime
-        .work_result_state("demo".to_string(), session.session_id.clone(), Some(&auth))
-        .await;
-    assert!(!alias_state.success);
-    assert_eq!(
-        alias_state.output["error_kind"],
-        "work_result_project_not_exact"
-    );
-    let alias_present = runtime
-        .present_work_result("demo".to_string(), session.session_id.clone(), Some(&auth))
-        .await;
-    assert!(!alias_present.success);
-    assert_eq!(
-        alias_present.output["error_kind"],
-        "work_result_project_not_exact"
-    );
-    let dispatched_alias = runtime
-        .dispatch_with_auth(
-            ToolCall::WorkResultState {
-                project: "demo".to_string(),
-                session_id: session.session_id.clone(),
-            },
-            Some(&auth),
-        )
-        .await;
-    assert!(!dispatched_alias.success);
-    assert_eq!(
-        dispatched_alias.output["error_kind"],
-        "work_result_project_not_exact"
-    );
-    assert!(
-        probe_patch_agent_request(&runtime, "work-result")
-            .await
-            .is_none(),
-        "a non-canonical project alias must fail before workspace observation, including through top-level dispatch"
-    );
+    let resolved = runtime
+        .resolve_project_input_for_auth(&project, Some(&auth))
+        .await
+        .unwrap();
+    let project_ref = runtime
+        .project_reference_for_resolved(&resolved, Some(&auth))
+        .unwrap();
+    for selector in ["demo", project_ref.as_str()] {
+        for present in [false, true] {
+            let alias = refresh_work_result_once(
+                &runtime,
+                "work-result",
+                selector,
+                &session.session_id,
+                &auth,
+                present,
+            )
+            .await;
+            assert!(alias.success, "selector {selector}: {:?}", alias.error);
+            assert_eq!(alias.output["work_result"], changed.output["work_result"]);
+        }
+    }
 
     let after = runtime.sessions.summary(&session.session_id, None).unwrap();
     assert_eq!(after.events_total, before.events_total);
@@ -416,6 +439,148 @@ async fn work_result_state_reauthorizes_exact_identity_and_refresh_does_not_reco
         present_mismatch.output["error_kind"],
         "session_project_mismatch"
     );
+}
+
+#[tokio::test]
+async fn work_result_selectors_reject_ambiguous_stale_foreign_revoked_and_conflicting_targets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime().with_project_reference_database(std::sync::Arc::new(
+        crate::Database::open(&tmp.path().join("refs.db")).unwrap(),
+    ));
+    let mut alice = auth_context(Some("alice"), false);
+    alice.scopes = vec![
+        crate::auth::SCOPE_PROJECT_READ.to_string(),
+        crate::auth::SCOPE_RUNTIME_READ.to_string(),
+    ];
+    let admin = auth_context(None, true);
+    let project = "agent:work-result-target:demo".to_string();
+    let mut registered = named_registered_project(
+        "work-result-target",
+        "demo",
+        "demo",
+        &tmp.path().to_string_lossy(),
+        1,
+    );
+    registered.root_fingerprint = Some(format!("wc_projroot_{}", "2".repeat(64)));
+    register_agent_with_projects(
+        &runtime,
+        "work-result-target",
+        Some("alice"),
+        crate::runner_protocol::RunnerCapabilities::default(),
+        vec![registered.clone()],
+    )
+    .await;
+    let resolved = runtime
+        .resolve_project_input_for_auth(&project, Some(&alice))
+        .await
+        .unwrap();
+    let project_ref = runtime
+        .project_reference_for_resolved(&resolved, Some(&alice))
+        .unwrap();
+    let _admin_first_ref = runtime
+        .project_reference_for_resolved(&resolved, Some(&admin))
+        .unwrap();
+    let session = runtime
+        .sessions
+        .start_session_with_options(
+            SessionCreateOptions::new(
+                Some(project.clone()),
+                None,
+                SessionMode::Normal,
+                SessionGuards::default(),
+            )
+            .with_owner_authority_fingerprint(Some(
+                workflow_session_authority_fingerprint(Some(&alice)).unwrap(),
+            )),
+        )
+        .unwrap();
+    let before = runtime.sessions.summary(&session.session_id, None).unwrap();
+    let other = "agent:work-result-conflict:demo".to_string();
+    let mut other_registered = named_registered_project(
+        "work-result-conflict",
+        "demo",
+        "demo",
+        &tmp.path().to_string_lossy(),
+        1,
+    );
+    other_registered.root_fingerprint = Some(format!("wc_projroot_{}", "4".repeat(64)));
+    register_agent_with_projects(
+        &runtime,
+        "work-result-conflict",
+        Some("alice"),
+        crate::runner_protocol::RunnerCapabilities::default(),
+        vec![other_registered],
+    )
+    .await;
+    let other_resolved = runtime
+        .resolve_project_input_for_auth(&other, Some(&admin))
+        .await
+        .unwrap();
+    let foreign_ref = runtime
+        .project_reference_for_resolved(&other_resolved, Some(&admin))
+        .unwrap();
+    // Numeric spellings are local to a principal's mapping namespace. An
+    // identical spelling already issued to Alice would select Alice's mapping,
+    // so use a reference that exists only in the other principal's namespace.
+    assert_ne!(foreign_ref, project_ref);
+    let mut revoked = alice.clone();
+    revoked.username = Some("bob".to_string());
+    for (selector, auth, expected) in [
+        ("demo", &alice, "ambiguous_project"),
+        ("~p9999999", &alice, "unknown_project"),
+        (foreign_ref.as_str(), &alice, "unknown_project"),
+        (project_ref.as_str(), &revoked, "unknown_project"),
+        (other.as_str(), &alice, "session_project_mismatch"),
+    ] {
+        for name in ["work_result_state", "present_work_result"] {
+            let result = runtime
+                .dispatch_with_auth(
+                    ToolCall::from_tool_name(
+                        name,
+                        json!({"project":selector,"session_id":session.session_id}),
+                    )
+                    .unwrap(),
+                    Some(auth),
+                )
+                .await;
+            assert!(!result.success, "{name}: {selector}");
+            assert_eq!(
+                result.output["error_kind"], expected,
+                "{name}: {selector}: {:?}",
+                result.error
+            );
+            assert!(result.output.get("work_result").is_none());
+        }
+    }
+    registered.root_fingerprint = Some(format!("wc_projroot_{}", "3".repeat(64)));
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        "work-result-target",
+        "inst",
+        vec![registered],
+    )
+    .await;
+    for name in ["work_result_state", "present_work_result"] {
+        let result = runtime
+            .dispatch_with_auth(
+                ToolCall::from_tool_name(
+                    name,
+                    json!({"project":project_ref,"session_id":session.session_id}),
+                )
+                .unwrap(),
+                Some(&alice),
+            )
+            .await;
+        assert!(!result.success);
+        assert_eq!(result.output["error_kind"], "unknown_project");
+        assert!(result.output.get("work_result").is_none());
+    }
+    for client in ["work-result-target", "work-result-conflict"] {
+        assert!(probe_patch_agent_request(&runtime, client).await.is_none());
+    }
+    let after = runtime.sessions.summary(&session.session_id, None).unwrap();
+    assert_eq!(after.events_total, before.events_total);
+    assert_eq!(after.updated_at, before.updated_at);
 }
 
 #[tokio::test]
@@ -592,6 +757,46 @@ async fn work_result_refresh_reobserves_validation_source_staleness_without_reco
     assert!(initial.success, "{:?}", initial.error);
     assert_eq!(
         initial.output["work_result"]["validation"]["current_status"],
+        "unproven"
+    );
+
+    let rejected = runtime
+        .dispatch_with_auth(
+            ToolCall::WriteProjectFile {
+                project: project.clone(),
+                session_id: None,
+                path: "README.md".to_string(),
+                content: "must never be written".to_string(),
+                overwrite: Some(true),
+                expected_read_revision: Some(999),
+            },
+            Some(&auth),
+        )
+        .await;
+    assert!(!rejected.success);
+    assert_eq!(rejected.output["error_kind"], "unknown_read_revision");
+    assert!(probe_patch_agent_request(&runtime, "work-result-source")
+        .await
+        .is_none());
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("README.md")).unwrap(),
+        "hello\n"
+    );
+    assert_eq!(
+        runtime.validation_sources.capture(&project).unwrap(),
+        start_fence
+    );
+    let after_noop = refresh_once(
+        &runtime,
+        "work-result-source",
+        &project,
+        &session.session_id,
+        &auth,
+    )
+    .await;
+    assert!(after_noop.success, "{:?}", after_noop.error);
+    assert_eq!(
+        after_noop.output["work_result"]["validation"]["current_status"],
         "unproven"
     );
 
@@ -868,7 +1073,7 @@ async fn work_result_collaboration_reuses_session_store_and_ack_resolution_state
 }
 
 #[test]
-fn work_result_tool_contract_requires_exact_project_and_session() {
+fn work_result_tool_contract_requires_explicit_project_and_session() {
     assert!(
         ToolCall::from_tool_name(
             "present_changes",

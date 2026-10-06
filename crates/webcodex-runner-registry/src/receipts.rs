@@ -16,6 +16,19 @@ pub trait JobReceiptStore: std::fmt::Debug + Send + Sync {
     fn upsert(&self, receipt: &RetainedJobReceipt) -> Result<(), String>;
     fn load(&self, now: i64) -> Result<Vec<RetainedJobReceipt>, String>;
     fn prune(&self, now: i64) -> Result<(), String>;
+    fn upsert_archive(
+        &self,
+        _receipt: &webcodex_core::runner_job_receipt::ArchivedJobReceipt,
+    ) -> Result<(), String> {
+        Err("archive store unavailable".into())
+    }
+    fn load_archive(
+        &self,
+        _job_id: &str,
+        _now: i64,
+    ) -> Result<Option<webcodex_core::runner_job_receipt::ArchivedJobReceipt>, String> {
+        Ok(None)
+    }
 }
 
 /// Sparse authoritative terminal fact emitted only after the canonical registry
@@ -72,6 +85,9 @@ pub(crate) struct ReceiptRegistryState {
 }
 
 impl ReceiptRegistryState {
+    pub(crate) fn archive_store(&self) -> Option<Arc<dyn JobReceiptStore>> {
+        self.store.clone()
+    }
     pub(crate) fn new(store: Option<Arc<dyn JobReceiptStore>>) -> Self {
         Self::with_sinks(store, None)
     }
@@ -137,6 +153,23 @@ impl Drop for ReceiptRegistryGuard<'_> {
             .iter()
             .filter_map(|id| self.jobs_by_id.get(id).and_then(capture))
             .collect();
+        let archives: Vec<_> = ids
+            .iter()
+            .filter_map(|id| {
+                let job = self.jobs_by_id.get(id)?;
+                let mut receipt = capture(job)?;
+                let archive = job.archive.clone()?;
+                for stream in [&mut receipt.snapshot.stdout, &mut receipt.snapshot.stderr] {
+                    stream.tail.clear();
+                    stream.first_retained_line = stream.next_line;
+                    stream.truncated = true;
+                }
+                let value =
+                    webcodex_core::runner_job_receipt::ArchivedJobReceipt { receipt, archive };
+                value.validate(now_ts()).ok()?;
+                Some(value)
+            })
+            .collect();
         let terminal_events: Vec<_> = terminal_ids
             .iter()
             .filter_map(|id| self.jobs_by_id.get(id).and_then(capture_terminal_event))
@@ -150,6 +183,12 @@ impl Drop for ReceiptRegistryGuard<'_> {
                 if store.upsert(&receipt).is_err() {
                     failed += 1;
                     retry_ids.push(receipt.snapshot.job_id);
+                }
+            }
+            for archive in archives {
+                if store.upsert_archive(&archive).is_err() {
+                    retry_ids.push(archive.receipt.snapshot.job_id);
+                    failed += 1;
                 }
             }
             if !retry_ids.is_empty() {

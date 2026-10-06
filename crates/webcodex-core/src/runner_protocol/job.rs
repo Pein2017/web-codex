@@ -907,6 +907,8 @@ impl Default for ShellJobStreamSnapshot {
 /// register inventory was serialized but before the new sink becomes usable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShellJobLogSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<crate::job_archive::JobArchiveDescriptor>,
     pub stdout: ShellJobStreamSnapshot,
     pub stderr: ShellJobStreamSnapshot,
 }

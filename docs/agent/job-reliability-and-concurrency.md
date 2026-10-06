@@ -452,6 +452,61 @@ observation-token refresh behavior.
 
 ## 7. Runner-process restart boundary
 
+### Bounded output recovery for the same execution
+
+On archive-capable Unix Runners, admitted ordinary Jobs may retain exact decoded
+stdout/stderr prefixes before live-tail trimming. The private archive namespace
+uses the normalized Server endpoint and stable Runner client id; the transient
+Runner instance is provenance. Output can contain secrets and is not rewritten
+into a secret-free diagnostic. Existing live inventory and 24-hour receipts stay
+bounded as before. The separate small archive locator table contains no output
+blobs and is not hydrated into active Job inventory.
+
+Ordinary live-token continuation keeps its existing delta/cursor behavior, even
+after a terminal archive is committed. Archive reads cannot bypass token syntax
+checks. Historical token-based recovery explicitly reports a reset baseline,
+not live delta continuity; use exact-id explicit pages for retained prefixes.
+
+Use existing `observe_jobs` with an exact `job_id`, inclusive
+`since_stdout_line` / `since_stderr_line`, and the ordinary bounded `tail_lines`
+page size. Line 1 begins the retained prefix. Continue with `cursor.stdout` and
+`cursor.stderr` from the previous page. Explicit pages cannot use observation
+tokens/references or waits. Archive metadata reports retained bytes, the next
+line and evidence loss. An unavailable Runner, evicted files, unsupported old
+history or a line exceeding the response bound is explicit unavailable evidence,
+never empty complete output or retry permission.
+
+Retention is at most seven days after terminal, subject to earlier quota eviction:
+16 MiB per stream, 1 GiB for the shared owned archive root across namespaces,
+and 256 terminal entries. Active reservations, temporary files and receipt/index
+overhead count against the quota. Only verified terminal archives can be evicted;
+active archives and unrelated state are never cleanup targets. A bounded writer
+queue drops evidence under pressure while child pipes continue draining. Archive
+storage failure cannot change the child's exit result, and only a committed
+terminal receipt establishes durable terminal archive evidence.
+
+The execution-recovery candidate is not yet qualified for activation: its
+shared SQLite locator/WAL physical allocation cannot currently be proven inside
+that total bound. A retained-row limit is not a physical WAL limit. Keep this
+gate HOLD (and the separate native sandbox positive gate) until the named
+[change verification](../../openspec/changes/improve-webcodex-execution-recovery/verification.md)
+records the required evidence; do not reinterpret the quota as payload-only.
+
+Every metadata or byte read rechecks request authentication, the immutable
+admission partition/owner, current Project visibility and the pinned admitted
+root. The Runner also checks canonical root plus filesystem incarnation before
+and after reading. A replacement root or an online revoked/removed Project fails
+closed. If Server restart or an offline Runner prevents proving current Project
+visibility, the explicitly approved fallback returns only `job_id`, canonical
+terminal `status` and `exit_code` under current request authentication and the
+immutable admission partition/owner. It exposes no Project, path, Session,
+command, error, timestamp, descriptor or output. This narrow fallback cannot
+detect a Project change hidden by the offline state; it never renews retention.
+
+Archive recovery conveys history only. An ordinary running Job interrupted by
+Runner death remains lost/unknown and never becomes a detached process because
+partial archived bytes exist.
+
 Ordinary Jobs are still process-owned by their exact Runner instance. A Runner
 process restart therefore makes those child processes unrecoverable and they
 converge to `lost`; Server-side inventory reconciliation must never infer native

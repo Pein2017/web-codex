@@ -6,6 +6,7 @@
 
 mod access;
 mod access_control;
+mod archive;
 mod capabilities;
 mod job_status;
 mod job_updates;
@@ -15,6 +16,7 @@ mod project_inventory;
 mod projects;
 mod protocol;
 mod receipts;
+pub use archive::ArchivedTerminalFact;
 mod reconciliation;
 pub use receipts::{
     JobReceiptStore, JobTerminalEvent, JobTerminalEventSink, JobTerminalRegistrationSnapshot,

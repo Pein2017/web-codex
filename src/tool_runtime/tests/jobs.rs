@@ -640,6 +640,8 @@ async fn long_run_shell_hands_off_same_job_once_and_status_log_stop_observe_it()
                 job_id: job_id.clone(),
                 after_observation_token: None,
                 observation_ref: None,
+                since_stdout_line: None,
+                since_stderr_line: None,
             }],
             40,
             None,

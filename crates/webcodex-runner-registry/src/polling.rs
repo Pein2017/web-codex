@@ -698,13 +698,9 @@ impl RunnerRegistry {
                 if let Some(job) = inner.jobs_by_id.get_mut(&job_id) {
                     if job.lifecycle == JobLifecycleState::Queued {
                         job.lifecycle = JobLifecycleState::RunnerQueued;
-                        // Dispatch proves only that the Runner accepted the
-                        // Job request. A typed structured Job becomes started
-                        // only when the Runner reports `running` after a
-                        // successful child spawn.
-                        if job.structured_execution.is_none() {
-                            job.started_at = Some(now_ts());
-                        }
+                        // Dispatch proves the Runner received the request, not
+                        // that a child process started. The `running` update
+                        // records process startup.
                         super::jobs::notify_job_update(job);
                     }
                 }

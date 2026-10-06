@@ -18,6 +18,25 @@
 - finish_coding_task 是证据摘要，不替代验收。workspace baseline 比较的是启动与收尾的路径/状态：既有 dirty、后来新增 dirty、消失及重叠；重叠不证明内容没变，变化不证明属于当前 Session。write_like 是工具类别计数，0 不等于 shell 没改文件；必要时检查源码和 diff。
 - 长任务使用可恢复 Job 或用户指定的 tmux，保存标识、日志和结果位置。异步 Job 要纳入 Session 收尾，需在工具支持时同时显式传业务 session_id；recording_session_id 仅记录调用，不代替 Job 归属。断连不等于任务停止；恢复时先查既有任务，避免重复启动。用户手动返回查看结果，不承诺自动唤醒网页对话。
 
+- 已获授权的原生 Codex worker 执行前，先通过同一 Runner 的 `run_process` 调用
+  `/data/CoordExp/codex-tools/web-codex/deployment/app/sandbox_preflight.py`，
+  `executable="python"`，显式传 `--executable /root/.local/bin/codex`、
+  `--cwd <实际 Runner cwd>`、`--read-path <选定的可读输入绝对路径>` 和
+  `--permission-profile :read-only`；同一个已选配置 profile 用 `--profile <name>`。
+  此 helper 仅支持已检查的 `codex-cli 0.159.2`、原生 `codex sandbox` 和
+  内置 `:read-only`（包含 managed requirements），不接收任意 policy/config override。
+  worker 必须沿用相同 executable、cwd、`-P :read-only`、profile 和配置环境；
+  其他 route、额外 override 或无法证明相同输入时保持 unproven，不推断等价。
+  helper 在所有阶段共用 10 秒 deadline；Runner 调用可设 `timeout_secs=15`。
+  保留 JSON receipt，后续核对 UID、环境摘要、namespace nesting、可执行文件 identity
+  和 selected inputs；需要比较已观察的相同 Runner context 时显式传
+  `--expected-context-json`，不要把不同 namespace 的 Desktop 结果当作 Runner 证据。
+  `probe_passed` / exit 0 只表示此时此 setup/read probe 通过；host 可读不证明 sandbox 可读。
+  `blocked` / exit 2 或 `unproven` / exit 3 时不启动 substantive worker，不更换 checkout、
+  不绕过 sandbox、不自动重试/另起 worker。helper 自身从不执行 worker。
+  原生 worker 以后即使 exit 0，blocked/incomplete 输出仍需按任务 consumer 验收，
+  不因 preflight 或 generic process completion 宣称任务成功。
+
 ## 按需上下文
 
 - Skill 分页优先执行返回的 suggested_call，保留其 Project、Skill ID、资源路径和 definition revision；EOF 不再续读。Plugin 的 ack_session_message_ids 仅确认已读的消息，需绑定明确的 recording_session_id，不等于解决消息或接受工作。

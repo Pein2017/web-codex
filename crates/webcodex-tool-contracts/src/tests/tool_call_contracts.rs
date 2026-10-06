@@ -6,6 +6,48 @@ use serde_json::{json, Value};
 use webcodex_core::workflow_session_contract as sessions;
 
 #[test]
+fn archived_job_pages_use_exact_identity_and_native_line_positions() {
+    let call = ToolCall::from_tool_name(
+        "observe_jobs",
+        json!({
+            "items":[{"job_id":"wc_job_original", "since_stdout_line":1, "since_stderr_line":7}],
+            "tail_lines":40
+        }),
+    )
+    .unwrap();
+    match call {
+        ToolCall::ObserveJobs { items, .. } => {
+            assert_eq!(items[0].job_id, "wc_job_original");
+            assert_eq!(items[0].since_stdout_line, Some(1));
+            assert_eq!(items[0].since_stderr_line, Some(7));
+            assert!(items[0].after_observation_token.is_none());
+            assert!(items[0].observation_ref.is_none());
+        }
+        other => panic!("expected ObserveJobs, got {other:?}"),
+    }
+    for arguments in [
+        json!({"items":[{"job_id":"wc_job_original", "since_stdout_line":0}]}),
+        json!({"items":[{"job_id":"wc_job_original", "since_stdout_line":9007199254740992u64}]}),
+        json!({"items":[{"job_id":"wc_job_original", "since_stdout_line":-1}]}),
+        json!({"items":[{"observation_ref":"~j1", "since_stdout_line":1}]}),
+        json!({"items":[{"job_id":"wc_job_original", "after_observation_token":"opaque", "since_stdout_line":1}]}),
+        json!({"items":[{"job_id":"wc_job_original", "since_stderr_line":1}], "wait_secs":1}),
+    ] {
+        assert!(ToolCall::from_tool_name("observe_jobs", arguments).is_err());
+    }
+    assert!(
+        ToolCall::from_tool_name(
+            "observe_jobs",
+            json!({
+                "items":[{"job_id":"wc_job_original"}]
+            })
+        )
+        .is_ok(),
+        "ordinary existing observation remains unchanged"
+    );
+}
+
+#[test]
 fn from_tool_name_parses_unit_tools_without_arguments() {
     for name in [
         "list_tools",

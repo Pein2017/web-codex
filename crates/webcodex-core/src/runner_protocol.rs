@@ -603,6 +603,8 @@ pub struct RunnerCapabilities {
     pub async_jobs: bool,
     #[serde(default)]
     pub async_shell_jobs: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub job_output_archive: bool,
     /// The Runner can execute one-shot/background shell work through a Workflow
     /// Session's configured SSH resource. Missing on older runners fails closed.
     #[serde(default)]
@@ -1056,6 +1058,7 @@ impl Default for RunnerCapabilities {
             jobs: false,
             async_jobs: false,
             async_shell_jobs: false,
+            job_output_archive: false,
             ssh_shell: false,
             persistent_shell: false,
             ssh_persistent_shell: false,

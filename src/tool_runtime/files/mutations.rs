@@ -190,6 +190,9 @@ fn read_revision_rejection(
     path: &str,
     error: ReadRevisionLookupError,
 ) -> ToolResult {
+    crate::tool_runtime::validation_source::reject_before_source_write(
+        crate::tool_runtime::validation_source::NoSourceWriteRejection::ReadRevision,
+    );
     let (error_kind, detail) = match error {
         ReadRevisionLookupError::Unknown => (
             "unknown_read_revision",
@@ -2210,6 +2213,9 @@ fn compact_write_project_file_preflight_rejection(
     detail: impl Into<String>,
     error_kind: &'static str,
 ) -> ToolResult {
+    crate::tool_runtime::validation_source::reject_before_source_write(
+        crate::tool_runtime::validation_source::NoSourceWriteRejection::GuardedEditPreflight,
+    );
     let detail = detail.into();
     ToolResult::err_with_output(
         format!("Rejected before write: {detail}. No files were modified."),
@@ -2231,6 +2237,9 @@ fn compact_apply_text_edits_preflight_rejection(
     kind: Option<&str>,
     path: Option<&str>,
 ) -> ToolResult {
+    crate::tool_runtime::validation_source::reject_before_source_write(
+        crate::tool_runtime::validation_source::NoSourceWriteRejection::GuardedEditPreflight,
+    );
     let detail = message.into();
     let mut output = json!({
         "state_changed": false,
@@ -2956,6 +2965,7 @@ impl ToolRuntime {
             create_dirs: false,
             wait_timeout_secs: wait_timeout,
         };
+        crate::tool_runtime::validation_source::source_write_may_begin();
         let (request_id, rx) = match self
             .runner_registry
             .enqueue_project_file_mutation(
@@ -3394,6 +3404,7 @@ impl ToolRuntime {
             create_dirs: false,
             wait_timeout_secs: wait_timeout,
         };
+        crate::tool_runtime::validation_source::source_write_may_begin();
         let enqueue_result = self
             .runner_registry
             .enqueue_project_file_mutation(
@@ -4869,8 +4880,8 @@ mod tests {
         assert!(!error.contains("No files were modified"));
     }
 
-    #[test]
-    fn write_project_file_effect_payload_requires_complete_consistent_state() {
+    #[tokio::test]
+    async fn write_project_file_effect_payload_requires_complete_consistent_state() {
         for payload in [
             r#"{"changed":false,"execution_state":"completed","error":"missing state_changed"}"#,
             r#"{"changed":false,"state_changed":true,"execution_state":"completed","error":"contradictory effect"}"#,
@@ -4891,6 +4902,32 @@ mod tests {
         assert_eq!(rolled_back.output["changed"], false);
         assert_eq!(rolled_back.output["state_changed"], false);
         assert_eq!(rolled_back.output["execution_state"], "completed");
+
+        // A concurrent validator can observe parent creation even when the
+        // Runner subsequently rolls it back and truthfully reports net zero.
+        let registry = crate::tool_runtime::validation_source::ValidationSourceRegistry::default();
+        let before = registry.capture("rollback").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("created-parent");
+        let mut during = None;
+        crate::tool_runtime::validation_source::run_observed_mutation(registry.begin("rollback"), async {
+            crate::tool_runtime::validation_source::source_write_may_begin();
+            std::fs::create_dir(&parent).unwrap();
+            assert!(parent.is_dir(), "the concurrent observer can see the temporary mutation");
+            during = registry.capture("rollback");
+            assert!(!during.as_ref().unwrap().quiescent);
+            std::fs::remove_dir(&parent).unwrap();
+            write_project_file_agent_stdout_result(
+                r#"{"changed":false,"state_changed":false,"execution_state":"completed","error":"write failed and parent creation was rolled back"}"#,
+            )
+        }).await;
+        assert!(!parent.exists());
+        for start in [Some(&before), during.as_ref()] {
+            assert_eq!(
+                registry.observe("rollback", start).observed_mutation_fence,
+                webcodex_core::validation_source::ObservedMutationFence::Crossed
+            );
+        }
     }
 
     #[test]

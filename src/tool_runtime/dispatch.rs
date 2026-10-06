@@ -1504,7 +1504,15 @@ impl ToolRuntime {
         // coordinator C records the tool execution only in W.
         let suppress_handoff_business_recorder = !inner_model_facing_recording
             && matches!(&call, ToolCall::SessionHandoffSummary { .. });
-        let session_id = if defer_work_session || suppress_handoff_business_recorder {
+        // Presentation's business Session selects the read target, not an
+        // implicit recorder. Its exact handler retains Session/Project auth;
+        // an independently explicit outer recorder is still handled by kernel.
+        let suppress_work_result_business_recorder =
+            matches!(&call, ToolCall::PresentWorkResult { .. });
+        let session_id = if defer_work_session
+            || suppress_handoff_business_recorder
+            || suppress_work_result_business_recorder
+        {
             None
         } else {
             call.session_id().map(str::to_string)
@@ -1852,8 +1860,8 @@ impl ToolRuntime {
         // authenticated principal, then bind only legacy inner adapters that still
         // perform auth-less ProjectConfig lookups to the authorized canonical id.
         // Do not rewrite every Project-bearing ToolCall: work_on_project preserves
-        // the caller selector in its output, Work Result deliberately requires an
-        // exact canonical input, and newer adapters consume the retained
+        // the caller selector in its output, Work Result rechecks authenticated
+        // canonical resolution, and newer adapters consume the retained
         // ResolvedProject or re-resolve with the current AuthContext themselves.
         let mut requested_project_output = None;
         if let Some(resolved) = project_resolution
@@ -1874,19 +1882,22 @@ impl ToolRuntime {
         let mut result = super::read_cache::READ_SCOPE
             .scope(
                 read_scope,
-                self.dispatch_authorized_inner(
-                    call,
-                    auth,
-                    transport,
-                    window,
-                    ssh_resource.as_deref(),
-                    validation_assertion_name,
-                    project_resolution,
-                    trusted_recording_session_id,
-                    trusted_recording_session_project,
-                    logical_invocation_id,
-                    protocol_capabilities,
-                    correlation,
+                super::validation_source::run_observed_mutation(
+                    source_mutation,
+                    Box::pin(self.dispatch_authorized_inner(
+                        call,
+                        auth,
+                        transport,
+                        window,
+                        ssh_resource.as_deref(),
+                        validation_assertion_name,
+                        project_resolution,
+                        trusted_recording_session_id,
+                        trusted_recording_session_project,
+                        logical_invocation_id,
+                        protocol_capabilities,
+                        correlation,
+                    )),
                 ),
             )
             .await;
@@ -1894,9 +1905,6 @@ impl ToolRuntime {
             if result.output.get("project").is_some() {
                 result.output["project"] = serde_json::Value::String(requested_project);
             }
-        }
-        if let Some(observation) = source_mutation {
-            observation.finish(&result);
         }
         if let Some(code) = shell_normalization {
             result.output["requested_surface"] = serde_json::json!("run_process");

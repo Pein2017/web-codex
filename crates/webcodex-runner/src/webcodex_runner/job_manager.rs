@@ -336,6 +336,8 @@ struct DetachedJobRef {
 
 #[derive(Debug, Clone)]
 struct RunningJob {
+    archive_capture: Option<super::job_archive::ArchiveCapture>,
+    archive: Option<webcodex_core::job_archive::JobArchiveDescriptor>,
     client_id: String,
     runner_instance_id: String,
     snapshot: ShellJobSnapshot,
@@ -460,8 +462,12 @@ fn job_update_from_delivery(
     job: &RunningJob,
     pending: &PendingJobUpdateDelivery,
 ) -> RunnerJobUpdateRequest {
-    let mut update =
-        job_update_from_snapshot(&job.client_id, &job.runner_instance_id, &job.snapshot);
+    let mut update = job_update_from_snapshot(
+        &job.client_id,
+        &job.runner_instance_id,
+        &job.snapshot,
+        job.archive.clone(),
+    );
     update.update_seq = Some(pending.update_seq);
     update.status = pending.status.clone();
     update.exit_code = pending.exit_code;
@@ -874,6 +880,7 @@ fn job_update_from_snapshot(
     client_id: &str,
     runner_instance_id: &str,
     snapshot: &ShellJobSnapshot,
+    archive: Option<webcodex_core::job_archive::JobArchiveDescriptor>,
 ) -> RunnerJobUpdateRequest {
     RunnerJobUpdateRequest {
         client_id: client_id.to_string(),
@@ -885,6 +892,7 @@ fn job_update_from_snapshot(
         stdout_chunk: None,
         stderr_chunk: None,
         log_snapshot: Some(ShellJobLogSnapshot {
+            archive,
             stdout: snapshot.stdout.clone(),
             stderr: snapshot.stderr.clone(),
         }),
@@ -1363,6 +1371,17 @@ fn validate_runner_structured_common(
 }
 
 impl JobManager {
+    pub(crate) fn read_archive(
+        &self,
+        read: &webcodex_core::job_archive::JobArchiveRead,
+        registry: &Path,
+    ) -> Result<webcodex_core::job_archive::JobArchiveReadResult, String> {
+        super::job_archive::ArchiveStore::default_for_runner(
+            &read.archive.client_id,
+            &self.detached_profile_server_url,
+        )?
+        .read_verified(read, registry)
+    }
     fn detached_store_for_start(&self, client_id: &str) -> Result<DetachedJobStore, String> {
         #[cfg(test)]
         if let Some(root) = lock_unpoison(&self.detached_store_root_override).clone() {
@@ -1402,7 +1421,7 @@ impl JobManager {
         job_id: &str,
         mut delta: RunnerJobDelta,
     ) -> Option<(RunnerJobUpdateRequest, bool)> {
-        let (update, semantic) = {
+        let (mut update, semantic, capture) = {
             let mut jobs = lock_unpoison(&self.jobs);
             let job = jobs.get_mut(job_id)?;
             if runner_job_is_terminal(&job.snapshot.status) {
@@ -1416,6 +1435,10 @@ impl JobManager {
             let explicit_semantic =
                 delta.finished || delta.command_execution_state.is_some() || delta.error.is_some();
             let now = chrono::Utc::now().timestamp();
+            if let Some(capture) = &job.archive_capture {
+                capture.append(true, delta.stdout_chunk.as_deref());
+                capture.append(false, delta.stderr_chunk.as_deref());
+            }
             append_runner_stream(&mut job.snapshot.stdout, delta.stdout_chunk.as_deref());
             append_runner_stream(&mut job.snapshot.stderr, delta.stderr_chunk.as_deref());
             if let Some(max_bytes) = delta.stream_limit_bytes {
@@ -1491,10 +1514,29 @@ impl JobManager {
             // while using the latest retained authoritative snapshot at send
             // time.
             (
-                job_update_from_snapshot(&job.client_id, &job.runner_instance_id, &job.snapshot),
+                job_update_from_snapshot(
+                    &job.client_id,
+                    &job.runner_instance_id,
+                    &job.snapshot,
+                    job.archive.clone(),
+                ),
                 semantic,
+                if runner_job_is_terminal(&job.snapshot.status) {
+                    job.archive_capture.take()
+                } else {
+                    None
+                },
             )
         };
+        if let Some(capture) = capture {
+            let archive = capture.finish();
+            if let Some(job) = lock_unpoison(&self.jobs).get_mut(job_id) {
+                job.archive = archive.clone();
+            }
+            if let Some(snapshot) = update.log_snapshot.as_mut() {
+                snapshot.archive = archive;
+            }
+        }
         self.prune_terminal_records();
         Some((update, semantic))
     }
@@ -1577,7 +1619,12 @@ impl JobManager {
 
     fn resend_snapshot(&self, job_id: &str) {
         let update = lock_unpoison(&self.jobs).get(job_id).map(|job| {
-            job_update_from_snapshot(&job.client_id, &job.runner_instance_id, &job.snapshot)
+            job_update_from_snapshot(
+                &job.client_id,
+                &job.runner_instance_id,
+                &job.snapshot,
+                job.archive.clone(),
+            )
         });
         if let Some(update) = update {
             self.queue_recorded_update(update, true);
@@ -1772,6 +1819,8 @@ impl JobManager {
                 jobs.insert(
                     job_id.clone(),
                     RunningJob {
+                        archive_capture: None,
+                        archive: None,
                         client_id: client_id.to_string(),
                         runner_instance_id: runner_instance_id.to_string(),
                         snapshot,
@@ -1905,7 +1954,12 @@ impl JobManager {
                 job.child = None;
             }
             (
-                job_update_from_snapshot(&job.client_id, &job.runner_instance_id, &job.snapshot),
+                job_update_from_snapshot(
+                    &job.client_id,
+                    &job.runner_instance_id,
+                    &job.snapshot,
+                    job.archive.clone(),
+                ),
                 terminal,
                 semantic || terminal,
             )
@@ -2131,8 +2185,10 @@ impl JobManager {
             jobs.insert(
                 job_id.clone(),
                 RunningJob {
+                    archive_capture: None,
+                    archive: None,
                     client_id: client_id.clone(),
-                    runner_instance_id,
+                    runner_instance_id: runner_instance_id.clone(),
                     snapshot: ShellJobSnapshot {
                         job_id: job_id.clone(),
                         request_id: start.metadata.request_id.clone(),
@@ -2151,7 +2207,7 @@ impl JobManager {
                         command_execution_state: terminal
                             .then(|| job_prestart_lifecycle(&start.operation))
                             .flatten(),
-                        context,
+                        context: context.clone(),
                         stdout: ShellJobStreamSnapshot::default(),
                         stderr: ShellJobStreamSnapshot::default(),
                         validation_progress: None,
@@ -2164,9 +2220,6 @@ impl JobManager {
                 },
             );
             drop(jobs);
-            if queue_locally {
-                lock_unpoison(&self.queued).push_back(start.clone());
-            }
             (queue_locally, immediate_failure)
         };
         if let Some(error) = immediate_failure {
@@ -2174,6 +2227,37 @@ impl JobManager {
             self.resend_snapshot(&job_id);
             self.prune_terminal_records();
             return;
+        }
+        if !start.operation.is_detached_process() {
+            let capture = super::job_archive::ArchiveStore::default_for_runner(
+                &client_id,
+                &self.detached_profile_server_url,
+            )
+            .and_then(|store| {
+                store.capture(
+                    &context,
+                    &start.project_registry_dir,
+                    &job_id,
+                    &start.metadata.request_id,
+                    &client_id,
+                    &runner_instance_id,
+                )
+            });
+            let capture = match capture {
+                Ok(capture) => Some(capture),
+                Err(reason) => {
+                    // Reasons are bounded internal constants, not paths, commands
+                    // or credentials. Archive failure never rejects native work.
+                    tracing::warn!(reason = %reason, "Job archive capture unavailable");
+                    None
+                }
+            };
+            if let Some(job) = lock_unpoison(&self.jobs).get_mut(&job_id) {
+                job.archive_capture = capture;
+            }
+        }
+        if queue_locally {
+            lock_unpoison(&self.queued).push_back(start.clone());
         }
         self.update_and_send(
             &job_id,
@@ -3607,6 +3691,84 @@ impl JobManager {
 #[cfg(test)]
 #[path = "job_manager_tests.rs"]
 pub(crate) mod job_manager_tests;
+
+#[cfg(test)]
+mod archive_concurrency_tests {
+    use super::*;
+
+    #[test]
+    fn archive_terminal_storage_wait_does_not_block_other_job_pipe_consumers() {
+        let manager = Arc::new(JobManager::new(2));
+        let (capture, started, release) =
+            super::super::job_archive::ArchiveCapture::delayed_finish_for_test();
+        for id in ["terminal", "other"] {
+            lock_unpoison(&manager.jobs).insert(
+                id.into(),
+                RunningJob {
+                    client_id: "client".into(),
+                    runner_instance_id: "instance".into(),
+                    snapshot: test_job_snapshot(id),
+                    child: None,
+                    stop_requested: Arc::new(AtomicBool::new(false)),
+                    slot_reserved: true,
+                    archive_capture: (id == "terminal").then(|| capture.clone()),
+                    archive: None,
+                },
+            );
+        }
+        let terminal_manager = manager.clone();
+        let terminal = std::thread::spawn(move || {
+            terminal_manager
+                .record_update(
+                    "terminal",
+                    RunnerJobDelta {
+                        status: "completed".into(),
+                        finished: true,
+                        exit_code: Some(0),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        });
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let append_manager = manager.clone();
+        let append = std::thread::spawn(move || {
+            let result = append_manager.record_update(
+                "other",
+                RunnerJobDelta {
+                    stdout_chunk: Some("other pipe keeps draining\n".into()),
+                    ..Default::default()
+                },
+            );
+            done_tx.send(result.is_some()).unwrap();
+        });
+        let independent_append = done_rx.recv_timeout(Duration::from_millis(500));
+        // Release before assertions even for the nearest-wrong implementation
+        // that waits on archive storage while holding the global jobs mutex.
+        release.send(()).unwrap();
+        let (terminal_update, _) = terminal.join().unwrap();
+        append.join().unwrap();
+        assert_eq!(
+            independent_append.unwrap(),
+            true,
+            "archive finalization cannot stall unrelated pipe consumers"
+        );
+        assert_eq!(terminal_update.status, "completed");
+        assert_eq!(terminal_update.exit_code, Some(0));
+        assert!(
+            terminal_update.log_snapshot.unwrap().archive.is_none(),
+            "storage failure does not fabricate evidence or rewrite native exit"
+        );
+        assert!(lock_unpoison(&manager.jobs)
+            .get("other")
+            .unwrap()
+            .snapshot
+            .stdout
+            .tail
+            .contains("other pipe keeps draining"));
+    }
+}
 
 #[cfg(test)]
 mod utf8_truncation_tests {

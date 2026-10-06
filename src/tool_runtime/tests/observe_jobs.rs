@@ -19,6 +19,8 @@ fn item(job_id: &str, token: Option<String>) -> ObserveJobsItem {
         job_id: job_id.to_string(),
         after_observation_token: token,
         observation_ref: None,
+        since_stdout_line: None,
+        since_stderr_line: None,
     }
 }
 
@@ -27,6 +29,8 @@ fn item_ref(observation_ref: &str) -> ObserveJobsItem {
         job_id: String::new(),
         after_observation_token: None,
         observation_ref: Some(observation_ref.to_string()),
+        since_stdout_line: None,
+        since_stderr_line: None,
     }
 }
 
@@ -456,7 +460,15 @@ fn observe_jobs_schema_catalog_permission_and_audit_are_public_and_token_safe() 
         .unwrap()
         .iter()
         .any(|schema| schema["type"] == "null"));
-    let sparse_observation = &sparse_output["properties"]["items"]["items"];
+    let sparse_variants = &sparse_output["properties"]["items"]["items"]["anyOf"];
+    let sparse_observation = &sparse_variants[0];
+    let offline_fact = &sparse_variants[1];
+    assert_eq!(offline_fact["additionalProperties"], false);
+    assert_eq!(
+        offline_fact["required"],
+        json!(["job_id", "status", "exit_code"])
+    );
+    assert_eq!(offline_fact["properties"].as_object().unwrap().len(), 3);
     assert_eq!(
         sparse_observation["properties"]["observation_ref"]["maxLength"],
         crate::job_observation::MAX_OBSERVATION_REF_LEN

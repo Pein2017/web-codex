@@ -101,6 +101,9 @@ impl Default for JobLogWait {
 /// model-facing output when the delta is empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellJobLogObservation {
+    pub archive: Option<webcodex_core::job_archive::JobArchiveDescriptor>,
+    pub archive_unavailable: bool,
+    pub archive_unavailable_reason: Option<String>,
     pub wait: JobLogWait,
     pub log_delta_status: webcodex_core::job_observation::JobLogDeltaStatus,
     pub stdout_delta_reset: bool,
@@ -125,6 +128,9 @@ impl std::ops::Deref for ShellJobLogObservation {
 impl Default for ShellJobLogObservation {
     fn default() -> Self {
         Self {
+            archive: None,
+            archive_unavailable: false,
+            archive_unavailable_reason: None,
             wait: JobLogWait::default(),
             log_delta_status: webcodex_core::job_observation::JobLogDeltaStatus::Baseline,
             stdout_delta_reset: false,
@@ -184,6 +190,9 @@ fn frozen_shell_job_log_projection(
         .ok()
         .map(|token| token.encode());
         let observation = ShellJobLogObservation {
+            archive: None,
+            archive_unavailable: false,
+            archive_unavailable_reason: None,
             wait,
             log_delta_status: webcodex_core::job_observation::JobLogDeltaStatus::Baseline,
             stdout_delta_reset: false,
@@ -259,6 +268,9 @@ fn frozen_shell_job_log_projection(
     .ok()
     .map(|token| token.encode());
     let observation = ShellJobLogObservation {
+        archive: None,
+        archive_unavailable: false,
+        archive_unavailable_reason: None,
         wait,
         log_delta_status: webcodex_core::job_observation::combined_delta_status(
             base_mode, &stdout, &stderr,
@@ -1300,6 +1312,7 @@ impl RunnerRegistry {
             Some(job_id.clone()),
         )?;
         let job = ShellJobRecord {
+            archive: None,
             job_id: job_id.clone(),
             request_id: Some(request_id.clone()),
             client_id: client_id.clone(),
@@ -2007,6 +2020,27 @@ impl RunnerRegistry {
                     .map_err(|error| error.to_string())
             })
             .transpose()?;
+        // Explicit archive pages and historical exact-id recovery supplement
+        // the live reader; they must not replace its cursor-aware continuation.
+        // Parse even historical tokens before any archive read dispatch.
+        let use_archive = since_stdout_line.is_some()
+            || since_stderr_line.is_some()
+            || !self.inner.lock().await.jobs_by_id.contains_key(job_id);
+        if use_archive {
+            if let Some(log) = self
+                .archive_log_for_auth(
+                    auth,
+                    job_id,
+                    since_stdout_line,
+                    since_stderr_line,
+                    tail_lines,
+                    after.as_ref(),
+                )
+                .await?
+            {
+                return Ok(log);
+            }
+        }
         let deadline = wait_secs
             .map(|secs| tokio::time::Instant::now() + tokio::time::Duration::from_secs(secs));
         let mut waited_ms = 0u64;
@@ -2257,7 +2291,7 @@ impl RunnerRegistry {
 
     async fn update_job_checked(
         &self,
-        body: RunnerJobUpdateRequest,
+        mut body: RunnerJobUpdateRequest,
         expected_connection_id: Option<&str>,
     ) -> Result<ShellJobInfo, String> {
         validate_id(&body.client_id, "client_id")?;
@@ -2276,6 +2310,41 @@ impl RunnerRegistry {
         // Reject job updates from a stale/replaced instance before refreshing
         // liveness or mutating job state.
         assert_active_instance_locked(&inner, &body.client_id, &body.runner_instance_id)?;
+        if let Some(archive) = body.log_snapshot.as_ref().and_then(|s| s.archive.as_ref()) {
+            let runner = inner
+                .runners
+                .get(&body.client_id)
+                .ok_or("archive executor unavailable")?;
+            let job = inner
+                .jobs_by_id
+                .get(&body.job_id)
+                .ok_or("archive Job unavailable")?;
+            let local_id = archive
+                .project_id
+                .strip_prefix(&format!("agent:{}:", body.client_id));
+            if archive.validate().is_err()
+                || !runner
+                    .runner_features
+                    .wire_capabilities()
+                    .job_output_archive
+                || !body.finished
+                || archive.job_id != body.job_id
+                || archive.client_id != body.client_id
+                || archive.runner_instance_id != body.runner_instance_id
+                || Some(&archive.request_id) != job.request_id.as_ref()
+                || Some(&archive.project_id) != job.project_id.as_ref()
+                || !runner.projects.iter().any(|p| {
+                    !p.disabled
+                        && Some(p.id.as_str()) == local_id
+                        && p.root_fingerprint.as_ref() == Some(&archive.project_root_fingerprint)
+                })
+            {
+                // Invalid optional storage evidence cannot alter a valid child
+                // lifecycle verdict. Fail closed for the archive only.
+                body.log_snapshot.as_mut().unwrap().archive = None;
+                tracing::warn!("Job archive ownership evidence unavailable");
+            }
+        }
         let sequenced = inner.runners.get(&body.client_id).is_some_and(|runner| {
             runner
                 .runner_features
@@ -2429,6 +2498,9 @@ impl RunnerRegistry {
             } else {
                 let was_recovering = job.recovery_active();
                 if let Some(snapshot) = body.log_snapshot {
+                    if let Some(archive) = snapshot.archive {
+                        job.archive = Some(archive);
+                    }
                     super::jobs::replace_log_from_snapshot(&mut job.stdout, &snapshot.stdout);
                     super::jobs::replace_log_from_snapshot(&mut job.stderr, &snapshot.stderr);
                 } else {

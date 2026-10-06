@@ -2356,6 +2356,8 @@ fn observe_jobs_item_limit_matches_presentation_bound() {
                 job_id: format!("job-{index}"),
                 after_observation_token: None,
                 observation_ref: None,
+                since_stdout_line: None,
+                since_stderr_line: None,
             })
             .collect(),
         tail_lines: 40,

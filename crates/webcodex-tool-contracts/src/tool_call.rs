@@ -370,6 +370,24 @@ pub struct ObserveJobsItem {
         skip_serializing_if = "Option::is_none"
     )]
     pub observation_ref: Option<String>,
+    /// Inclusive absolute stdout line for bounded same-Job evidence recovery.
+    /// Use an exact job_id without an observation token/ref or wait; 1 starts
+    /// at the retained archive prefix. This is a read cursor, never replay.
+    #[schemars(range(min = 1, max = 9007199254740991u64))]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_job_line",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub since_stdout_line: Option<usize>,
+    /// Independent inclusive absolute stderr line; same restrictions as stdout.
+    #[schemars(range(min = 1, max = 9007199254740991u64))]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_job_line",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub since_stderr_line: Option<usize>,
 }
 
 impl ObserveJobsItem {
@@ -378,6 +396,8 @@ impl ObserveJobsItem {
             job_id,
             after_observation_token,
             observation_ref: None,
+            since_stdout_line: None,
+            since_stderr_line: None,
         }
     }
 }
@@ -460,6 +480,19 @@ where
     Ok(token)
 }
 
+fn deserialize_optional_job_line<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let line = Option::<usize>::deserialize(deserializer)?;
+    if line.is_some_and(|line| line == 0 || line as u64 > 9_007_199_254_740_991) {
+        return Err(serde::de::Error::custom(
+            "Job line must be a positive JSON-safe integer",
+        ));
+    }
+    Ok(line)
+}
+
 fn deserialize_optional_git_diff_hunks_continuation<'de, D>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error>
@@ -504,6 +537,15 @@ where
     let mut selectors = HashSet::with_capacity(items.len());
     for item in &items {
         let has_job_id = !item.job_id.is_empty();
+        if (item.since_stdout_line.is_some() || item.since_stderr_line.is_some())
+            && (!has_job_id
+                || item.observation_ref.is_some()
+                || item.after_observation_token.is_some())
+        {
+            return Err(serde::de::Error::custom(
+                "explicit Job line positions require exact job_id without observation_ref or after_observation_token",
+            ));
+        }
         match (has_job_id, item.observation_ref.as_deref()) {
             (false, None) => {
                 return Err(serde::de::Error::custom(
@@ -559,6 +601,14 @@ fn observe_jobs_items_schema(_: &mut schemars::SchemaGenerator) -> schemars::Sch
                             "description": "Optional opaque Job-bound lifecycle/log-delta token from the latest observation. Return it unchanged without interpreting its cursor state. It is not execution identity or retry authority; a stale Server epoch resets the bounded log projection."
                         },
                         "observation_ref": {"type": "null"}
+                        ,"since_stdout_line": {
+                            "anyOf": [{"type":"integer","minimum":1,"maximum":9007199254740991u64}, {"type":"null"}],
+                            "description":"Inclusive stdout line for a bounded archived page. Use exact job_id without token/ref or wait; 1 starts at the retained prefix."
+                        },
+                        "since_stderr_line": {
+                            "anyOf": [{"type":"integer","minimum":1,"maximum":9007199254740991u64}, {"type":"null"}],
+                            "description":"Independent inclusive stderr line for the same bounded evidence read."
+                        }
                     },
                     "required": ["job_id"]
                 },
@@ -1487,8 +1537,8 @@ pub enum ToolCall {
 
     /// Explicitly present the current bounded Work Result for one exact coding Session.
     PresentWorkResult {
-        /// Required exact runtime Project input. It is independently resolved and authorized on every call
-        /// and must match the project scoped to session_id.
+        /// Required explicit authorized Project selector: canonical id, current principal-scoped
+        /// Project reference or unique short name. Canonical resolution must match the exact Session.
         #[schemars(length(min = 1, max = 512))]
         project: String,
         /// Required exact project-scoped Workflow Session id. Identity is never inferred from
@@ -5401,6 +5451,25 @@ impl ToolCall {
         }
         if name == "work_on_project" {
             validate_coding_project_source_shape(name, &arguments)?;
+        }
+        if name == "observe_jobs"
+            && arguments
+                .get("wait_secs")
+                .is_some_and(|value| !value.is_null())
+            && arguments
+                .get("items")
+                .and_then(Value::as_array)
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        ["since_stdout_line", "since_stderr_line"]
+                            .iter()
+                            .any(|field| item.get(*field).is_some_and(|value| !value.is_null()))
+                    })
+                })
+        {
+            return Err(
+                "explicit Job line positions cannot be combined with wait_secs".to_string(),
+            );
         }
         let mut wrapped = serde_json::Map::new();
         wrapped.insert(

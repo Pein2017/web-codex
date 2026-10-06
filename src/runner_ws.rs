@@ -387,6 +387,7 @@ mod tests {
                 host_context: None,
                 capabilities: crate::test_support::current_runner_capabilities(
                     RunnerCapabilities {
+                        job_output_archive: false,
                         shell: true,
                         explicit_shell_selection: false,
                         bash_login_shell: false,

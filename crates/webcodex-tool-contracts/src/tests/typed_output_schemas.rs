@@ -25,6 +25,31 @@ fn tool_result_instance<T: Serialize>(success: bool, payload: &T) -> Value {
     instance
 }
 
+#[test]
+fn archive_observation_schema_accepts_bounds_and_exact_offline_facts() {
+    let schema = output_schema_for_tool("observe_jobs");
+    let fact = json!({"job_id": "wc_job_fixture", "status": "completed", "exit_code": 0});
+    let result = json!({"success": true, "output": {"items": [fact.clone()], "wait": {"outcome": "immediate"}}});
+    test_support::validate_schema_instance(&result, &schema).unwrap();
+    let mut leaked = result.clone();
+    leaked["output"]["items"][0]["cwd"] = json!("/private/root");
+    assert!(test_support::validate_schema_instance(&leaked, &schema).is_err());
+    let mut observation = json!({
+        "job_id": "wc_job_fixture", "status": "completed", "terminal": true,
+        "changed": false, "log_delta_status": "baseline", "observation_token": "token",
+        "exit_code": 0, "stdout_tail": "prefix\n",
+        "cursor": {"stdout": 2, "stderr": 1},
+        "archive": {"committed_at": 1, "stdout": {"retained_bytes": 7, "next_line": 2, "loss_reason": null},
+                    "stderr": {"retained_bytes": 0, "next_line": 1, "loss_reason": null}},
+        "archive_unavailable": false
+    });
+    let result = json!({"success": true, "output": {"items": [observation.clone()], "wait": {"outcome": "immediate"}}});
+    test_support::validate_schema_instance(&result, &schema).unwrap();
+    observation["archive"]["stdout"]["retained_bytes"] = json!(16777217);
+    let invalid = json!({"success": true, "output": {"items": [observation], "wait": {"outcome": "immediate"}}});
+    assert!(test_support::validate_schema_instance(&invalid, &schema).is_err());
+}
+
 fn assert_registered_schema_accepts<T: Serialize>(tool: &str, success: bool, payload: &T) {
     let schema = output_schema_for_tool(tool);
     let instance = tool_result_instance(success, payload);

@@ -3,7 +3,7 @@ use crate::runner_job_lifecycle::RunnerJobLifecycle;
 use crate::runner_protocol::{ShellJobSnapshot, JOB_TERMINAL_RETENTION_SECS};
 
 /// Non-secret isolation partition captured when a Runner or Job is admitted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RunnerAccessGroup {
     /// SHA-256 shared-key/OAuth-bridge group, never the credential itself.
     SharedKey(String),
@@ -15,7 +15,7 @@ pub enum RunnerAccessGroup {
 pub const JOB_RECEIPT_STREAM_MAX_BYTES: usize = 256 * 1024 + 128;
 pub const JOB_RECEIPT_PAYLOAD_MAX_BYTES: usize = 4 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RetainedJobReceipt {
     pub client_id: String,
     /// Historical provenance only; never a current Runner lease.
@@ -28,6 +28,37 @@ pub struct RetainedJobReceipt {
     pub snapshot: ShellJobSnapshot,
     pub terminal_observed_at: i64,
     pub expires_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ArchivedJobReceipt {
+    pub receipt: RetainedJobReceipt,
+    pub archive: crate::job_archive::JobArchiveDescriptor,
+}
+
+impl ArchivedJobReceipt {
+    pub fn validate(&self, now: i64) -> Result<(), &'static str> {
+        self.archive.validate()?;
+        self.receipt.validate(self.receipt.terminal_observed_at)?;
+        if self.archive.committed_at > now
+            || self
+                .archive
+                .committed_at
+                .saturating_add(crate::job_archive::ARCHIVE_RETENTION_SECS)
+                <= now
+            || self.archive.job_id != self.receipt.snapshot.job_id
+            || self.archive.request_id != self.receipt.snapshot.request_id
+            || self.archive.client_id != self.receipt.client_id
+            || self.archive.runner_instance_id != self.receipt.runner_instance_id
+            || Some(&self.archive.project_id)
+                != self.receipt.snapshot.context.runtime_project_id.as_ref()
+            || !self.receipt.snapshot.stdout.tail.is_empty()
+            || !self.receipt.snapshot.stderr.tail.is_empty()
+        {
+            return Err("invalid archived receipt");
+        }
+        Ok(())
+    }
 }
 
 impl RetainedJobReceipt {

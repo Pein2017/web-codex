@@ -420,6 +420,7 @@ pub(super) struct DetachedIdempotencyIntent {
 
 #[derive(Debug, Clone)]
 pub(super) struct ShellJobRecord {
+    pub(super) archive: Option<webcodex_core::job_archive::JobArchiveDescriptor>,
     pub(super) job_id: String,
     pub(super) request_id: Option<String>,
     pub(super) client_id: String,

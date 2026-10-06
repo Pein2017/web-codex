@@ -637,6 +637,7 @@ pub struct RunnerPersistentShellOperation {
 /// fields.
 #[derive(Debug, Clone)]
 pub enum RunnerOperation {
+    JobArchiveRead(crate::job_archive::JobArchiveRead),
     RunShell(RunnerShellOperation),
     RunProcess(RunnerProcessOperation),
     RunScript(RunnerScriptOperation),
@@ -668,6 +669,7 @@ pub enum RunnerOperation {
 impl RunnerOperation {
     pub fn wire_kind(&self) -> &'static str {
         match self {
+            Self::JobArchiveRead(_) => "job_archive_read",
             Self::RunShell(_) => "run_shell",
             Self::RunProcess(_) => "run_process",
             Self::RunScript(_) => "run_script",
@@ -863,6 +865,12 @@ fn encode_operation(
             wire.cwd = operation.cwd;
             wire.content = Some(content);
             wire.timeout_secs = operation.timeout_secs;
+        }
+        RunnerOperation::JobArchiveRead(read) => {
+            read.archive.validate().map_err(str::to_string)?;
+            wire.content =
+                Some(serde_json::to_string(&read).map_err(|_| "invalid archive request")?);
+            wire.timeout_secs = 10;
         }
         RunnerOperation::Job(operation) => encode_job_operation(&mut wire, operation)?,
         RunnerOperation::File(operation) => {
@@ -1120,6 +1128,20 @@ fn decode_operation(wire: &RunnerRequest) -> Result<RunnerOperation, String> {
     }
     let no_special = || ensure_special_payloads_absent(wire);
     match wire.kind.as_str() {
+        "job_archive_read" => {
+            no_special()?;
+            let content = wire.content.as_deref().ok_or("archive request missing")?;
+            if content.len() > crate::job_archive::ARCHIVE_METADATA_MAX_BYTES {
+                return Err("archive request oversized".into());
+            }
+            let read: crate::job_archive::JobArchiveRead =
+                serde_json::from_str(content).map_err(|_| "archive request invalid")?;
+            read.archive.validate().map_err(str::to_string)?;
+            if read.archive.client_id != wire.client_id {
+                return Err("archive executor mismatch".into());
+            }
+            Ok(RunnerOperation::JobArchiveRead(read))
+        }
         "run_shell" => {
             no_special()?;
             ensure_no_file_fields_except_max_bytes(wire)?;

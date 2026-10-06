@@ -64,7 +64,7 @@ fn observed_has_error(observed: &[ObservedJob]) -> bool {
 fn observed_terminal_satisfied(observed: &[ObservedJob], wake_on: ObserveJobsWakeOn) -> bool {
     let mut terminal = observed
         .iter()
-        .map(|item| item.result.output["terminal"].as_bool() == Some(true));
+        .map(|item| observation_is_terminal(&item.result.output));
     if wake_on == ObserveJobsWakeOn::AllTerminal {
         terminal.all(|terminal| terminal)
     } else {
@@ -99,6 +99,15 @@ fn observed_has_change(observed: &[ObservedJob]) -> bool {
     observed
         .iter()
         .any(|item| item.result.output["changed"].as_bool() == Some(true))
+}
+
+fn observation_is_terminal(output: &Value) -> bool {
+    output["terminal"].as_bool() == Some(true)
+        || (output.as_object().is_some_and(|object| {
+            object.len() == 3 && object.contains_key("job_id") && object.contains_key("exit_code")
+        }) && output["status"]
+            .as_str()
+            .is_some_and(super::jobs::is_terminal_job_status))
 }
 
 fn bounded_error(error: Option<&str>) -> String {
@@ -371,8 +380,7 @@ fn batch_output(
     let terminal_count = items
         .iter()
         .filter(|item| {
-            item["success"].as_bool() == Some(true)
-                && item["output"]["terminal"].as_bool() == Some(true)
+            item["success"].as_bool() == Some(true) && observation_is_terminal(&item["output"])
         })
         .count();
     let mut output = json!({
@@ -635,6 +643,26 @@ fn sparse_success_item(item: &Value) -> Option<Value> {
     for key in ["recovery_state", "recovery_reason_code", "recovery_reason"] {
         copy_non_null(observation, &mut sparse, key);
     }
+    if observation
+        .get("archive")
+        .is_some_and(|value| !value.is_null())
+    {
+        for key in [
+            "archive",
+            "archive_unavailable",
+            "archive_unavailable_reason",
+            "cursor",
+        ] {
+            copy_present(observation, &mut sparse, key);
+        }
+    } else if observation
+        .get("archive_unavailable")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        copy_present(observation, &mut sparse, "archive_unavailable");
+        copy_non_null(observation, &mut sparse, "archive_unavailable_reason");
+    }
 
     let exceptional_log_evidence = log_delta_status == "reset"
         || stdout_truncated
@@ -789,12 +817,39 @@ fn normalize_observe_jobs_preferences(
     )
 }
 
+fn validate_explicit_job_line_positions(
+    items: &[ObserveJobsItem],
+    wait_secs: Option<u64>,
+) -> Result<(), String> {
+    for item in items {
+        if item.since_stdout_line.is_none() && item.since_stderr_line.is_none() {
+            continue;
+        }
+        if item.job_id.trim().is_empty()
+            || item.observation_ref.is_some()
+            || item.after_observation_token.is_some()
+            || wait_secs.is_some()
+        {
+            return Err("explicit Job line positions require exact job_id without observation_ref, after_observation_token or wait_secs".into());
+        }
+        if [item.since_stdout_line, item.since_stderr_line]
+            .into_iter()
+            .flatten()
+            .any(|line| line == 0 || line as u128 > 9_007_199_254_740_991)
+        {
+            return Err("explicit Job line positions must be positive JSON-safe integers".into());
+        }
+    }
+    Ok(())
+}
+
 impl ToolRuntime {
     fn validate_observe_jobs_input(
         items: &[ObserveJobsItem],
         tail_lines: usize,
         wait_secs: Option<u64>,
     ) -> Result<(), String> {
+        validate_explicit_job_line_positions(items, wait_secs)?;
         if items.len() > MAX_OBSERVE_JOBS_ITEMS {
             return Err("observe_jobs accepts at most 8 resolved items".into());
         }
@@ -845,9 +900,10 @@ impl ToolRuntime {
             stream::iter(items.iter().cloned().map(|resolved| async move {
                 let item = resolved.item;
                 let result = self
-                    .job_log_for_auth(
+                    .job_log_for_auth_positions(
                         item.job_id.clone(),
-                        None,
+                        item.since_stdout_line,
+                        item.since_stderr_line,
                         Some(tail_lines),
                         auth,
                         item.after_observation_token,
@@ -886,9 +942,10 @@ impl ToolRuntime {
                     return Ok::<WakeReason, String>(WakeReason::Timeout);
                 }
                 let result = self
-                    .job_log_for_auth(
+                    .job_log_for_auth_positions(
                         item.job_id.clone(),
-                        None,
+                        item.since_stdout_line,
+                        item.since_stderr_line,
                         Some(1),
                         auth,
                         item.after_observation_token.clone(),
@@ -898,7 +955,7 @@ impl ToolRuntime {
                 if !result.success {
                     return Ok(WakeReason::ItemError);
                 }
-                if result.output["terminal"].as_bool() == Some(true) {
+                if observation_is_terminal(&result.output) {
                     return Ok(WakeReason::Terminal);
                 }
                 if result.output["changed"].as_bool() == Some(true) {
@@ -952,6 +1009,11 @@ impl ToolRuntime {
         wake_on: ObserveJobsWakeOn,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
+        // Native-constructed calls must obey the same fence as JSON input,
+        // before reference resolution could discard caller-supplied positions.
+        if let Err(error) = validate_explicit_job_line_positions(&items, wait_secs) {
+            return ToolResult::err(error);
+        }
         let (tail_lines, wait_secs) = normalize_observe_jobs_preferences(tail_lines, wait_secs);
         if !(1..=MAX_OBSERVE_JOBS_ITEMS).contains(&items.len()) {
             return ToolResult::err("observe_jobs requires between 1 and 8 items");
@@ -1064,7 +1126,7 @@ impl ToolRuntime {
                             .iter()
                             .find(|observed| observed.index == resolved.index)
                             .is_none_or(|observed| {
-                                observed.result.output["terminal"].as_bool() != Some(true)
+                                !observation_is_terminal(&observed.result.output)
                             })
                 })
                 .cloned()
@@ -1127,6 +1189,31 @@ impl ToolRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_job_line_positions_cannot_bypass_canonical_input_fences() {
+        let mut item = ObserveJobsItem::resolved("job".into(), None);
+        item.since_stdout_line = Some(1);
+        assert!(ToolRuntime::validate_observe_jobs_input(&[item.clone()], 200, None).is_ok());
+        assert!(ToolRuntime::validate_observe_jobs_input(&[item.clone()], 200, Some(1)).is_err());
+        item.since_stdout_line = Some(0);
+        assert!(ToolRuntime::validate_observe_jobs_input(&[item.clone()], 200, None).is_err());
+        item.since_stdout_line = Some(1);
+        item.after_observation_token = Some("token".into());
+        assert!(ToolRuntime::validate_observe_jobs_input(&[item.clone()], 200, None).is_err());
+        item.after_observation_token = None;
+        item.observation_ref = Some("ref".into());
+        assert!(validate_explicit_job_line_positions(&[item.clone()], None).is_err());
+        item.observation_ref = None;
+        item.job_id.clear();
+        assert!(validate_explicit_job_line_positions(&[item.clone()], None).is_err());
+        #[cfg(target_pointer_width = "64")]
+        {
+            item.job_id = "job".into();
+            item.since_stdout_line = Some(9_007_199_254_740_992);
+            assert!(ToolRuntime::validate_observe_jobs_input(&[item], 200, None).is_err());
+        }
+    }
 
     #[test]
     fn all_terminal_deadline_is_not_rewritten_by_a_racing_final_snapshot() {
@@ -1245,16 +1332,22 @@ mod tests {
     fn batch_continuation_is_parser_ready_and_omits_absent_tokens() {
         let originals = vec![
             ObserveJobsItem {
+                since_stdout_line: None,
+                since_stderr_line: None,
                 job_id: "job-0".to_string(),
                 after_observation_token: Some("token-0".to_string()),
                 observation_ref: None,
             },
             ObserveJobsItem {
+                since_stdout_line: None,
+                since_stderr_line: None,
                 job_id: "job-1".to_string(),
                 after_observation_token: None,
                 observation_ref: None,
             },
             ObserveJobsItem {
+                since_stdout_line: None,
+                since_stderr_line: None,
                 job_id: "job-2".to_string(),
                 after_observation_token: Some("token-2".to_string()),
                 observation_ref: None,

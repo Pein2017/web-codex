@@ -9,11 +9,38 @@ use std::sync::{Arc, Mutex, Weak};
 #[derive(Debug, Default)]
 struct MemoryReceipts {
     rows: Mutex<Vec<RetainedJobReceipt>>,
+    archives: Mutex<Vec<webcodex_core::runner_job_receipt::ArchivedJobReceipt>>,
     fail: bool,
     failures_remaining: std::sync::atomic::AtomicUsize,
     registry: Mutex<Option<Weak<crate::receipts::ReceiptRegistryState>>>,
 }
 impl JobReceiptStore for MemoryReceipts {
+    fn upsert_archive(
+        &self,
+        value: &webcodex_core::runner_job_receipt::ArchivedJobReceipt,
+    ) -> Result<(), String> {
+        let mut archives = self.archives.lock().unwrap();
+        if !archives
+            .iter()
+            .any(|old| old.archive.job_id == value.archive.job_id)
+        {
+            archives.push(value.clone());
+        }
+        Ok(())
+    }
+    fn load_archive(
+        &self,
+        job_id: &str,
+        now: i64,
+    ) -> Result<Option<webcodex_core::runner_job_receipt::ArchivedJobReceipt>, String> {
+        Ok(self
+            .archives
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|value| value.archive.job_id == job_id && value.validate(now).is_ok())
+            .cloned())
+    }
     fn upsert(&self, receipt: &RetainedJobReceipt) -> Result<(), String> {
         if let Some(registry) = self
             .registry
@@ -132,6 +159,119 @@ fn access(owner: Option<&str>, group: Option<RunnerAccessGroup>) -> RunnerAccess
     }
 }
 
+fn archived_fact_fixture() -> webcodex_core::runner_job_receipt::ArchivedJobReceipt {
+    let now = crate::now_ts();
+    let receipt = RetainedJobReceipt {
+        client_id: CLIENT_ID.into(), runner_instance_id: INSTANCE_A.into(), auth_group: None, owner_at_admission: Some("alice".into()), kind: "shell".into(), terminal_observed_at: now - 2 * JOB_TERMINAL_RETENTION_SECS,
+        expires_at: now - JOB_TERMINAL_RETENTION_SECS,
+        snapshot: serde_json::from_value(serde_json::json!({
+            "job_id":"archived-fact", "request_id":"archived-request", "status":"completed", "update_seq":3,
+            "created_at":now-2*JOB_TERMINAL_RETENTION_SECS-2, "started_at":now-2*JOB_TERMINAL_RETENTION_SECS-1, "ended_at":now-2*JOB_TERMINAL_RETENTION_SECS, "exit_code":0,
+            "context":{"runtime_project_id":RUNTIME_PROJECT_ID,"project_cwd":"/srv/demo","command_preview":"sensitive historical preview"}
+        })).unwrap(),
+    };
+    webcodex_core::runner_job_receipt::ArchivedJobReceipt {
+        archive: webcodex_core::job_archive::JobArchiveDescriptor {
+            job_id: "archived-fact".into(),
+            request_id: "archived-request".into(),
+            client_id: CLIENT_ID.into(),
+            runner_instance_id: INSTANCE_A.into(),
+            project_id: RUNTIME_PROJECT_ID.into(),
+            project_root_fingerprint: format!("wc_projroot_{}", "1".repeat(64)),
+            root_incarnation: "2".repeat(64),
+            committed_at: now - 2 * JOB_TERMINAL_RETENTION_SECS,
+            stdout: webcodex_core::job_archive::JobArchiveStream {
+                retained_bytes: 0,
+                next_line: 1,
+                loss_reason: None,
+            },
+            stderr: webcodex_core::job_archive::JobArchiveStream {
+                retained_bytes: 0,
+                next_line: 1,
+                loss_reason: None,
+            },
+        },
+        receipt,
+    }
+}
+
+#[tokio::test]
+async fn historical_archive_rejects_invalid_token_before_read_dispatch() {
+    let store = Arc::new(MemoryReceipts::default());
+    store.archives.lock().unwrap().push(archived_fact_fixture());
+    let registry = durable(&store).await;
+    let alice = access(Some("alice"), None);
+    let error = registry
+        .job_log_for_auth(
+            Some(&alice),
+            "archived-fact",
+            None,
+            None,
+            Some(10),
+            Some("not-an-observation-token"),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("malformed"), "{error}");
+    assert!(registry.inner.lock().await.pending_by_id.is_empty());
+    assert!(registry.inner.lock().await.jobs_by_id.is_empty());
+}
+
+#[tokio::test]
+async fn archive_offline_fallback_is_exact_three_fields_and_never_transfers_authority() {
+    let store = Arc::new(MemoryReceipts::default());
+    let value = archived_fact_fixture();
+    value.validate(crate::now_ts()).unwrap();
+    store.archives.lock().unwrap().push(value);
+    let registry = durable(&store).await;
+    let alice = access(Some("alice"), None);
+    let fact = registry
+        .archived_terminal_fact_for_auth(Some(&alice), "archived-fact")
+        .await
+        .unwrap()
+        .unwrap();
+    let json = serde_json::to_value(fact).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({"job_id":"archived-fact","status":"completed","exit_code":0})
+    );
+    assert_eq!(json.as_object().unwrap().len(), 3);
+    assert!(registry
+        .archived_terminal_fact_for_auth(None, "archived-fact")
+        .await
+        .is_err());
+    assert!(registry
+        .archived_terminal_fact_for_auth(Some(&access(Some("mallory"), None)), "archived-fact")
+        .await
+        .is_err());
+    assert!(registry
+        .archived_terminal_fact_for_auth(
+            Some(&access(
+                None,
+                Some(RunnerAccessGroup::ProjectGrant("other".into()))
+            )),
+            "archived-fact"
+        )
+        .await
+        .is_err());
+    assert!(registry.inner.lock().await.jobs_by_id.is_empty());
+    assert!(registry.inner.lock().await.pending_by_id.is_empty());
+    register(&registry, INSTANCE_B, empty_inventory()).await;
+    let global = RunnerAccess {
+        global_visibility: true,
+        owner_bypass: true,
+        ..alice
+    };
+    // Online registration has no matching pinned root. The offline exception
+    // must not turn a demonstrated current Project mismatch into availability.
+    assert!(registry
+        .archived_terminal_fact_for_auth(Some(&global), "archived-fact")
+        .await
+        .is_err());
+    assert!(registry.inner.lock().await.pending_by_id.is_empty());
+}
+
 #[tokio::test]
 async fn terminal_events_emit_once_only_after_accepted_sequenced_terminal_truth() {
     let store = Arc::new(MemoryReceipts::default());
@@ -186,7 +326,6 @@ async fn terminal_events_emit_once_only_after_accepted_sequenced_terminal_truth(
     assert_eq!(events.rows.lock().unwrap().len(), 1);
 }
 
-
 #[tokio::test]
 async fn terminal_event_sink_failure_requeues_candidate_until_a_later_registry_unlock() {
     let store = Arc::new(MemoryReceipts::default());
@@ -203,7 +342,10 @@ async fn terminal_event_sink_failure_requeues_candidate_until_a_later_registry_u
     assert!(events.rows.lock().unwrap().is_empty());
 
     // Any later registry guard release retries the exact bounded candidate.
-    assert_eq!(registry.get_job(&job.job_id).await.unwrap().status, "completed");
+    assert_eq!(
+        registry.get_job(&job.job_id).await.unwrap().status,
+        "completed"
+    );
     {
         let rows = events.rows.lock().unwrap();
         assert_eq!(rows.len(), 1);
@@ -241,7 +383,10 @@ async fn same_instance_reconciliation_preserves_exact_job_identity_for_terminal_
         },
     )
     .await;
-    assert_eq!(registry.get_job(&job.job_id).await.unwrap().job_id, job.job_id);
+    assert_eq!(
+        registry.get_job(&job.job_id).await.unwrap().job_id,
+        job.job_id
+    );
     assert!(events.rows.lock().unwrap().is_empty());
 
     registry
@@ -282,7 +427,14 @@ async fn terminal_events_share_protocol_violation_lost_and_stopped_classificatio
 
     let (stopped, _) = start_and_take_over(&registry, INSTANCE_A).await;
     registry
-        .update_job(update(INSTANCE_A, &stopped.job_id, 1, "running", None, false))
+        .update_job(update(
+            INSTANCE_A,
+            &stopped.job_id,
+            1,
+            "running",
+            None,
+            false,
+        ))
         .await
         .unwrap();
     registry
@@ -290,15 +442,40 @@ async fn terminal_events_share_protocol_violation_lost_and_stopped_classificatio
         .await
         .unwrap();
     registry
-        .update_job(update(INSTANCE_A, &stopped.job_id, 2, "stopped", None, true))
+        .update_job(update(
+            INSTANCE_A,
+            &stopped.job_id,
+            2,
+            "stopped",
+            None,
+            true,
+        ))
         .await
         .unwrap();
 
     let rows = events.rows.lock().unwrap();
     let event = |job_id: &str| rows.iter().find(|event| event.job_id == job_id).unwrap();
-    assert_eq!((event(&protocol.job_id).status.as_str(), event(&protocol.job_id).outcome.as_str()), ("failed", "failed"));
-    assert_eq!((event(&lost.job_id).status.as_str(), event(&lost.job_id).outcome.as_str()), ("lost", "failed"));
-    assert_eq!((event(&stopped.job_id).status.as_str(), event(&stopped.job_id).outcome.as_str()), ("stopped", "cancelled"));
+    assert_eq!(
+        (
+            event(&protocol.job_id).status.as_str(),
+            event(&protocol.job_id).outcome.as_str()
+        ),
+        ("failed", "failed")
+    );
+    assert_eq!(
+        (
+            event(&lost.job_id).status.as_str(),
+            event(&lost.job_id).outcome.as_str()
+        ),
+        ("lost", "failed")
+    );
+    assert_eq!(
+        (
+            event(&stopped.job_id).status.as_str(),
+            event(&stopped.job_id).outcome.as_str()
+        ),
+        ("stopped", "cancelled")
+    );
 }
 
 #[tokio::test]
@@ -350,6 +527,7 @@ async fn receipts_all_sequenced_terminal_classes_restore_without_execution_autho
         let mut terminal = update(INSTANCE_A, &job.job_id, 2, status, None, true);
         terminal.exit_code = Some(if status == "failed" { 7 } else { 0 });
         terminal.log_snapshot = Some(ShellJobLogSnapshot {
+            archive: None,
             stdout: stream("retained output\n", 20, true),
             stderr: stream("retained error\n", 4, true),
         });

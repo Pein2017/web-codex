@@ -17,7 +17,8 @@ case "$action" in
       test -r "$path" || { echo "Missing private config: $path" >&2; exit 1; }
     done
     for path in AGENTS.md plugins/web-workflow/plugin.mjs \
-      plugins/web-workflow/pytest_report.py plugins/web-workflow/package.json; do
+      plugins/web-workflow/pytest_report.py plugins/web-workflow/package.json \
+      sandbox_preflight.py; do
       test -r "$root/app/$path" || { echo "Missing installed application file: $path" >&2; exit 1; }
     done
     command -v tmux >/dev/null

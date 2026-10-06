@@ -399,6 +399,7 @@ async fn job_log_wait_sequenced_update_changes_token_even_when_snapshot_is_same(
             stdout_chunk: None,
             stderr_chunk: None,
             log_snapshot: Some(ShellJobLogSnapshot {
+                archive: None,
                 stdout: ShellJobStreamSnapshot {
                     tail: "same\n".into(),
                     first_retained_line: 1,
@@ -435,6 +436,7 @@ async fn job_log_wait_sequenced_update_changes_token_even_when_snapshot_is_same(
             stdout_chunk: None,
             stderr_chunk: None,
             log_snapshot: Some(ShellJobLogSnapshot {
+                archive: None,
                 stdout: ShellJobStreamSnapshot {
                     tail: "same\n".into(),
                     first_retained_line: 1,

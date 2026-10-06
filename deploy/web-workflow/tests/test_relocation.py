@@ -60,7 +60,8 @@ if action == 'list-panes':
                          / "@colbymchenry/codegraph-linux-x64")
         self.executable(self.node_dir / "node", "#!/usr/bin/env bash\necho package-node\n")
         for name in ("AGENTS.md", "plugins/web-workflow/plugin.mjs",
-                     "plugins/web-workflow/pytest_report.py", "plugins/web-workflow/package.json"):
+                     "plugins/web-workflow/pytest_report.py", "plugins/web-workflow/package.json",
+                     "sandbox_preflight.py"):
             self.touch(self.release / name)
         for name in ("server.env", "runner.toml", "tunnel.env"):
             self.touch(self.root / "config" / name)
@@ -151,7 +152,8 @@ with open(os.environ['FAKE_SERVICE_CALLS'], 'a') as out:
         self.legacy_fixture()
         paths = [self.release / name for name in
                  ("bin/webcodex-cli", "AGENTS.md", "plugins/web-workflow/plugin.mjs",
-                  "plugins/web-workflow/pytest_report.py", "plugins/web-workflow/package.json")]
+                  "plugins/web-workflow/pytest_report.py", "plugins/web-workflow/package.json",
+                  "sandbox_preflight.py")]
         paths += [self.root / "runtime/bin/rg", self.node_dir / "node",
                   self.root / "bin/service.sh"]
         for path in paths:
@@ -167,6 +169,14 @@ with open(os.environ['FAKE_SERVICE_CALLS'], 'a') as out:
                     path.write_bytes(saved)
                     path.chmod(mode)
                     self.executions.unlink(missing_ok=True)
+
+    def test_missing_sandbox_preflight_fails_without_launch(self):
+        helper = self.release / "sandbox_preflight.py"
+        helper.unlink()
+        result = self.run_control("start")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("Missing installed application file: sandbox_preflight.py", result.stderr)
+        self.assertFalse(self.executions.exists())
 
     def test_existing_session_start_status_stop(self):
         self.live.touch()

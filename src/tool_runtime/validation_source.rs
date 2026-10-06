@@ -2,13 +2,71 @@
 //! Unlike the Code Mode serialization fence this includes direct calls and all
 //! Sessions. It is NOT a filesystem watcher, write lock, or source snapshot.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use webcodex_core::validation_source::{
     ValidationSourceFence, ValidationSourceState, MAX_SOURCE_GENERATION,
 };
 
 const MAX_TRACKED_PROJECTS: usize = 4096;
+
+#[derive(Clone, Copy, Default)]
+struct WriteAttempt {
+    rejected_before_write: bool,
+    write_may_have_begun: bool,
+}
+
+tokio::task_local! {
+    // One scope per canonical dispatch, independent of concurrent requests and
+    // nested dispatch. Never serialized or accepted from a Runner/tool payload.
+    static WRITE_ATTEMPT: Cell<WriteAttempt>;
+}
+
+pub(crate) enum NoSourceWriteRejection {
+    GuardedEditPreflight,
+    ReadRevision,
+}
+
+/// Called only by named local rejection constructors before mutation enqueue.
+/// A later possible write permanently disqualifies this invocation's proof.
+pub(crate) fn reject_before_source_write(_reason: NoSourceWriteRejection) {
+    let _ = WRITE_ATTEMPT.try_with(|attempt| {
+        let mut state = attempt.get();
+        if !state.write_may_have_begun {
+            state.rejected_before_write = true;
+            attempt.set(state);
+        }
+    });
+}
+
+pub(crate) fn source_write_may_begin() {
+    let _ = WRITE_ATTEMPT.try_with(|attempt| {
+        attempt.set(WriteAttempt {
+            rejected_before_write: false,
+            write_may_have_begun: true,
+        });
+    });
+}
+
+pub(crate) async fn run_observed_mutation<F>(
+    guard: Option<MutationObservationGuard>,
+    operation: F,
+) -> super::ToolResult
+where
+    F: Future<Output = super::ToolResult>,
+{
+    WRITE_ATTEMPT
+        .scope(Cell::new(WriteAttempt::default()), async move {
+            let result = operation.await;
+            if let Some(guard) = guard {
+                guard.finish(&result);
+            }
+            result
+        })
+        .await
+}
 
 #[derive(Debug)]
 struct ProjectObservation {
@@ -80,8 +138,12 @@ impl ValidationSourceRegistry {
         let state = self.project(project)?;
         {
             let mut state = state.lock().ok()?;
-            state.advance();
-            state.active += 1;
+            let Some(active) = state.active.checked_add(1) else {
+                state.advance();
+                state.uncertain = true;
+                return None;
+            };
+            state.active = active;
         }
         Some(MutationObservationGuard {
             state,
@@ -100,10 +162,19 @@ impl MutationObservationGuard {
         // Returning a Job, losing delivery, or lacking mutation truth cannot
         // prove that the potential writer stopped. Keep this epoch uncertain.
         let output = &result.output;
-        self.completed = output
+        let execution_state = output
             .get("execution_state")
-            .and_then(serde_json::Value::as_str)
-            != Some("outcome_unknown")
+            .and_then(serde_json::Value::as_str);
+        let known_completion = matches!(execution_state, None | Some("not_started" | "completed"))
+            && output.get("terminal").and_then(serde_json::Value::as_bool) != Some(false)
+            && (output
+                .get("command_completed")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+                || output
+                    .get("command_started")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(false))
             && output
                 .get("failure_kind")
                 .and_then(serde_json::Value::as_str)
@@ -121,15 +192,48 @@ impl MutationObservationGuard {
                     .get("command_started")
                     .and_then(serde_json::Value::as_bool)
                     == Some(false));
+        let no_write = known_completion
+            && !result.success
+            && execution_state == Some("not_started")
+            && output
+                .get("command_started")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            && output
+                .get("command_completed")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            && output
+                .get("state_changed")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+            && WRITE_ATTEMPT
+                .try_with(|attempt| {
+                    let attempt = attempt.get();
+                    attempt.rejected_before_write && !attempt.write_may_have_begun
+                })
+                .unwrap_or(false);
+        if let Ok(mut state) = self.state.lock() {
+            // Completion truth, generation and active count commit together.
+            // No-op never rolls a generation back or clears prior uncertainty.
+            if !no_write {
+                state.advance();
+            }
+            state.active = state.active.saturating_sub(1);
+            state.uncertain |= !known_completion;
+            self.completed = true;
+        }
     }
 }
 
 impl Drop for MutationObservationGuard {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.advance();
-            state.active = state.active.saturating_sub(1);
-            state.uncertain |= !self.completed;
+        if !self.completed {
+            if let Ok(mut state) = self.state.lock() {
+                state.advance();
+                state.active = state.active.saturating_sub(1);
+                state.uncertain = true;
+            }
         }
     }
 }

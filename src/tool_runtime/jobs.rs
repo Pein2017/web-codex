@@ -1718,10 +1718,54 @@ impl ToolRuntime {
         after_observation_token: Option<String>,
         wait_secs: Option<u64>,
     ) -> ToolResult {
+        self.job_log_for_auth_positions(
+            job_id,
+            offset,
+            None,
+            tail_lines,
+            auth,
+            after_observation_token,
+            wait_secs,
+        )
+        .await
+    }
+
+    pub(crate) async fn job_log_for_auth_positions(
+        &self,
+        job_id: String,
+        offset: Option<usize>,
+        stderr_offset: Option<usize>,
+        tail_lines: Option<usize>,
+        auth: Option<&AuthContext>,
+        after_observation_token: Option<String>,
+        wait_secs: Option<u64>,
+    ) -> ToolResult {
         if let Err(message) = Self::validate_job_log_wait(wait_secs) {
             return invalid_job_observation_result("invalid_wait_secs", message);
         }
-        let tail_lines = if offset.is_none() && tail_lines.is_none() {
+        if let Some(token) = after_observation_token.as_deref() {
+            if let Err(error) = crate::job_observation::JobObservationToken::parse(token) {
+                return invalid_job_observation_result(
+                    "invalid_observation_token",
+                    error.to_string(),
+                );
+            }
+        }
+        let access = crate::runner_http::runner_access_from_auth(auth);
+        match self
+            .runner_registry
+            .archived_terminal_fact_for_auth(access.as_ref(), &job_id)
+            .await
+        {
+            Ok(Some(fact)) => {
+                return ToolResult::ok(
+                    serde_json::to_value(fact).expect("terminal fact serialization"),
+                )
+            }
+            Err(error) => return agent_job_log_error_result(&job_id, error),
+            Ok(None) => {}
+        }
+        let tail_lines = if offset.is_none() && stderr_offset.is_none() && tail_lines.is_none() {
             Some(super::helpers::DEFAULT_JOB_LOG_TAIL_LINES)
         } else {
             tail_lines
@@ -1732,7 +1776,7 @@ impl ToolRuntime {
                 crate::runner_http::runner_access_from_auth(auth).as_ref(),
                 &job_id,
                 offset,
-                None,
+                stderr_offset,
                 tail_lines,
                 after_observation_token.as_deref(),
                 wait_secs,
@@ -1815,6 +1859,9 @@ impl ToolRuntime {
                     "activity": job.activity,
                     "stdout_tail": stdout,
                     "stderr_tail": stderr,
+                    "archive": wait.archive.as_ref().map(|a| json!({"stdout": a.stdout, "stderr": a.stderr, "committed_at": a.committed_at})),
+                    "archive_unavailable": wait.archive_unavailable || (wait.terminal && wait.archive.is_none()),
+                    "archive_unavailable_reason": wait.archive_unavailable_reason.as_deref().or_else(|| (wait.terminal && wait.archive.is_none()).then_some("archive_not_selected_or_unavailable")),
                     "stdout_lines": next_stdout_line.saturating_sub(1),
                     "stderr_lines": next_stderr_line.saturating_sub(1),
                     "stdout_returned_lines": wait.stdout_returned_lines,

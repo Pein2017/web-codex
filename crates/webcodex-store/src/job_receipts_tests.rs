@@ -18,6 +18,94 @@ fn receipt(now: i64, id: &str) -> RetainedJobReceipt {
     }
 }
 
+fn archived(now: i64, id: &str) -> webcodex_core::runner_job_receipt::ArchivedJobReceipt {
+    let mut value = receipt(now, id);
+    value.snapshot.context.runtime_project_id = Some("agent:receipt-runner:p".into());
+    value.snapshot.context.project_cwd = Some("/project".into());
+    value.snapshot.stdout.tail.clear();
+    value.snapshot.stdout.first_retained_line = value.snapshot.stdout.next_line;
+    webcodex_core::runner_job_receipt::ArchivedJobReceipt {
+        archive: webcodex_core::job_archive::JobArchiveDescriptor {
+            job_id: id.into(),
+            request_id: format!("req-{id}"),
+            client_id: value.client_id.clone(),
+            runner_instance_id: value.runner_instance_id.clone(),
+            project_id: "agent:receipt-runner:p".into(),
+            project_root_fingerprint: format!("wc_projroot_{}", "1".repeat(64)),
+            root_incarnation: "2".repeat(64),
+            committed_at: now,
+            stdout: webcodex_core::job_archive::JobArchiveStream {
+                retained_bytes: 5,
+                next_line: 2,
+                loss_reason: None,
+            },
+            stderr: webcodex_core::job_archive::JobArchiveStream {
+                retained_bytes: 0,
+                next_line: 1,
+                loss_reason: None,
+            },
+        },
+        receipt: value,
+    }
+}
+
+#[test]
+fn archived_receipt_exact_id_survives_ordinary_expiry_inventory_pruning_and_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("receipts.db");
+    let db = Database::open(&path).unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let original = archived(now - 2 * JOB_TERMINAL_RETENTION_SECS, "original");
+    db.upsert_job_archive(&original, now).unwrap();
+    for n in 0..70 {
+        db.upsert_job_receipt(&receipt(now, &format!("new-{n:03}")), now)
+            .unwrap();
+    }
+    db.prune_job_receipts(now).unwrap();
+    assert_eq!(
+        db.load_job_receipts(now).unwrap().len(),
+        JOB_INVENTORY_MAX_TERMINAL_JOBS
+    );
+    assert_eq!(
+        db.load_job_archive("original", now).unwrap(),
+        Some(original.clone())
+    );
+    assert!(db.load_job_archive("unknown", now).unwrap().is_none());
+    drop(db);
+    let reopened = Database::open(&path).unwrap();
+    assert_eq!(
+        reopened.load_job_archive("original", now).unwrap(),
+        Some(original.clone())
+    );
+    assert!(reopened
+        .load_job_archive(
+            "original",
+            original.archive.committed_at + webcodex_core::job_archive::ARCHIVE_RETENTION_SECS
+        )
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn archived_receipt_replay_cannot_replace_identity_and_malformed_metadata_fails_closed() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("receipts.db")).unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let original = archived(now, "job");
+    db.upsert_job_archive(&original, now).unwrap();
+    let mut replacement = original.clone();
+    replacement.receipt.owner_at_admission = Some("mallory".into());
+    db.upsert_job_archive(&replacement, now).unwrap();
+    assert_eq!(db.load_job_archive("job", now).unwrap(), Some(original));
+    db.conn_for_tests()
+        .execute(
+            "UPDATE wc_job_archives SET payload='{}' WHERE job_id='job'",
+            [],
+        )
+        .unwrap();
+    assert!(db.load_job_archive("job", now).is_err());
+}
+
 #[test]
 fn job_receipts_upgrade_preserves_legacy_deadline_without_accepting_arbitrary_ttl() {
     let temp = tempfile::tempdir().unwrap();

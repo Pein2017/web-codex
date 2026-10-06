@@ -711,6 +711,7 @@ pub(crate) fn record_from_snapshot(
 ) -> ShellJobRecord {
     let context = &snapshot.context;
     let mut record = ShellJobRecord {
+        archive: None,
         job_id: snapshot.job_id.clone(),
         request_id: Some(snapshot.request_id.clone()),
         client_id: client_id.to_string(),

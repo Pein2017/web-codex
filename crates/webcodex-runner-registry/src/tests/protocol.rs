@@ -452,6 +452,7 @@ async fn runner_supports_recognizes_all_protocol_capability_names() {
             hostname: None,
             host_context: None,
             capabilities: RunnerCapabilities {
+                job_output_archive: false,
                 shell: true,
                 explicit_shell_selection: true,
                 bash_login_shell: true,

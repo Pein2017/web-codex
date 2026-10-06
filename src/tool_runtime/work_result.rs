@@ -133,16 +133,6 @@ impl ToolRuntime {
             .resolve_project_input_for_auth(project, auth)
             .await
             .map_err(|error| error.into_tool_result())?;
-        if project.trim() != resolved.resolved_id {
-            return Err(ToolResult::err_with_output(
-                "Work Result requires the exact complete runtime project id",
-                json!({
-                    "error_kind": "work_result_project_not_exact",
-                    "failure_kind": "invalid_arguments",
-                    "state_changed": false,
-                }),
-            ));
-        }
         let Some(summary) = self
             .sessions
             .summary(session_id, Some(WORK_RESULT_SESSION_EVENT_LIMIT))
