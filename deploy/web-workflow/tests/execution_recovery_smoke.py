@@ -3,8 +3,9 @@
 
 All child commands operate on generated CPU fixtures. Keep the private temporary
 directory as evidence; process shutdown targets only this invocation's Popen groups.
-A successful script exit is not all-five acceptance: native preflight and the
-shared-database physical archive quota remain HOLD.
+The direct loop has no Codex CLI agent or sandbox probe. Physical storage caps
+are additionally qualified by the focused real-filesystem store/Runner tests;
+this script qualifies their actual Server/Runner consumption and rollback seam.
 """
 
 import argparse
@@ -12,6 +13,8 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
+import shlex
 import socket
 import sqlite3
 import subprocess
@@ -47,6 +50,19 @@ class Runtime:
         for name in ("data", "home", "projects", "xdg/config", "xdg/data", "xdg/state", "xdg/cache"):
             (self.root / name).mkdir(parents=True)
         (self.root / "empty.env").touch()
+        # A deliberately unavailable CLI route counts attempted fallback. The
+        # real installed Codex is never discovered or invoked by this harness.
+        self.cli_counter = self.root / "codex-attempts"
+        self.cli_counter.touch()
+        tools = self.root / "direct-tools"
+        tools.mkdir()
+        denied_cli = tools / "codex"
+        denied_cli.write_text("#!/bin/sh\nprintf attempted\\n >> " + shlex.quote(str(self.cli_counter)) + "\nexit 126\n")
+        denied_cli.chmod(0o700)
+        for tool in ("cargo", "rustc"):
+            target = shutil.which(tool)
+            require(target is not None, "required system compiler tool unavailable")
+            (tools / tool).symlink_to(target)
         (self.fixture / "README.md").write_text("fixture input\n")
         (self.fixture / "Cargo.toml").write_text('[workspace]\n[package]\nname="recovery-fixture"\nversion="0.1.0"\nedition="2021"\n[lib]\npath="lib.rs"\n')
         (self.fixture / "lib.rs").write_text("pub fn value() -> u8 { 1 }\n")
@@ -62,7 +78,7 @@ class Runtime:
             f'project_registry_dir={json.dumps(str(self.root / "projects"))}\npoll_interval_ms=100\ntransport="polling"\n'
             f'[policy]\nallow_raw_shell=true\nallow_cwd_anywhere=false\nallowed_roots=[{json.dumps(str(self.fixture))}]\n'
             'max_timeout_secs=30\nmax_output_bytes=1048576\n')
-        self.env = {"PATH": os.environ["PATH"], "LANG": "C.UTF-8", "HOME": str(self.root / "home"),
+        self.env = {"PATH": str(tools) + ":/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": str(self.root / "home"),
                     "WEBCODEX_ENV_FILE": str(self.root / "empty.env"), "RUST_LOG": "warn",
                     "WEBCODEX_ADDR": f"127.0.0.1:{self.port}", "WEBCODEX_DATA": str(self.root / "data"),
                     "WEBCODEX_TOKEN": self.token, "WEBCODEX_TOOL_REQUEST_TRACE": "full",
@@ -97,6 +113,14 @@ class Runtime:
             os.killpg(child.pid, signal.SIGKILL)
             child.wait(timeout=3)
         self.records.append({"process": kind, "pid": child.pid, "exit": child.returncode})
+
+    def crash(self, kind):
+        child = self.children.pop(kind)
+        require(child.poll() is None, "fault target is not the owned live child")
+        os.killpg(child.pid, signal.SIGKILL)
+        child.wait(timeout=5)
+        self.records.append({"process": kind, "pid": child.pid, "exit": child.returncode,
+                             "fault": "owned disposable process crash"})
 
     def request(self, path, body, token=None):
         headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
@@ -170,7 +194,7 @@ class Runtime:
                           "no_install": True, "error": error}))
 
 
-def smoke(runtime, helper):
+def smoke(runtime):
     runtime.start("server")
     runtime.wait_ready(runner=False)
     runtime.start("runner")
@@ -206,6 +230,28 @@ def smoke(runtime, helper):
     require(after.get("success") and after["output"]["work_result"]["validation"].get("current_status") == "unproven",
             "proven no-write falsely staled or certified source")
     require((runtime.fixture / "README.md").read_text() == "fixture input\n", "guarded rejection wrote source")
+    read = runtime.call("read_files", {"project": runtime.project, "session_id": session,
+        "items": [{"path": "lib.rs", "start_line": 1, "limit": 1}]}, session)
+    require(read.get("success") and read["output"].get("failed_count", 0) == 0, "direct source read failed")
+    read_item = read["output"]["items"][0]
+    revision = read_item.get("output", read_item)["read_revision"]
+    edited = runtime.call("write_project_file", {"project": runtime.project, "session_id": session,
+        "path": "lib.rs", "content": "pub fn value() -> u8 { 2 }\n", "overwrite": True,
+        "expected_read_revision": revision}, session)
+    require(edited.get("success") and (runtime.fixture / "lib.rs").read_text() == "pub fn value() -> u8 { 2 }\n",
+            "direct revision-guarded write failed")
+    stale = runtime.call("write_project_file", {"project": runtime.project, "session_id": session,
+        "path": "lib.rs", "content": "must not be written", "overwrite": True,
+        "expected_read_revision": revision}, session)
+    require(not stale.get("success") and (runtime.fixture / "lib.rs").read_text() == "pub fn value() -> u8 { 2 }\n",
+            "stale read guard admitted a second write")
+    direct_check = runtime.call("cargo_check", {"project": runtime.project, "session_id": session,
+        "all_targets": False, "timeout_secs": 30, "sync_wait_secs": 20}, session)
+    require(direct_check.get("success") and direct_check["output"].get("exit_code") == 0,
+            "direct edited-source CPU validation failed")
+    escaped = runtime.call("run_process", {"project": runtime.project, "executable": sys.executable,
+        "args": ["-c", "raise SystemExit('must not run')"], "cwd": "..", "timeout_secs": 5})
+    require(not escaped.get("success"), "direct Project cwd boundary was relaxed")
     output = runtime.call("run_process", {"project": runtime.project, "executable": sys.executable,
         "args": ["-c", "import sys,time; time.sleep(1.5); [sys.stdout.write(f'{i:05d}:'+'x'*90+'\\n') for i in range(2200)]"],
         "timeout_secs": 10, "sync_wait_secs": 1})
@@ -255,7 +301,9 @@ def smoke(runtime, helper):
     runtime.stop("server")
     # Explicit clock-age simulation on disposable evidence only; no sealed or live state.
     database = runtime.root / "data/webcodex.db"
-    with sqlite3.connect(database) as connection:
+    locator = runtime.root / "data/job-archive-locator/archives.sqlite3"
+    require(locator.is_file(), "independent locator database was not consumed")
+    with sqlite3.connect(locator) as connection:
         row = connection.execute("SELECT payload FROM wc_job_archives WHERE job_id=?", (job,)).fetchone()
         require(row is not None, "archive locator absent before simulated age")
         value = json.loads(row[0])
@@ -265,6 +313,9 @@ def smoke(runtime, helper):
         value["receipt"]["expires_at"] = aged + 24 * 3600
         connection.execute("UPDATE wc_job_archives SET payload=?,committed_at=?,expires_at=? WHERE job_id=?",
                            (json.dumps(value), aged, aged + 7 * 24 * 3600, job))
+    with sqlite3.connect(database) as connection:
+        require(not connection.execute("SELECT 1 FROM sqlite_master WHERE name='wc_job_archives'").fetchone(),
+                "archive locator still uses shared Session database")
         # Force ordinary startup pruning to exercise the real age boundary.
         connection.execute("UPDATE wc_job_receipts SET expires_at=?", (int(time.time()) - 1,))
     manifests = list((runtime.root / "xdg/state/webcodex/runner-job-archives-v1").glob("*/*/terminal.json"))
@@ -310,16 +361,9 @@ def smoke(runtime, helper):
             "historical archive falsely claimed live delta continuity")
     restored = runtime.call("session_summary", {"session_id": session, "limit": 5})
     require(restored.get("success"), "current Session did not restore")
-    probe = runtime.call("run_process", {"project": runtime.project, "executable": sys.executable,
-        "args": [str(helper), "--executable", "/root/.local/bin/codex", "--cwd", str(runtime.fixture),
-                 "--read-path", str(runtime.fixture / "README.md"), "--permission-profile", ":read-only"],
-        "timeout_secs": 15})
-    probe_output = probe.get("output", {})
-    require(probe_output.get("exit_code") == 2, "expected current-host native sandbox denial changed; requalify gate")
-    report = json.loads(probe_output["stdout_tail"])
-    require(report.get("status") in ("blocked", "unproven") and report.get("worker_started") is False,
-            "native preflight did not block substantive worker")
-    runtime.records.append({"native_positive_gate": "HOLD: original positive requirement retained", "probe": report})
+    require(runtime.cli_counter.stat().st_size == 0, "direct loop attempted a local Codex fallback")
+    runtime.records.append({"direct_loop": "PASS", "codex_cli_attempts": 0,
+                            "read_edit_validate_same_job_restart": True})
     # Same canonical path, new root inode: neither metadata nor bytes may escape.
     runtime.stop("runner")
     original = runtime.root / "original-fixture"
@@ -336,7 +380,7 @@ def smoke(runtime, helper):
     runtime.stop("runner")
     runtime.stop("server")
     archives_before = []
-    for database in (runtime.root / "data").rglob("*.db"):
+    for database in [locator]:
         with sqlite3.connect(database) as connection:
             if connection.execute("SELECT 1 FROM sqlite_master WHERE name='wc_job_archives'").fetchone():
                 archives_before.append((database, connection.execute("SELECT job_id FROM wc_job_archives ORDER BY job_id").fetchall()))
@@ -355,13 +399,60 @@ def smoke(runtime, helper):
         with sqlite3.connect(database) as connection:
             require(connection.execute("SELECT job_id FROM wc_job_archives ORDER BY job_id").fetchall() == expected,
                     "previous-app pruning destroyed new archive state")
-    runtime.records.append({"physical_archive_quota": "HOLD: shared SQLite/WAL is not a hard physical bound"})
-    return "candidate_native_slice_passed_preflight_positive_and_physical_quota_hold"
+    # Re-admit the original root, not a different inode, then prove the final
+    # candidate can consume the same archive after old-app pruning. No restore
+    # of either database is used, and no producer is rerun.
+    runtime.fixture.rename(runtime.root / "replacement-fixture")
+    original.rename(runtime.fixture)
+    runtime.start("server")
+    runtime.wait_ready(runner=False)
+    runtime.start("runner")
+    runtime.wait_ready()
+    require(runtime.page(job)["stdout_tail"].startswith("00000:"),
+            "candidate cannot recover original archive after previous-app pruning")
+    require(runtime.cli_counter.stat().st_size == 0, "rollback/restart attempted a local Codex fallback")
+    runtime.records.append({"independent_locator_rollback_readback": "PASS", "codex_cli_attempts": 0})
+    # Lose the execution owner after an observable effect but before any terminal
+    # commit. A fresh Server may not manufacture a verdict or repeat the payload.
+    uncertain = runtime.call("run_process", {"project": runtime.project, "executable": sys.executable,
+        "args": ["-c", "import os,pathlib,time; pathlib.Path('uncertain.pid').write_text(str(os.getpid())); "
+                 "p=pathlib.Path('uncertain-once'); "
+                 "p.write_text(p.read_text()+'effect\\n' if p.exists() else 'effect\\n'); time.sleep(3)"],
+        "timeout_secs": 8, "sync_wait_secs": 1})
+    require(uncertain.get("success") and uncertain["output"].get("job_id"), "uncertain fixture not admitted")
+    uncertain_job = uncertain["output"]["job_id"]
+    require(uncertain["output"].get("execution_state") != "completed", "fixture terminated before injected crash")
+    require((runtime.fixture / "uncertain-once").read_text() == "effect\n", "uncertain effect missing")
+    runtime.crash("runner")
+    runtime.stop("server")
+    runtime.start("server")
+    runtime.wait_ready(runner=False)
+    lost = runtime.call("observe_jobs", {"items": [{"job_id": uncertain_job}]})
+    require(not lost.get("success") or lost.get("output", {}).get("failed_count") == 1,
+            "missing terminal commit manufactured a recovered verdict")
+    require((runtime.fixture / "uncertain-once").read_text() == "effect\n"
+            and runtime.cli_counter.stat().st_size == 0, "unknown outcome triggered replay or local-agent fallback")
+    native_pid = int((runtime.fixture / "uncertain.pid").read_text())
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        try:
+            # A zombie has exited and owns no executable file descriptors.
+            state = Path(f"/proc/{native_pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+            if state == "Z":
+                break
+        except FileNotFoundError:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("disposable native child did not exit after owner loss")
+    runtime.records.append({"unknown_outcome": "not promoted to terminal proof", "original_job_id": uncertain_job,
+                            "payload_effects": 1, "native_child_no_longer_running": True, "codex_cli_attempts": 0})
+    return "candidate_native_direct_recovery_passed"
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("server", "runner", "previous-server", "previous-runner", "evidence-root", "helper"):
+    for name in ("server", "runner", "previous-server", "previous-runner", "evidence-root"):
         parser.add_argument("--" + name, required=True, type=Path)
     args = parser.parse_args()
     os.umask(0o077)
@@ -371,7 +462,7 @@ def main():
                       args.evidence_root.resolve(strict=True))
     status, error = "FAIL", None
     try:
-        status = smoke(runtime, args.helper.resolve(strict=True))
+        status = smoke(runtime)
         return_code = 0
     except Exception as failure:
         error = f"{type(failure).__name__}: {failure}"

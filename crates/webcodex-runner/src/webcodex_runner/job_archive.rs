@@ -9,8 +9,13 @@ use std::time::Duration;
 use webcodex_core::job_archive::*;
 use webcodex_core::runner_protocol::ShellJobContext;
 
-const SERVER_RECEIPT_OVERHEAD_BYTES: u64 = 2 * ARCHIVE_METADATA_MAX_BYTES as u64;
-const RESERVATION_BYTES: u64 = 2 * ARCHIVE_STREAM_MAX_BYTES + 4 * ARCHIVE_METADATA_MAX_BYTES as u64;
+const RUNNER_MAX_BYTES: u64 = ARCHIVE_TOTAL_MAX_BYTES - ARCHIVE_SERVER_RESERVED_BYTES;
+// Qualified on Linux with allocation units <= 4096 bytes: two prepaid streams,
+// plus 1 MiB for their block rounding, receipt/temp/reservation and directory
+// growth (the entire owned scanner is bounded to 4096 entries). This is not a
+// universal filesystem bound; unsupported allocation/preallocation fails closed.
+const STRUCTURAL_RESERVATION_BYTES: u64 = 1024 * 1024;
+const RESERVATION_BYTES: u64 = 2 * ARCHIVE_STREAM_MAX_BYTES + STRUCTURAL_RESERVATION_BYTES;
 const MAX_CHUNK: usize = 64 * 1024;
 const CAPTURE_QUEUE_CHUNKS: usize = 8;
 const RECEIPT: &str = "terminal.json";
@@ -19,6 +24,8 @@ const RECEIPT: &str = "terminal.json";
 pub(crate) struct ArchiveStore {
     pub(crate) root: PathBuf,
     namespace: String,
+    #[cfg(test)]
+    commit_gate: Option<Arc<(mpsc::SyncSender<PathBuf>, Mutex<mpsc::Receiver<()>>)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +154,73 @@ fn private_file(path: &Path, create: bool) -> Result<File, String> {
     }
 }
 
+fn preallocate_stream(file: &File) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        if unsafe { libc::fstatvfs(file.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
+            return Err("archive allocation unavailable".into());
+        }
+        let stats = unsafe { stats.assume_init() };
+        if stats.f_frsize == 0 || stats.f_frsize > 4096 || stats.f_bsize > 4096 {
+            return Err("archive allocation unsupported".into());
+        }
+        if unsafe {
+            libc::fallocate(
+                file.as_raw_fd(),
+                libc::FALLOC_FL_KEEP_SIZE,
+                0,
+                ARCHIVE_STREAM_MAX_BYTES as libc::off_t,
+            )
+        } != 0
+        {
+            return Err("archive allocation unavailable".into());
+        }
+        if allocated_bytes(
+            &file
+                .metadata()
+                .map_err(|_| "archive allocation unavailable")?,
+        ) > ARCHIVE_STREAM_MAX_BYTES + 4096
+        {
+            return Err("archive allocation unsupported".into());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        Err("archive allocation unsupported".into())
+    }
+}
+
+fn prepare_capture_files(dir: &Path) -> Result<(File, File), String> {
+    let reservation = private_file(&dir.join("reservation"), true)?;
+    reservation
+        .sync_all()
+        .map_err(|_| "archive reservation failed")?;
+    drop(reservation);
+    let stdout = private_file(&dir.join("stdout"), true)?;
+    preallocate_stream(&stdout)?;
+    let stderr = private_file(&dir.join("stderr"), true)?;
+    preallocate_stream(&stderr)?;
+    Ok((stdout, stderr))
+}
+
+// Only called for a newly minted job directory, under the owned quota lock and
+// after all preparation handles have closed. Failure leaves a fully charged
+// pending job, never an uncounted partial archive or recursive deletion.
+fn rollback_capture(dir: &Path) -> Result<(), String> {
+    for name in ["stdout", "stderr", "reservation"] {
+        let path = dir.join(name);
+        if fs::symlink_metadata(&path).is_ok() {
+            drop(private_file(&path, false)?);
+            fs::remove_file(path).map_err(|_| "archive cleanup failed")?;
+        }
+    }
+    fs::remove_dir(dir).map_err(|_| "archive cleanup failed".to_string())
+}
+
 impl ArchiveStore {
     pub(crate) fn default_for_runner(client_id: &str, server_url: &str) -> Result<Self, String> {
         let endpoint = server_url.trim().trim_end_matches('/');
@@ -159,6 +233,8 @@ impl ArchiveStore {
             namespace: digest(
                 format!("webcodex-job-archive-v1\0{endpoint}\0{client_id}").as_bytes(),
             ),
+            #[cfg(test)]
+            commit_gate: None,
         })
     }
 
@@ -258,10 +334,11 @@ impl ArchiveStore {
                     ));
                     reservation |= name == "reservation";
                 }
-                if reservation {
+                if reservation || !job.join(RECEIPT).exists() {
+                    // Creation can fail before the reservation file exists.
+                    // Recognized partial jobs retain a full pending charge.
                     bytes = bytes.max(RESERVATION_BYTES);
                 } else if job.join(RECEIPT).exists() {
-                    bytes = bytes.saturating_add(SERVER_RECEIPT_OVERHEAD_BYTES);
                     if let Ok(record) = read_descriptor(&job.join(RECEIPT)) {
                         if digest(record.job_id.as_bytes())
                             != job.file_name().unwrap().to_string_lossy()
@@ -281,7 +358,7 @@ impl ArchiveStore {
         for (ended, path, bytes) in terminal {
             if ended.saturating_add(ARCHIVE_RETENTION_SECS) <= now
                 || count > ARCHIVE_MAX_TERMINAL
-                || used.saturating_add(extra) > ARCHIVE_TOTAL_MAX_BYTES
+                || used.saturating_add(extra) > RUNNER_MAX_BYTES
             {
                 // Exact known files only; never recursive removal of an unresolved target.
                 for name in ["stdout", "stderr", RECEIPT] {
@@ -296,7 +373,7 @@ impl ArchiveStore {
                 count -= 1;
             }
         }
-        if used.saturating_add(extra) > ARCHIVE_TOTAL_MAX_BYTES {
+        if used.saturating_add(extra) > RUNNER_MAX_BYTES {
             return Err("archive quota exceeded".into());
         }
         Ok(())
@@ -366,22 +443,36 @@ impl ArchiveStore {
             return Err("archive identity already exists".into());
         }
         secure_dir(&dir)?;
-        let reservation = private_file(&dir.join("reservation"), true)?;
-        reservation
-            .sync_all()
-            .map_err(|_| "archive reservation failed")?;
-        let stdout = private_file(&dir.join("stdout"), true)?;
-        let stderr = private_file(&dir.join("stderr"), true)?;
+        let (stdout, stderr) = match prepare_capture_files(&dir) {
+            Ok(files) => files,
+            Err(error) => {
+                let _ = rollback_capture(&dir);
+                return Err(error);
+            }
+        };
         let (tx, rx) = mpsc::sync_channel(CAPTURE_QUEUE_CHUNKS);
         let loss = Arc::new(Mutex::new(None));
         let worker_loss = loss.clone();
         let store = self.clone();
-        std::thread::Builder::new()
+        let worker_dir = dir.clone();
+        if std::thread::Builder::new()
             .name("webcodex-job-archive".into())
             .spawn(move || {
-                archive_writer(store, dir, descriptor, stdout, stderr, rx, worker_loss);
+                archive_writer(
+                    store,
+                    worker_dir,
+                    descriptor,
+                    stdout,
+                    stderr,
+                    rx,
+                    worker_loss,
+                );
             })
-            .map_err(|_| "archive writer unavailable")?;
+            .is_err()
+        {
+            let _ = rollback_capture(&dir);
+            return Err("archive writer unavailable".into());
+        }
         Ok(ArchiveCapture { tx, loss })
     }
 
@@ -650,36 +741,69 @@ fn archive_writer(
                     descriptor.stderr.loss_reason.get_or_insert(reason);
                 }
                 descriptor.committed_at = chrono::Utc::now().timestamp();
-                let committed = (|| -> Result<(), String> {
-                    stdout.sync_all().map_err(|_| "archive sync failed")?;
-                    stderr.sync_all().map_err(|_| "archive sync failed")?;
-                    let _lock = store.lock()?;
-                    let bytes =
-                        serde_json::to_vec(&descriptor).map_err(|_| "archive receipt failed")?;
-                    if bytes.len() > ARCHIVE_METADATA_MAX_BYTES {
-                        return Err("archive receipt oversized".into());
-                    }
-                    let mut temp = private_file(&dir.join("terminal.tmp"), true)?;
-                    temp.write_all(&bytes)
-                        .map_err(|_| "archive receipt failed")?;
-                    temp.sync_all().map_err(|_| "archive receipt failed")?;
-                    fs::rename(dir.join("terminal.tmp"), dir.join(RECEIPT))
-                        .map_err(|_| "archive receipt failed")?;
-                    File::open(&dir)
-                        .and_then(|f| f.sync_all())
-                        .map_err(|_| "archive directory sync failed")?;
-                    fs::remove_file(dir.join("reservation"))
-                        .map_err(|_| "archive reservation failed")?;
-                    store.account_and_prune(descriptor.committed_at, 0)?;
-                    Ok(())
-                })()
-                .is_ok();
+                let synced = trim_and_sync(&stdout, descriptor.stdout.retained_bytes)
+                    .and_then(|_| trim_and_sync(&stderr, descriptor.stderr.retained_bytes));
+                // A reservation is the only barrier against eviction while
+                // writing. Close BOTH streams even on sync failure, before
+                // releasing that barrier or allowing any cleanup to count
+                // unlink as reclaimed storage.
+                drop(stdout);
+                drop(stderr);
+                let committed = synced
+                    .and_then(|_| {
+                        (|| -> Result<(), String> {
+                            let _lock = store.lock()?;
+                            let bytes = serde_json::to_vec(&descriptor)
+                                .map_err(|_| "archive receipt failed")?;
+                            if bytes.len() > ARCHIVE_METADATA_MAX_BYTES {
+                                return Err("archive receipt oversized".into());
+                            }
+                            let mut temp = private_file(&dir.join("terminal.tmp"), true)?;
+                            temp.write_all(&bytes)
+                                .map_err(|_| "archive receipt failed")?;
+                            temp.sync_all().map_err(|_| "archive receipt failed")?;
+                            drop(temp);
+                            fs::rename(dir.join("terminal.tmp"), dir.join(RECEIPT))
+                                .map_err(|_| "archive receipt failed")?;
+                            File::open(&dir)
+                                .and_then(|f| f.sync_all())
+                                .map_err(|_| "archive directory sync failed")?;
+                            #[cfg(test)]
+                            if let Some(gate) = &store.commit_gate {
+                                gate.0
+                                    .send(dir.clone())
+                                    .map_err(|_| "archive test gate failed")?;
+                                gate.1
+                                    .lock()
+                                    .unwrap()
+                                    .recv()
+                                    .map_err(|_| "archive test gate failed")?;
+                            }
+                            fs::remove_file(dir.join("reservation"))
+                                .map_err(|_| "archive reservation failed")?;
+                            store.account_and_prune(descriptor.committed_at, 0)?;
+                            Ok(())
+                        })()
+                    })
+                    .is_ok();
                 let _ = reply.send(committed.then_some(descriptor));
                 return;
             }
         }
     }
     // No terminal commit on owner loss. Partial bytes never establish process survival.
+}
+
+fn trim_and_sync(file: &File, retained: u64) -> Result<(), String> {
+    let metadata = file.metadata().map_err(|_| "archive sync failed")?;
+    // Real capture files have prepaid extents beyond their retained prefix.
+    // Rejected writes can still publish a storage_failure receipt when no
+    // truncation is necessary and the existing stream can be synced.
+    if metadata.len() != retained || allocated_bytes(&metadata) > retained.div_ceil(4096) * 4096 {
+        file.set_len(retained).map_err(|_| "archive trim failed")?;
+    }
+    file.sync_all()
+        .map_err(|_| "archive sync failed".to_string())
 }
 
 fn read_descriptor(path: &Path) -> Result<JobArchiveDescriptor, String> {
@@ -754,6 +878,27 @@ fn read_stream(
 pub(crate) mod tests {
     use super::*;
 
+    fn physical_bytes(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(path).unwrap();
+        let mut bytes = metadata.blocks() * 512;
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                bytes += physical_bytes(&entry.unwrap().path());
+            }
+        }
+        bytes
+    }
+
+    fn open_job_handles(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read_link(entry.path()).ok())
+            .filter(|path| path.starts_with(dir))
+            .collect()
+    }
+
     fn fixture() -> (tempfile::TempDir, ArchiveStore, PathBuf, ShellJobContext) {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
@@ -771,6 +916,7 @@ pub(crate) mod tests {
         let store = ArchiveStore {
             root: temp.path().join("archives"),
             namespace: digest(b"test-endpoint-client"),
+            commit_gate: None,
         };
         (temp, store, registry, context)
     }
@@ -853,6 +999,246 @@ pub(crate) mod tests {
 
     pub(crate) fn rejected_stream_writer_fixture() -> WriterFixture {
         writer_fixture("rejected-write", true)
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn archive_stream_extents_are_prepaid_and_trimmed_before_terminal_credit() {
+        let (_temp, store, registry, context) = fixture();
+        let capture = store
+            .capture(
+                &context, &registry, "prepaid", "request", "client", "instance",
+            )
+            .unwrap();
+        let dir = store.job_dir("prepaid");
+        let before = physical_bytes(&dir);
+        assert!(before >= 2 * ARCHIVE_STREAM_MAX_BYTES);
+        assert!(before <= RESERVATION_BYTES);
+        assert_eq!(fs::metadata(dir.join("stdout")).unwrap().len(), 0);
+        // The bytes stay prepaid throughout unlocked writing, not merely after
+        // a post-hoc accounting pass. FIFO Finish establishes the exact prefix.
+        capture
+            .tx
+            .send(Message::Chunk(true, "exact prefix\n".into()))
+            .unwrap();
+        let descriptor = capture.finish().unwrap();
+        assert_eq!(descriptor.stdout.retained_bytes, 13);
+        assert_eq!(fs::read(dir.join("stdout")).unwrap(), b"exact prefix\n");
+        let after = physical_bytes(&dir);
+        eprintln!("archive physical bytes: prepaid={before} committed={after} server_reserved={ARCHIVE_SERVER_RESERVED_BYTES}");
+        assert!(after < before);
+        assert!(after <= STRUCTURAL_RESERVATION_BYTES);
+        assert!(!dir.join("reservation").exists());
+        assert!(open_job_handles(&dir).is_empty());
+        assert!(
+            physical_bytes(&store.root) + ARCHIVE_SERVER_RESERVED_BYTES <= ARCHIVE_TOTAL_MAX_BYTES
+        );
+        let _lock = store.lock().unwrap();
+        let probe = store.job_dir("extent-probe");
+        secure_dir(&probe).unwrap();
+        let (mut stdout, stderr) = prepare_capture_files(&probe).unwrap();
+        let prepaid = physical_bytes(&probe);
+        stdout.write_all(&vec![b'x'; MAX_CHUNK]).unwrap();
+        stderr.sync_all().unwrap();
+        stdout.sync_all().unwrap();
+        let written = physical_bytes(&probe);
+        eprintln!("archive prepaid-write bytes: before={prepaid} after={written} reservation={RESERVATION_BYTES}");
+        assert!(written >= 2 * ARCHIVE_STREAM_MAX_BYTES);
+        assert!(written <= RESERVATION_BYTES);
+        assert!(written <= prepaid + STRUCTURAL_RESERVATION_BYTES);
+        drop(stdout);
+        drop(stderr);
+        rollback_capture(&probe).unwrap();
+        assert!(!probe.exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn archive_commit_closes_all_handles_before_reservation_release_and_eviction() {
+        let (_temp, mut store, registry, context) = fixture();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = mpsc::channel();
+        store.commit_gate = Some(Arc::new((entered_tx, Mutex::new(resume_rx))));
+        let capture = store
+            .capture(
+                &context,
+                &registry,
+                "evict-at-commit",
+                "request",
+                "client",
+                "instance",
+            )
+            .unwrap();
+        capture
+            .tx
+            .send(Message::Chunk(true, "retained bytes\n".into()))
+            .unwrap();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        capture.tx.send(Message::Finish(reply_tx)).unwrap();
+        let dir = entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let descriptor = read_descriptor(&dir.join(RECEIPT)).unwrap();
+        assert!(dir.join("reservation").exists());
+        let handles = open_job_handles(&dir);
+        // Always release the writer, including the nearest-wrong failure, so
+        // a failed assertion cannot leave a blocked external/thread owner.
+        for n in 0..ARCHIVE_MAX_TERMINAL {
+            let mut later = descriptor.clone();
+            later.job_id = format!("later-{n}");
+            later.committed_at += 1;
+            let later_dir = store.job_dir(&later.job_id);
+            secure_dir(&later_dir).unwrap();
+            let mut receipt = private_file(&later_dir.join(RECEIPT), true).unwrap();
+            receipt
+                .write_all(&serde_json::to_vec(&later).unwrap())
+                .unwrap();
+            receipt.sync_all().unwrap();
+        }
+        resume_tx.send(()).unwrap();
+        assert!(reply_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_some());
+        assert!(
+            handles.is_empty(),
+            "live writer handles at eviction boundary: {handles:?}"
+        );
+        assert!(
+            !dir.exists(),
+            "the oldest newly committed entry must be eligible for count eviction"
+        );
+        eprintln!(
+            "archive commit eviction: open_handles={} evicted=true remaining_physical={}",
+            handles.len(),
+            physical_bytes(&store.root)
+        );
+        assert!(
+            open_job_handles(&dir).is_empty(),
+            "unlink cannot leave allocated writer handles"
+        );
+        assert!(
+            physical_bytes(&store.root) + ARCHIVE_SERVER_RESERVED_BYTES <= ARCHIVE_TOTAL_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn archive_fixed_server_reservation_is_charged_without_any_terminal_entries() {
+        let (_temp, store, _registry, _context) = fixture();
+        let _lock = store.lock().unwrap();
+        let used = allocated_bytes(&fs::metadata(&store.root).unwrap())
+            + allocated_bytes(&fs::metadata(store.root.join("quota.lock")).unwrap());
+        let now = chrono::Utc::now().timestamp();
+        store
+            .account_and_prune(now, RUNNER_MAX_BYTES - used)
+            .unwrap();
+        assert_eq!(
+            store
+                .account_and_prune(now, RUNNER_MAX_BYTES - used + 1)
+                .unwrap_err(),
+            "archive quota exceeded"
+        );
+        assert_eq!(fs::read_dir(&store.root).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn archive_partial_creation_before_reservation_is_fully_charged_and_bounded() {
+        let (_temp, store, _registry, _context) = fixture();
+        let _lock = store.lock().unwrap();
+        let namespace = store.root.join(&store.namespace);
+        secure_dir(&namespace).unwrap();
+        for n in 0..31 {
+            secure_dir(&store.job_dir(&format!("partial-{n}"))).unwrap();
+        }
+        assert_eq!(
+            store
+                .account_and_prune(chrono::Utc::now().timestamp(), 0)
+                .unwrap_err(),
+            "archive quota exceeded",
+            "31 jobs that failed before reservation creation cannot escape their pending charge"
+        );
+        assert_eq!(fs::read_dir(&namespace).unwrap().count(), 31);
+        assert!(
+            physical_bytes(&store.root) + ARCHIVE_SERVER_RESERVED_BYTES <= ARCHIVE_TOTAL_MAX_BYTES
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn archive_preparation_failure_closes_extents_and_exact_rollback_preserves_unknown_state() {
+        let (temp, store, _registry, _context) = fixture();
+        let _lock = store.lock().unwrap();
+        let dir = store.job_dir("failed-creation");
+        secure_dir(&dir).unwrap();
+        // A collision after stdout allocation deterministically fails the
+        // next create_new, while preserving the existing owned stderr file.
+        private_file(&dir.join("stderr"), true).unwrap();
+        assert!(prepare_capture_files(&dir).is_err());
+        assert!(physical_bytes(&dir) >= ARCHIVE_STREAM_MAX_BYTES);
+        assert!(open_job_handles(&dir).is_empty());
+        rollback_capture(&dir).unwrap();
+        assert!(!dir.exists());
+        let unknown = store.job_dir("unknown-state");
+        secure_dir(&unknown).unwrap();
+        private_file(&unknown.join("unexpected"), true).unwrap();
+        assert!(rollback_capture(&unknown).is_err());
+        assert!(unknown.join("unexpected").exists());
+        assert_eq!(
+            store
+                .account_and_prune(chrono::Utc::now().timestamp(), 0)
+                .unwrap_err(),
+            "unowned archive entry"
+        );
+        fs::write(temp.path().join("unrelated"), b"preserve").unwrap();
+        assert_eq!(
+            fs::read(temp.path().join("unrelated")).unwrap(),
+            b"preserve"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn archive_quota_eviction_reclaims_closed_terminal_bytes_and_preserves_other_active_namespace()
+    {
+        let (_temp, store, registry, context) = fixture();
+        let terminal = store
+            .capture(
+                &context, &registry, "terminal", "request", "client", "instance",
+            )
+            .unwrap();
+        terminal
+            .tx
+            .send(Message::Chunk(true, "x".repeat(MAX_CHUNK)))
+            .unwrap();
+        terminal.finish().unwrap();
+        let mut other = store.clone();
+        other.namespace = digest(b"other-client");
+        let active = other
+            .capture(
+                &context,
+                &registry,
+                "active",
+                "request-active",
+                "client",
+                "instance",
+            )
+            .unwrap();
+        let _lock = store.lock().unwrap();
+        let physical = physical_bytes(&store.root);
+        let active_dir = other.job_dir("active");
+        let actual_active = physical_bytes(&active_dir);
+        let charged = physical + RESERVATION_BYTES - actual_active;
+        let extra = RUNNER_MAX_BYTES - charged + 1;
+        store
+            .account_and_prune(chrono::Utc::now().timestamp(), extra)
+            .unwrap();
+        eprintln!("archive quota eviction bytes: before={physical} after={} active_preserved={actual_active} extra={extra} server_reserved={ARCHIVE_SERVER_RESERVED_BYTES}", physical_bytes(&store.root));
+        assert!(!store.job_dir("terminal").exists());
+        assert!(active_dir.join("reservation").exists());
+        assert_eq!(physical_bytes(&active_dir), actual_active);
+        assert!(physical_bytes(&store.root) < physical);
+        assert!(
+            physical_bytes(&store.root) + ARCHIVE_SERVER_RESERVED_BYTES <= ARCHIVE_TOTAL_MAX_BYTES
+        );
+        drop(active);
     }
 
     #[test]

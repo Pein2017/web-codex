@@ -2662,6 +2662,7 @@ mod envelope_tests {
                 apply_patch_matching_mode: false,
                 git: false,
                 jobs: true,
+                job_output_archive: false,
                 async_jobs: true,
                 async_shell_jobs: true,
                 ssh_shell: true,

@@ -53,10 +53,6 @@ Paths below are relative to `deployment/` unless stated otherwise.
 - `app/`: the single installed application directory, with matching native
   Server/Runner/CLI binaries in `bin/`, guidance in `AGENTS.md`, and the complete
   workflow Plugin bundle (`plugin.mjs`, `pytest_report.py`, package metadata).
-  The same application bundle includes the deployment-owned
-  `sandbox_preflight.py` from `deploy/web-workflow/`; invoke it with the selected
-  Runner Python through existing `run_process`, never through the read-only
-  workflow Plugin. Package the helper and guidance together with the binaries.
   The directory contains the retained application bytes; moving them does not
   change their build identity. Historical release directories remain evidence.
 - `config/`: private Server env, Runner TOML and Tunnel control-plane credentials.
@@ -136,17 +132,16 @@ guidance at `app/AGENTS.md`. Startup requires the installed application and
 complete Plugin bundle, dedicated Node, Git, rg, Tunnel client and private
 configuration before it creates service windows.
 
-Before an explicitly authorized native Codex worker, use the installed preflight
-helper through the same Runner Project/cwd/environment/namespace context. Select
-the inspected `/root/.local/bin/codex` `0.159.2` route and explicit `:read-only`
-permission profile; it uses native policy construction with managed requirements
-and forwards only the selected optional config profile. Its 10-second deadline,
-bounded diagnostics and JSON receipt cover native setup and selected-file read
-only. Unsupported policy/config overrides or different nesting remain unproven.
-Preserve blocked/unproven receipts and do not start a worker or alter permissions
-to bypass a failed probe. The helper is an operator prerequisite, not an ACP
-provider, a policy lease or task acceptance; generic worker exit zero retains its
-own execution truth separately from blocked/incomplete task output.
+## Direct workflow operation
+
+This workflow runs ChatGPT → WebCodex Server → Runner. Use the selected Project's
+admitted file/Git tools, validation operations and bounded `run_process`; use a Job
+for asynchronous work and observe or continue that same Job rather than redispatching
+when its result is unknown. Keep Project/policy authorization, source
+`read_revision` guards and Session/`recording_session_id` binding in force. A command
+exit status reports execution only; task completion requires the relevant consumer
+to accept its output or artifact against the declared criteria. This workflow does
+not launch a local Codex CLI agent or run a sandbox readiness probe.
 
 ## Controlled update and recovery
 

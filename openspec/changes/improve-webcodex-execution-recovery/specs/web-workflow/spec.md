@@ -1,37 +1,44 @@
 ## ADDED Requirements
 
-### Requirement: Native worker launch preflight is sandbox-bound
+### Requirement: Direct Runner operation does not depend on Codex CLI
 
-The named deployment's supported native Codex worker launch route SHALL run a bounded, non-model preflight through the same Runner execution context and native sandbox policy construction for the explicitly selected executable, checkout, cwd and configuration before substantive worker execution. It SHALL distinguish host visibility from native setup/read probe success, expose known mount/path admission failures, and retain an unproven result for unsupported routes or when same-policy context cannot be established. A successful probe SHALL NOT certify arbitrary later commands. A blocked or unproven preflight SHALL NOT automatically weaken sandbox policy, change checkout, start an alternative worker or claim that the task ran. Generic process completion SHALL remain separate from worker acceptance.
+The named deployment's Web workflow SHALL complete authorized file, Git, validation, process and Job recovery operations through the existing WebCodex Server → Runner path. Its guidance, startup, packaged assets and acceptance workflow SHALL NOT require or invoke Codex CLI, a Codex sandbox probe or a local Codex agent to perform those operations. It SHALL NOT configure or implicitly delegate to a local coding-agent provider as a replacement for direct tools. Removing that dependency SHALL preserve ordinary authentication, Project/root authority, permissions, source guards and execution uncertainty. Process completion SHALL remain distinct from task acceptance.
 
-#### Scenario: Known nested sandbox failure
+#### Scenario: Direct work with Codex CLI unavailable
 
-- **WHEN** the selected worker sandbox cannot mount or access the authorized checkout
-- **THEN** preflight returns a bounded admission diagnostic before the worker's substantive/model invocation
-- **AND** no unsafe fallback or duplicate worker is started
+- **WHEN** Codex CLI is unavailable and a caller requests authorized work on a disposable Project
+- **THEN** existing tools read and guard-edit a file, run a bounded test and recover the original terminal Job through the Runner
+- **AND** no Codex CLI invocation, sandbox readiness check or local-agent fallback is needed
 
-#### Scenario: Host access is insufficient
+#### Scenario: Direct-operation denial cannot delegate around authority
 
-- **WHEN** the host can read the checkout but the same-policy sandbox probe is unavailable or cannot be shown equivalent
-- **THEN** preflight reports sandbox access unproven, not ready
+- **WHEN** Project authority, Runner policy or an edit revision fence rejects a request
+- **THEN** the existing direct path preserves that rejection and any uncertainty
+- **AND** it does not launch a local agent, change target or weaken permissions to continue
 
-#### Scenario: Successful preflight does not accept the task
+#### Scenario: Process completion does not accept the task
 
-- **WHEN** a same-policy probe succeeds and an explicitly authorized worker subsequently exits zero with a blocked or incomplete report
-- **THEN** the execution receipt retains exit zero while task acceptance remains blocked or incomplete
-- **AND** preflight is not represented as proof of future task completion or unchanged permissions
+- **WHEN** a directly executed program exits zero but its required consumer artifact or validation is missing, blocked or incomplete
+- **THEN** the execution receipt retains the actual exit outcome while task acceptance remains incomplete
+- **AND** generic process success is not presented as proof that the user's goal was achieved
 
 ## MODIFIED Requirements
 
 ### Requirement: Reproducible self-hosted delivery
 
-The named Linux deployment SHALL use a committed build with recorded identity, retained rollback and real MCP/Runner smoke evidence. Long-running jobs SHALL be retrieved manually; no automatic ChatGPT wake-up is promised. Reinstallation SHALL update matching Server, Runner, CLI and Web workflow assets under the existing `codex-tools/web-codex` owner, preserve current private configuration, registered Projects, Sessions and accepted evidence, and validate real consumer routing after activation. Local dogfood delivery SHALL NOT imply a version bump, public tag, push, GitHub/npm release or database restoration.
+The named Linux deployment SHALL use a committed build with recorded identity, retained rollback and real MCP/Runner smoke evidence. Long-running jobs SHALL be retrieved manually; no automatic ChatGPT wake-up is promised. Reinstallation SHALL update matching WebCodex Server, Runner, WebCodex CLI and Web workflow assets under the existing `codex-tools/web-codex` owner, preserve current private configuration, registered Projects, Sessions and accepted evidence, and validate real consumer routing after activation. Codex CLI worker or sandbox readiness SHALL NOT be a delivery prerequisite. Local dogfood delivery SHALL NOT imply a version bump, public tag, push, GitHub/npm release or database restoration. The current no-install ruling SHALL remain binding until the user explicitly authorizes later activation.
 
 #### Scenario: Deployment acceptance
 
 - **WHEN** the candidate is installed
 - **THEN** server and runner identity, project access, guidance, shared context and a disposable edit/test loop are verified
-- **AND** the five changed execution/recovery boundaries have their declared consumer evidence rather than only unit-test counts
+- **AND** lifecycle truth, bounded archive recovery, authorized selectors, no-write source proof and direct operation without Codex CLI have their declared consumer evidence rather than only unit-test counts
+
+#### Scenario: Planning approval is not activation authority
+
+- **WHEN** the user approves revised direct-operation planning while the no-install ruling remains in force
+- **THEN** that approval does not replace the live application or restart services
+- **AND** later activation still requires a qualified candidate and a new explicit installation request
 
 #### Scenario: Preserve current runtime state
 

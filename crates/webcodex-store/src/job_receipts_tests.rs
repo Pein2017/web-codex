@@ -95,15 +95,548 @@ fn archived_receipt_replay_cannot_replace_identity_and_malformed_metadata_fails_
     db.upsert_job_archive(&original, now).unwrap();
     let mut replacement = original.clone();
     replacement.receipt.owner_at_admission = Some("mallory".into());
-    db.upsert_job_archive(&replacement, now).unwrap();
-    assert_eq!(db.load_job_archive("job", now).unwrap(), Some(original));
-    db.conn_for_tests()
+    replacement.archive.committed_at += 1;
+    db.upsert_job_archive(&replacement, now + 1).unwrap();
+    assert_eq!(
+        db.load_job_archive("job", now).unwrap(),
+        Some(original.clone())
+    );
+    assert!(db
+        .load_job_archive(
+            "job",
+            original.archive.committed_at + webcodex_core::job_archive::ARCHIVE_RETENTION_SECS
+        )
+        .unwrap()
+        .is_none());
+    db.job_archives
+        .connection()
+        .unwrap()
+        .as_ref()
+        .unwrap()
         .execute(
             "UPDATE wc_job_archives SET payload='{}' WHERE job_id='job'",
             [],
         )
         .unwrap();
     assert!(db.load_job_archive("job", now).is_err());
+}
+
+#[cfg(unix)]
+fn archive_allocated(path: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let directory = path.parent().unwrap();
+    let mut bytes = std::fs::metadata(directory).unwrap().blocks() * 512;
+    for entry in std::fs::read_dir(directory).unwrap() {
+        match std::fs::symlink_metadata(entry.unwrap().path()) {
+            Ok(metadata) => bytes += metadata.blocks() * 512,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("{error}"),
+        }
+    }
+    bytes
+}
+
+fn maximum_archive(now: i64, id: &str) -> webcodex_core::runner_job_receipt::ArchivedJobReceipt {
+    let mut value = archived(now, id);
+    value.receipt.snapshot.error = Some(String::new());
+    let overhead = serde_json::to_vec(&value).unwrap().len();
+    value.receipt.snapshot.error =
+        Some("x".repeat(webcodex_core::job_archive::ARCHIVE_METADATA_MAX_BYTES - overhead));
+    assert_eq!(
+        serde_json::to_vec(&value).unwrap().len(),
+        webcodex_core::job_archive::ARCHIVE_METADATA_MAX_BYTES
+    );
+    value.validate(now).unwrap();
+    value
+}
+
+#[test]
+#[cfg(unix)]
+fn archive_legacy_wal_retained_reader_is_a_physical_bound_counterexample() {
+    use rusqlite::{params, Connection};
+    use std::os::unix::fs::MetadataExt;
+    use webcodex_core::job_archive::ARCHIVE_SERVER_RESERVED_BYTES;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("shared.db");
+    let writer = Connection::open(&path).unwrap();
+    writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; CREATE TABLE wc_job_archives(job_id TEXT PRIMARY KEY,payload TEXT)").unwrap();
+    writer
+        .execute(
+            "INSERT INTO wc_job_archives VALUES ('original','original')",
+            [],
+        )
+        .unwrap();
+    let reader = Connection::open(&path).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    reader
+        .query_row("SELECT payload FROM wc_job_archives", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap();
+    for n in 0..1400 {
+        writer
+            .execute(
+                "INSERT INTO wc_job_archives VALUES (?1,?2)",
+                params![format!("job-{n:04}"), "x".repeat(16384)],
+            )
+            .unwrap();
+        writer.execute("DELETE FROM wc_job_archives WHERE job_id IN (SELECT job_id FROM wc_job_archives ORDER BY job_id DESC LIMIT -1 OFFSET 256)", []).unwrap();
+    }
+    let rows: i64 = writer
+        .query_row("SELECT count(*) FROM wc_job_archives", [], |r| r.get(0))
+        .unwrap();
+    let wal_bytes = std::fs::metadata(temp.path().join("shared.db-wal"))
+        .unwrap()
+        .blocks()
+        * 512;
+    assert_eq!(rows, 256);
+    assert!(
+        wal_bytes > ARCHIVE_SERVER_RESERVED_BYTES,
+        "legacy WAL {wal_bytes} must falsify reserve despite bounded rows"
+    );
+    eprintln!("legacy counterexample: {rows} rows, pinned WAL allocated={wal_bytes}");
+}
+
+#[test]
+#[cfg(unix)]
+fn archive_reader_busy_keeps_original_and_shared_receipts_then_repeated_writes_stay_bounded() {
+    use rusqlite::{Connection, ErrorCode};
+    use webcodex_core::job_archive::{ARCHIVE_MAX_TERMINAL, ARCHIVE_SERVER_RESERVED_BYTES};
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("state.db")).unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let original = archived(now, "original");
+    db.upsert_job_archive(&original, now).unwrap();
+    let reader = Connection::open(db.job_archive_path()).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    reader
+        .query_row("SELECT payload FROM wc_job_archives", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap();
+    let start = std::time::Instant::now();
+    for n in 0..3 {
+        let error = db
+            .upsert_job_archive(&maximum_archive(now, &format!("blocked-{n}")), now)
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<rusqlite::Error>()
+                .unwrap()
+                .sqlite_error_code(),
+            Some(ErrorCode::DatabaseBusy)
+        );
+        assert!(archive_allocated(&db.job_archive_path()) <= ARCHIVE_SERVER_RESERVED_BYTES);
+        assert_eq!(
+            db.load_job_archive("original", now).unwrap(),
+            Some(original.clone())
+        );
+    }
+    assert!(start.elapsed() < std::time::Duration::from_secs(3));
+    db.upsert_job_receipt(&receipt(now, "ordinary"), now)
+        .unwrap();
+    assert_eq!(db.load_job_receipts(now).unwrap().len(), 1);
+    assert_eq!(
+        db.conn_for_tests()
+            .query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "wal"
+    );
+    assert_eq!(
+        db.conn_for_tests()
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='wc_job_archives'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    reader.execute_batch("ROLLBACK").unwrap();
+    for n in 0..600 {
+        db.upsert_job_archive(&archived(now, &format!("job-{n:04}")), now)
+            .unwrap();
+        assert!(archive_allocated(&db.job_archive_path()) <= ARCHIVE_SERVER_RESERVED_BYTES);
+    }
+    let guard = db.job_archives.connection().unwrap();
+    let count: i64 = guard
+        .as_ref()
+        .unwrap()
+        .query_row("SELECT count(*) FROM wc_job_archives", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, ARCHIVE_MAX_TERMINAL as i64);
+}
+
+#[test]
+#[cfg(unix)]
+fn archive_sqlite_full_and_live_rollback_journal_respect_physical_reserve() {
+    use std::sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    };
+    use webcodex_core::job_archive::{
+        ARCHIVE_LOCATOR_DB_MAX_BYTES, ARCHIVE_MAX_TERMINAL, ARCHIVE_SERVER_RESERVED_BYTES,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("state.db")).unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let original = maximum_archive(now, "original");
+    db.upsert_job_archive(&original, now).unwrap();
+    let running = Arc::new(AtomicBool::new(true));
+    let peak = Arc::new(AtomicU64::new(0));
+    let sampler = {
+        let running = running.clone();
+        let peak = peak.clone();
+        let path = db.job_archive_path();
+        std::thread::spawn(move || {
+            while running.load(Ordering::Relaxed) {
+                let allocated = archive_allocated(&path);
+                peak.fetch_max(allocated, Ordering::Relaxed);
+                std::thread::yield_now();
+            }
+        })
+    };
+    let mut full_at = None;
+    for n in 0..ARCHIVE_MAX_TERMINAL {
+        match db.upsert_job_archive(&maximum_archive(now, &format!("full-{n:04}")), now) {
+            Ok(()) => {}
+            Err(error) => {
+                assert_eq!(
+                    error
+                        .downcast_ref::<rusqlite::Error>()
+                        .unwrap()
+                        .sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DiskFull)
+                );
+                full_at = Some(n);
+                break;
+            }
+        }
+    }
+    assert!(full_at.is_some_and(|n| n < ARCHIVE_MAX_TERMINAL));
+    assert_eq!(
+        db.load_job_archive("original", now).unwrap(),
+        Some(original.clone())
+    );
+    // Touch all original pages inside one transaction and inspect its journal
+    // before rollback, not merely the smaller post-commit footprint.
+    {
+        let mut guard = db.job_archives.connection().unwrap();
+        let tx = guard.as_mut().unwrap().transaction().unwrap();
+        tx.execute(
+            "UPDATE wc_job_archives SET payload=replace(payload,'x','y')",
+            [],
+        )
+        .unwrap();
+        tx.cache_flush().unwrap();
+        let journal = db
+            .job_archive_path()
+            .with_file_name("archives.sqlite3-journal");
+        assert!(std::fs::metadata(&journal).unwrap().len() > ARCHIVE_LOCATOR_DB_MAX_BYTES / 2);
+        let during = archive_allocated(&db.job_archive_path());
+        peak.fetch_max(during, Ordering::Relaxed);
+        assert!(during <= ARCHIVE_SERVER_RESERVED_BYTES);
+        tx.rollback().unwrap();
+    }
+    running.store(false, Ordering::Relaxed);
+    sampler.join().unwrap();
+    assert!(peak.load(Ordering::Relaxed) <= ARCHIVE_SERVER_RESERVED_BYTES);
+    assert!(
+        std::fs::metadata(db.job_archive_path()).unwrap().len() <= ARCHIVE_LOCATOR_DB_MAX_BYTES
+    );
+    eprintln!(
+        "bounded full: failed insertion={full_at:?}, peak allocated={} bytes",
+        peak.load(Ordering::Relaxed)
+    );
+    drop(db);
+    let reopened = Database::open(&temp.path().join("state.db")).unwrap();
+    assert_eq!(
+        reopened.load_job_archive("original", now).unwrap(),
+        Some(original)
+    );
+    let fresh = archived(
+        now + webcodex_core::job_archive::ARCHIVE_RETENTION_SECS,
+        "fresh",
+    );
+    reopened
+        .upsert_job_archive(&fresh, fresh.archive.committed_at)
+        .unwrap();
+    assert!(reopened
+        .load_job_archive("original", fresh.archive.committed_at)
+        .unwrap()
+        .is_none());
+    assert!(archive_allocated(&reopened.job_archive_path()) <= ARCHIVE_SERVER_RESERVED_BYTES);
+}
+
+#[test]
+#[cfg(unix)]
+fn archive_private_storage_policy_unknown_files_links_and_oversize_fail_archive_only() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    for case in [
+        "wal",
+        "shm",
+        "unknown",
+        "permissions",
+        "oversize",
+        "symlink",
+        "hardlink",
+        "directory-link",
+        "pages",
+        "schema",
+        "vacuum",
+        "wal-policy",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        let db = Database::open(&path).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        db.upsert_job_archive(&archived(now, "original"), now)
+            .unwrap();
+        let archive_path = db.job_archive_path();
+        let directory = archive_path.parent().unwrap().to_path_buf();
+        assert_eq!(
+            std::fs::metadata(&archive_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        drop(db);
+        match case {
+            "wal" | "shm" | "unknown" => {
+                std::fs::File::create(directory.join(if case == "wal" {
+                    "archives.sqlite3-wal"
+                } else if case == "shm" {
+                    "archives.sqlite3-shm"
+                } else {
+                    "unknown"
+                }))
+                .unwrap();
+            }
+            "permissions" => {
+                std::fs::set_permissions(&archive_path, std::fs::Permissions::from_mode(0o644))
+                    .unwrap()
+            }
+            "oversize" => std::fs::OpenOptions::new()
+                .write(true)
+                .open(&archive_path)
+                .unwrap()
+                .set_len(webcodex_core::job_archive::ARCHIVE_LOCATOR_DB_MAX_BYTES + 4096)
+                .unwrap(),
+            "symlink" => {
+                std::fs::rename(&archive_path, temp.path().join("actual.db")).unwrap();
+                symlink(temp.path().join("actual.db"), &archive_path).unwrap();
+            }
+            "hardlink" => std::fs::hard_link(&archive_path, temp.path().join("other.db")).unwrap(),
+            "directory-link" => {
+                let moved = temp.path().join("moved");
+                std::fs::rename(&directory, &moved).unwrap();
+                symlink(moved, &directory).unwrap();
+            }
+            "pages" | "vacuum" => {
+                // Deliberately incompatible operator modification; VACUUM is
+                // confined to this negative fixture, never the archive writer.
+                let conn = rusqlite::Connection::open(&archive_path).unwrap();
+                conn.execute_batch(if case == "pages" {
+                    "PRAGMA page_size=8192; VACUUM"
+                } else {
+                    "PRAGMA auto_vacuum=FULL; VACUUM"
+                })
+                .unwrap();
+            }
+            "schema" => {
+                rusqlite::Connection::open(&archive_path)
+                    .unwrap()
+                    .execute_batch("CREATE TABLE extra(value TEXT)")
+                    .unwrap();
+            }
+            "wal-policy" => {
+                rusqlite::Connection::open(&archive_path)
+                    .unwrap()
+                    .execute_batch("PRAGMA journal_mode=WAL")
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let db = Database::open(&path).unwrap();
+        assert!(db.load_job_archive("original", now).is_err(), "case {case}");
+        db.upsert_job_receipt(&receipt(now, "ordinary"), now)
+            .unwrap();
+        assert_eq!(db.load_job_receipts(now).unwrap().len(), 1);
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn archive_concurrent_writers_share_one_owner_and_replaced_open_file_fails_closed() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+    let temp = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::open(&temp.path().join("state.db")).unwrap());
+    let now = chrono::Utc::now().timestamp();
+    let original = archived(now, "original");
+    db.upsert_job_archive(&original, now).unwrap();
+    let other = Database::open(&temp.path().join("other-state.db")).unwrap();
+    assert_eq!(db.job_archive_path(), other.job_archive_path());
+    assert_eq!(
+        other.load_job_archive("original", now).unwrap(),
+        Some(original.clone())
+    );
+    let workers: Vec<_> = (0..8)
+        .map(|worker| {
+            let db = db.clone();
+            let mut value = original.clone();
+            value.receipt.owner_at_admission = Some(format!("writer-{worker}"));
+            std::thread::spawn(move || {
+                for n in 0..40 {
+                    db.upsert_job_archive(&value, now).unwrap();
+                    db.upsert_job_archive(&archived(now, &format!("job-{worker}-{n:03}")), now)
+                        .unwrap();
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!(
+        db.load_job_archive("original", now).unwrap(),
+        Some(original)
+    );
+    assert!(
+        archive_allocated(&db.job_archive_path())
+            <= webcodex_core::job_archive::ARCHIVE_SERVER_RESERVED_BYTES
+    );
+    let archive_path = db.job_archive_path();
+    std::fs::rename(&archive_path, temp.path().join("replaced.db")).unwrap();
+    let replacement = std::fs::File::create(&archive_path).unwrap();
+    replacement
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .unwrap();
+    assert!(db.load_job_archive("original", now).is_err());
+    assert!(db
+        .upsert_job_archive(&archived(now, "after-replace"), now)
+        .is_err());
+    db.upsert_job_receipt(&receipt(now, "ordinary"), now)
+        .unwrap();
+}
+
+#[test]
+#[ignore = "real child crash fixture; called by archive_hot_journal_recovery_preserves_original"]
+fn archive_hot_journal_child() {
+    let path =
+        std::env::var_os("WEBCODEX_ARCHIVE_CRASH_FIXTURE").expect("child-local fixture path");
+    let db = Database::open(&std::path::PathBuf::from(path)).unwrap();
+    let guard = db.job_archives.connection().unwrap();
+    let conn = guard.as_ref().unwrap();
+    conn.execute_batch(
+        "BEGIN IMMEDIATE; UPDATE wc_job_archives SET payload=replace(payload,'x','y')",
+    )
+    .unwrap();
+    // The child-local fsync interceptor exits at the journal's durable hot
+    // header during this real COMMIT, before it can remove the journal.
+    conn.execute_batch("COMMIT").unwrap();
+    panic!("crash interceptor did not run");
+}
+
+#[test]
+#[cfg(unix)]
+fn archive_hot_journal_recovery_preserves_original() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("state.db");
+    let now = chrono::Utc::now().timestamp();
+    let original = maximum_archive(now, "original");
+    let db = Database::open(&path).unwrap();
+    db.upsert_job_archive(&original, now).unwrap();
+    let archive_path = db.job_archive_path();
+    drop(db);
+    // Fault injection at the actual SQLite durability boundary. Intercept only
+    // this private journal and only after real sync succeeds with hot magic;
+    // no timing race, production hook, process-global environment or retry.
+    let preload = temp.path().join("crash.so");
+    let mut compiler = std::process::Command::new("cc")
+        .args(["-shared", "-fPIC", "-x", "c", "-", "-o"])
+        .arg(&preload)
+        .arg("-ldl")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        compiler.stdin.take().unwrap().write_all(br#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+static void crash_hot_journal(int fd, int result) {
+    char link[64], path[4096];
+    unsigned char bytes[8], magic[8] = {0xd9,0xd5,0x05,0xf9,0x20,0xa1,0x63,0xd7};
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(link, path, sizeof(path)-1);
+    if (result != 0 || n < 0) return;
+    path[n] = 0;
+    const char *suffix = "/job-archive-locator/archives.sqlite3-journal";
+    size_t len = strlen(suffix);
+    if ((size_t)n >= len && !strcmp(path+n-len,suffix) && pread(fd,bytes,8,0)==8 && !memcmp(bytes,magic,8)) _exit(73);
+}
+int fsync(int fd) {
+    int (*real)(int) = dlsym(RTLD_NEXT,"fsync");
+    int result = real(fd); crash_hot_journal(fd,result); return result;
+}
+int fdatasync(int fd) {
+    int (*real)(int) = dlsym(RTLD_NEXT,"fdatasync");
+    int result = real(fd); crash_hot_journal(fd,result); return result;
+}
+"#).unwrap();
+    }
+    let compiled = compiler.wait_with_output().unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "job_receipts_tests::archive_hot_journal_child",
+            "--nocapture",
+        ])
+        .env("WEBCODEX_ARCHIVE_CRASH_FIXTURE", &path)
+        .env("LD_PRELOAD", &preload)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(
+        result.status.code(),
+        Some(73),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let journal = archive_path.with_file_name("archives.sqlite3-journal");
+    let bytes = std::fs::read(&journal).unwrap();
+    assert_eq!(
+        &bytes[..8],
+        &[0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7]
+    );
+    assert!(
+        archive_allocated(&archive_path)
+            <= webcodex_core::job_archive::ARCHIVE_SERVER_RESERVED_BYTES
+    );
+    let reopened = Database::open(&path).unwrap();
+    assert_eq!(
+        reopened.load_job_archive("original", now).unwrap(),
+        Some(original)
+    );
+    assert!(!journal.exists());
 }
 
 #[test]

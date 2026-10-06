@@ -25,6 +25,8 @@ Structured execution SHALL produce mutually consistent admission, start and term
 
 Within operator-declared retention and disk bounds, terminal receipts and exact retained decoded stdout/stderr SHALL be recoverable through existing authorized Job readers for the original execution after live-tail or terminal-inventory eviction, ordinary receipt expiry or Server/Runner restart. Archived evidence SHALL retain an authenticated exact-Job lookup distinct from live lifecycle restoration; temporary Runner-instance replacement SHALL NOT orphan committed history. Output retention SHALL remain separate from execution survival and task acceptance. Readers SHALL enforce current Project visibility and pinned root incarnation for archive metadata/output, exact Job/executor identity, private storage, bounded response size and explicit completeness. When a fresh Server lacks current Project authority and the Runner is offline, only the explicit minimal-terminal-fact exception below MAY disclose historical facts under normal current request authentication and immutable admission ownership. Archive failure, truncation, expiration or unsupported historical evidence SHALL NOT be represented as empty complete output or authorize re-execution. Quota-bound retention SHALL NOT promise minimum availability or silently sanitize the retained evidence.
 
+The total archive bound SHALL account for actual output, active and temporary files, locator/index storage and its auxiliary files, and concurrent reservations across all namespaces of the named deployment. Retained row counts or serialized-payload limits alone SHALL NOT constitute a physical storage bound. Reaching an evidence-storage bound SHALL stop or reject additional retention without blocking child output draining, changing the actual process outcome or consuming unrelated Session/ordinary-receipt storage as an overflow path.
+
 #### Scenario: Read output older than the live tail
 
 - **WHEN** a Job produces more output than its live snapshot can hold and the retained archive contains earlier output
@@ -54,6 +56,18 @@ Within operator-declared retention and disk bounds, terminal receipts and exact 
 - **WHEN** a retention limit, quota, write failure or old non-archived Job makes some output unavailable
 - **THEN** the reader explicitly reports the retained range and missing evidence
 - **AND** actual execution outcome remains distinct from evidence-storage failure
+
+#### Scenario: Physical archive bound includes storage overhead
+
+- **WHEN** repeated archive commits, concurrent reservations or a long-lived reader retain storage page versions or temporary data
+- **THEN** the total physical archive usage remains within the declared deployment-wide bound, including index and auxiliary bytes
+- **AND** an insertion that cannot stay within that bound fails as evidence retention, not as a fabricated process failure or an unbounded spill into another store
+
+#### Scenario: Locator capacity does not alter other durable state
+
+- **WHEN** the archive locator reaches its physical capacity or an allowed old terminal archive is evicted
+- **THEN** current Session identities/events and ordinary receipt behavior remain intact
+- **AND** active Jobs, unrelated traces/configuration and sealed qualification/research receipts are not removed to make space
 
 #### Scenario: Fresh Server and offline Runner expose only authenticated terminal facts
 

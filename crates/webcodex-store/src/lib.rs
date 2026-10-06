@@ -30,6 +30,7 @@ mod goal_plan;
 #[cfg(test)]
 mod goal_plan_tests;
 mod goal_stall;
+mod job_archive_store;
 mod job_receipts;
 mod job_terminal_wait;
 #[cfg(test)]
@@ -125,14 +126,17 @@ pub struct Database {
     conn: Mutex<Connection>,
     connection_observer: Arc<dyn StoreConnectionObserver>,
     state_path: PathBuf,
+    job_archives: job_archive_store::JobArchiveStore,
 }
 
 impl Database {
     fn from_connection(conn: Connection, state_path: PathBuf) -> Self {
+        let job_archives = job_archive_store::JobArchiveStore::new(&state_path);
         Self {
             conn: Mutex::new(conn),
             connection_observer: Arc::new(TracingStoreConnectionObserver),
             state_path,
+            job_archives,
         }
     }
 
@@ -142,6 +146,12 @@ impl Database {
 
     pub(crate) fn state_path(&self) -> &Path {
         &self.state_path
+    }
+
+    /// One fixed archive owner per state directory, independent of the shared
+    /// database's filename. This path is operator state, never a model locator.
+    pub fn job_archive_path(&self) -> PathBuf {
+        self.job_archives.path()
     }
 }
 

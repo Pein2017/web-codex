@@ -291,3 +291,25 @@ locator remain pending. Downgrade qualification applies
 to the current shared-database candidate only and must be repeated if the
 pending physical-quota architecture ruling changes its storage. No existing
 database was restored.
+
+## Revised direct-only candidate (2026-10-06; current qualification)
+
+The preceding sections remain the historical `f78ce3d2` report. The user subsequently removed native Codex readiness from scope and authorized push to the existing fork branch plus local installation, not a public Release. That resolves authority, not technical acceptance. No Codex CLI is invoked by the new workflow or qualification.
+
+### Independent storage and physical quota
+
+- Fixed private Server owner: `<state-db-parent>/job-archive-locator/archives.sqlite3`. Session and ordinary receipt WAL are unchanged; no shared-database archive fallback or migration exists for the never-installed candidate table. The existing JobReceiptStore API delegates to this lazy independent connection; archive failure does not prevent ordinary Database startup.
+- Joint budget remains 1 GiB. Charge a fixed 16-MiB Server reservation independent of Runner deletion; restrict its database to 4096 × 1024 pages (4 MiB), DELETE rollback journal, FULL synchronization, memory temporary storage and disabled cache spilling. Read back each opened writer's policy, reject incompatible/oversized/WAL/SHM/unowned/replaced state, preserve immutable admission identity/deadline. The 256-row and seven-day values are ceilings, not availability promises.
+- Runner allowance is 1008 MiB across all owned namespaces. On the qualified Linux filesystem, prepay two 16-MiB streams plus 1 MiB structural allowance before unlocked writes. Charge recognized incomplete creation fully; exact rollback closes handles. Trim, sync and close output and receipt handles before reservation release and eviction. Unsupported allocation/preallocation fails archive capture closed without changing process exit.
+- Read-only `ask-advisor` follow-up identified the retained-reader WAL mechanism and the open-unlinked writer credit defect. Its ACCEPT_WITH_CORRECTIONS was design advice, not acceptance. The finite journal bound follows the pinned bundled SQLite restricted API and the named filesystem; it is not a universal arbitrary-filesystem claim.
+
+Commands used a command-local `TMPDIR=deployment/verification/execution-recovery-20261006/physical-tmp.fYv0Zq` on the actual `/data` Linux filesystem (4096-byte allocation):
+
+- `cargo test --locked -p webcodex-store --lib job_receipts_tests -- --nocapture --test-threads=1`: 13 passed, one explicitly ignored subprocess helper, exit 0. Full store `--lib`: 226 passed, that helper ignored, exit 0. The helper is directly executed by the crash test, not omitted qualification.
+- Original-policy counterexample: 256 bounded rows but 66,342,912 allocated WAL bytes under a retained reader. Final store: actual SQLITE_FULL at additional insertion 245 after the original maximum-size row; original remained readable. Continuous allocated-byte sampling plus explicit in-transaction all-page journal inspection peaked at 8,380,416 bytes, below 16 MiB. Real child-only sync interception exited during COMMIT after a valid hot-journal header; reopening recovered the exact original. The first cache-flush fixture lacked hot magic and failed the strong assertion; it was replaced, not accepted as crash evidence.
+- `cargo test -p webcodex-runner --bin webcodex-runner archive -- --nocapture`: 21 passed, exit 0, preserving existing native child-exit/storage-failure checks. The nearest-wrong original handle order failed the gate regression, exit 101, with three live output/receipt handles. Candidate had zero; prepaid bytes 33,558,528 remained constant after stream writes and trimmed to 12,288 on commit. Near-quota eviction preserved the other namespace's 33,558,528 active bytes.
+- Existing structured-process and raw-shell terminal lifecycle consumers each passed once, exit 0. A missing archive-capability field in a core test fixture blocked compilation; adding only its false default restored it. Lead's full `cargo test --locked -p webcodex-core --lib`: 294 passed, exit 0; registry archive filter: three passed, exit 0. A previous zero-match core archive filter was compilation evidence only.
+- `python3 -m unittest discover -s deploy/web-workflow/tests -p test_relocation.py -v`: ten passed, exit 0. Missing-helper startup regression was RED before retirement. Removed the helper and dedicated tests; installed startup and guidance retain ordinary Project/source/Session and process-vs-task-acceptance fences.
+- `node --test plugins/web-workflow/plugin.test.mjs`: 29 passed, exit 0. Strict OpenSpec validation, Python syntax and Rust formatting checks passed.
+
+Real revised Server/Runner integration, clean package identity, old-app pruning/readback, push, installation and live readback are still pending at this source-candidate checkpoint. Historical results do not close those gates.

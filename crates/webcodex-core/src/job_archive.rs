@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 
 pub const ARCHIVE_STREAM_MAX_BYTES: u64 = 16 * 1024 * 1024;
 pub const ARCHIVE_TOTAL_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+/// Deployment-wide reservation, charged once even when no Runner archive remains.
+/// Includes the locator database, rollback journal, temporary and concurrent bytes.
+pub const ARCHIVE_SERVER_RESERVED_BYTES: u64 = 16 * 1024 * 1024;
+pub const ARCHIVE_LOCATOR_DB_MAX_BYTES: u64 = 4 * 1024 * 1024;
 pub const ARCHIVE_MAX_TERMINAL: usize = 256;
 pub const ARCHIVE_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 pub const ARCHIVE_METADATA_MAX_BYTES: usize = 16 * 1024;

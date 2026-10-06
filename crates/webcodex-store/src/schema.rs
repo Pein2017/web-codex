@@ -96,15 +96,6 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_job_receipts_expiry ON wc_job_receipts(expires_at);
             CREATE INDEX IF NOT EXISTS idx_job_receipts_runner_history
                 ON wc_job_receipts(client_id, terminal_observed_at DESC, job_id DESC);
-            CREATE TABLE IF NOT EXISTS wc_job_archives (
-                job_id TEXT PRIMARY KEY,
-                client_id TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                committed_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_job_archives_expiry ON wc_job_archives(expires_at);
-
             CREATE TABLE IF NOT EXISTS users (
                 id TEXT PRIMARY KEY,
                 username TEXT NOT NULL UNIQUE,

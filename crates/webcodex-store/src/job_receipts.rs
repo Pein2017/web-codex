@@ -6,28 +6,14 @@ use webcodex_core::runner_job_receipt::{
 use webcodex_core::runner_protocol::JOB_INVENTORY_MAX_TERMINAL_JOBS;
 
 impl Database {
-    /// Separate additive table: previous applications may prune ordinary 24h
-    /// receipts without touching this exact-id historical locator owner.
+    /// Archive storage has its own physical bound; ordinary state never supplies
+    /// an overflow or fallback path.
     pub fn upsert_job_archive(
         &self,
         value: &webcodex_core::runner_job_receipt::ArchivedJobReceipt,
         now: i64,
     ) -> anyhow::Result<()> {
-        use webcodex_core::job_archive::*;
-        value.validate(now).map_err(anyhow::Error::msg)?;
-        let payload = serde_json::to_string(value)?;
-        anyhow::ensure!(
-            payload.len() <= ARCHIVE_METADATA_MAX_BYTES,
-            "archive receipt oversized"
-        );
-        let mut conn = self.lock_connection(crate::StoreDomain::JobReceipts);
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM wc_job_archives WHERE expires_at <= ?1", [now])?;
-        tx.execute("INSERT INTO wc_job_archives(job_id,client_id,payload,committed_at,expires_at) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(job_id) DO NOTHING",
-            params![value.archive.job_id, value.archive.client_id, payload, value.archive.committed_at, value.archive.committed_at.saturating_add(ARCHIVE_RETENTION_SECS)])?;
-        tx.execute("DELETE FROM wc_job_archives WHERE job_id IN (SELECT job_id FROM wc_job_archives ORDER BY committed_at DESC,job_id DESC LIMIT -1 OFFSET ?1)", [ARCHIVE_MAX_TERMINAL as i64])?;
-        tx.commit()?;
-        Ok(())
+        self.job_archives.upsert(value, now)
     }
 
     pub fn load_job_archive(
@@ -35,22 +21,7 @@ impl Database {
         job_id: &str,
         now: i64,
     ) -> anyhow::Result<Option<webcodex_core::runner_job_receipt::ArchivedJobReceipt>> {
-        use rusqlite::OptionalExtension;
-        use webcodex_core::job_archive::*;
-        anyhow::ensure!(
-            !job_id.is_empty() && job_id.len() <= 128,
-            "archive Job id invalid"
-        );
-        let conn = self.lock_connection(crate::StoreDomain::JobReceipts);
-        let payload: Option<String> = conn.query_row("SELECT payload FROM wc_job_archives WHERE job_id=?1 AND expires_at>?2 AND length(CAST(payload AS BLOB))<=?3", params![job_id, now, ARCHIVE_METADATA_MAX_BYTES as i64], |row| row.get(0)).optional()?;
-        let Some(payload) = payload else {
-            return Ok(None);
-        };
-        let value: webcodex_core::runner_job_receipt::ArchivedJobReceipt =
-            serde_json::from_str(&payload)?;
-        value.validate(now).map_err(anyhow::Error::msg)?;
-        anyhow::ensure!(value.archive.job_id == job_id, "archive identity mismatch");
-        Ok(Some(value))
+        self.job_archives.load(job_id, now)
     }
     /// Insert immutable terminal evidence. Replay cannot replace either the
     /// verdict, historical partition or deadline, including concurrent writers.
