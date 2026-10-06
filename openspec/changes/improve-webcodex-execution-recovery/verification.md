@@ -313,3 +313,13 @@ Commands used a command-local `TMPDIR=deployment/verification/execution-recovery
 - `node --test plugins/web-workflow/plugin.test.mjs`: 29 passed, exit 0. Strict OpenSpec validation, Python syntax and Rust formatting checks passed.
 
 Real revised Server/Runner integration, clean package identity, old-app pruning/readback, push, installation and live readback are still pending at this source-candidate checkpoint. Historical results do not close those gates.
+
+### First revised native consumer qualification
+
+`deployment/verification/execution-recovery-20261006/native-recovery-mnsfrxz2/receipt.json`: `candidate_native_direct_recovery_passed`, script exit 0; 107 real tool calls. Native Server/Runner source `c7d8b4b2d033`, clean, exact build match. Ten owned service children exited 0; the eleventh was the deliberately SIGKILLed disposable Runner (exit -9), not an unexplained service failure; its native payload was independently confirmed no longer running. No installed service or research workspace was mutated.
+
+The direct guarded read/edit/check used the actual retained Session event's exit code 0. An earlier fixture incorrectly expected `exit_code` in cargo_check's intentionally compact model projection and failed; `native-recovery-3vwxgen3/receipt.json` is retained. That was fixed by asserting the native recorder field, not deleting the exit check or changing runtime output.
+
+All revised caller seams passed: prestart rejection without invalid lifecycle; one side effect; authorized canonical/reference/short-name Work Result; pre-first-write guard rejection preserving unproven source; stale-revision and parent-cwd policy denial; full 213400-byte decoded output paged beyond the live tail; same terminal token unchanged/no repeated output; 70-Job inventory eviction; Runner and Server restart; simulated 25-hour ordinary receipt expiry; offline exact three-field terminal projection; malformed-token and foreign-auth rejection; same pathname/new inode refusal; current Session restoration; retained previous Server/Runner Session read and ordinary receipt pruning; unchanged independent locator IDs; final candidate reading the original archive after the old pair with no state restore. Codex CLI attempts stayed zero throughout. Losing a running Job's owner before terminal commit did not create a recovered verdict or repeat its one payload effect.
+
+The final clean committed harness/package build and its matching native readback remain the activation gate. Push and live installation are not inferred from this isolated success.

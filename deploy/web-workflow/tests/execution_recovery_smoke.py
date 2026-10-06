@@ -170,6 +170,12 @@ class Runtime:
                     arguments["client_id"] = self.client
                 value = self.request("/api/runtime/status", arguments)
                 if value.get("success") and (not runner or value["output"].get("focus", {}).get("connected")):
+                    output = value["output"]
+                    self.records.append({"runtime_identity": {
+                        "server": output.get("server"), "focus": output.get("focus"),
+                        "build_alignment": output.get("build_alignment"),
+                        "protocol_compatibility": output.get("protocol_compatibility"),
+                        "trace": output.get("effective_config", {}).get("tool_request_trace_mode")}})
                     return value
             except (OSError, ValueError, KeyError, StopIteration):
                 pass
@@ -247,8 +253,16 @@ def smoke(runtime):
             "stale read guard admitted a second write")
     direct_check = runtime.call("cargo_check", {"project": runtime.project, "session_id": session,
         "all_targets": False, "timeout_secs": 30, "sync_wait_secs": 20}, session)
-    require(direct_check.get("success") and direct_check["output"].get("exit_code") == 0,
-            "direct edited-source CPU validation failed")
+    require(direct_check.get("success"), "direct edited-source CPU validation failed")
+    # The canonical cargo_check model projection omits raw process fields.
+    # Read the disposable recorder's retained native exit, not a missing field
+    # or a phrase in stderr, for the acceptance receipt.
+    ledger = json.loads((runtime.root / "data/sessions.json").read_text())
+    record = next(value for value in ledger["sessions"] if value["session_id"] == session)
+    finished = next(event for event in reversed(record["events"])
+                    if event.get("kind") == "tool_call_finished" and event.get("tool_name") == "cargo_check")
+    require(finished.get("exit_code") == 0, "direct validator lacks retained native exit zero")
+    runtime.records.append({"direct_validator_native_exit": finished["exit_code"], "job_id": finished.get("job_id")})
     escaped = runtime.call("run_process", {"project": runtime.project, "executable": sys.executable,
         "args": ["-c", "raise SystemExit('must not run')"], "cwd": "..", "timeout_secs": 5})
     require(not escaped.get("success"), "direct Project cwd boundary was relaxed")
