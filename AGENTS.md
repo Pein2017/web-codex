@@ -6,6 +6,8 @@ WebCodex is actively developed. Requested features, fixes, and reliability impro
 
 ## 1. Verify and preserve
 
+- Read `docs/fork-maintenance.md` before upstream integration or source publication; use `Pein2017/web-codex`, local `main` tracking `origin/main`, and explicit reviewed upstream merges.
+
 - Work only in the repository, worktree, and external targets authorized by the user.
 - At task start, verify root, branch, HEAD, status, relevant changes, and recent history. Recheck after Git operations, observed concurrent changes, or before committing.
 - Treat prompt paths, hashes, branches, and runtime state as expectations to verify, not permission to overwrite actual state.

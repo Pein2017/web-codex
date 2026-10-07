@@ -6,12 +6,14 @@ Only `/data` is assumed durable. Both runtime directories are root-anchored
 Git ignores, including their private configuration and credentials.
 This is a named Linux dogfood deployment, not an npm or GitHub release.
 
-This complete Git checkout is the local fork, with its existing history and
-`coordexp/web-workflow` branch preserved. `upstream` already points to
-`https://github.com/yyjeqhc/webcodex.git`; the existing `origin` remains optional
-for publication. Work on source in this checkout; no new GitHub repository or
-push is part of relocation. Source and deployment-script edits do not require
-rebuilding the native binaries when Rust source is unchanged.
+This complete Git checkout is the local fork, with its existing history preserved.
+Its maintained branch is now `main` tracking `origin/main` at
+`https://github.com/Pein2017/web-codex.git`; `upstream` remains
+`https://github.com/yyjeqhc/webcodex.git` with pushes disabled. The former
+`coordexp/web-workflow` branch was renamed without merging the old remote `main`,
+which is retained under `history/main-before-unification-20261007`.
+See [fork maintenance](../../docs/fork-maintenance.md). Source and documentation
+edits do not require rebuilding native binaries when Rust source is unchanged.
 
 ## Local tool surface and upstream updates
 
@@ -36,7 +38,7 @@ and verify an actual gateway call in a new conversation.
 
 Upstream synchronization is explicit operator work. When authorized, fetch
 `upstream`, inspect the selected revision and divergence, and merge reviewed
-upstream changes into `coordexp/web-workflow` without overwriting local work or
+upstream changes into `main` without overwriting local work or
 rewriting its history. Recheck the local visibility declarations, discovery
 catalog and recovery suggestions alongside the affected upstream contracts;
 then run focused model-admission and internal artifact-transfer/import checks.
