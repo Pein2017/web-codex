@@ -143,6 +143,29 @@ exit status reports execution only; task completion requires the relevant consum
 to accept its output or artifact against the declared criteria. This workflow does
 not launch a local Codex CLI agent or run a sandbox readiness probe.
 
+### Shared-memory MCP and Skill
+
+Merge this credential-free fragment into private `config/runner.toml`, retaining
+existing roots/providers. CodeGraph keeps `plugin_tool`; shared-memory uses
+`mcp_tool`. Neither adds outer connector tools or duplicates the Skill.
+
+```toml
+[skills]
+roots = ["/data/CoordExp/.codex/skills", "/data/CoordExp/codex-tools/shared-memory-mcp/skills"]
+
+[[mcp.providers]]
+id = "shared-memory"
+name = "Shared Markdown Memory"
+executable = "/data/CoordExp/.shared-memory/.venv/bin/shared-memory"
+args = ["--root", "/data/CoordExp/.shared-memory", "serve"]
+cwd = "/data/CoordExp"
+```
+
+Use the actual caller context; shared-memory's Skill owns its workflow. These
+settings support fenced config check/reload without a service restart. Shared
+collection/link diagnostics remain separate; do not alter native shared roots
+or weaken checks to silence them. Shared memory is not `memory_*`.
+
 ## Controlled update and recovery
 
 `control.sh` supports only `start`, `stop` and `status`. Installation changes
