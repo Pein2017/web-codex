@@ -1499,6 +1499,8 @@ impl ToolRuntime {
             if let Some(goal_context) = goal_context {
                 projected.output["goal_context"] = goal_context;
             }
+            self.attach_shared_memory_background(&mut projected, auth)
+                .await;
         }
         projected
     }

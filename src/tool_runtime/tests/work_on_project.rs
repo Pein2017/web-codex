@@ -24,6 +24,10 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use webcodex_core::mcp_gateway::{
+    McpGatewayContent, McpGatewayProvider, McpGatewayRequest, McpGatewayResponse,
+    McpGatewayResponsePayload, McpGatewayTool, McpGatewayToolResult,
+};
 use webcodex_core::plugin::{
     PluginGatewayRequest, PluginGatewayResponse, PluginGatewayResponsePayload,
     PluginSelectionAnnotations, ProjectPluginCatalog, ProjectPluginCatalogEntry,
@@ -39,6 +43,369 @@ use webcodex_core::runner_skill::{
     RunnerSkillDescriptor, RunnerSkillListResponse, RunnerSkillRequest,
     RUNNER_SKILL_RESPONSE_FORMAT,
 };
+
+#[tokio::test]
+async fn shared_memory_bootstrap_is_automatic_and_explicit_when_unavailable() {
+    // No provider, production store, model request, Git commit or live configuration.
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("README.md"),
+        "Disposable shared-memory consumer fixture\n",
+    )
+    .unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let project =
+        register_runner_project_at_path(&runtime, "shared-memory-fixture", "demo", root.path())
+            .await;
+    let auth = bootstrap_auth_context();
+    let (result, _) = dispatch_recording_startup_requests(
+        &runtime,
+        "shared-memory-fixture",
+        work_on_project_call_with_extensions(&project, "Read-only context fixture", false),
+        Some(&auth),
+        "shared-memory-fixture-window",
+    )
+    .await;
+    assert!(result.success, "{:?}", result.error);
+    let public: Value = serde_json::from_slice(&serde_json::to_vec(&result).unwrap()).unwrap();
+    assert_eq!(public["output"]["shared_memory"]["status"], "unavailable");
+    assert_eq!(
+        public["output"]["shared_memory"]["boundary"],
+        "server-tool-result"
+    );
+    assert_eq!(
+        public["output"]["shared_memory"]["host_request_verified"],
+        false
+    );
+    assert!(public["output"]["session_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("wc_sess_"));
+}
+
+#[tokio::test]
+async fn shared_memory_success_and_exact_resume_reach_public_mcp_serialization() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("README.md"),
+        "Isolated shared background consumer\n",
+    )
+    .unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let client = "shared-memory-configured";
+    let project = register_runner_project_at_path(&runtime, client, "demo", root.path()).await;
+    register_shared_background_fixture(&runtime, client).await;
+    let auth = bootstrap_auth_context();
+    let mut session_id: Option<String> = None;
+    for (generation, state) in [(1, "paused"), (2, "closed"), (2, "closed")] {
+        fs::write(root.path().join("shared-background-fixture.json"), serde_json::to_vec(&json!({
+            "generation": generation, "text": format!("Airport route {state}; historical finite-fit evidence remains; preservation failed.")
+        })).unwrap()).unwrap();
+        let (result, kinds) = dispatch_recording_startup_requests(
+            &runtime,
+            client,
+            work_on_project_call(&project, "Read-only fixture", session_id.as_deref()),
+            Some(&auth),
+            "configured-shared-memory-window",
+        )
+        .await;
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            result.output["continuation"],
+            if session_id.is_some() {
+                "resumed_explicitly"
+            } else {
+                "created"
+            }
+        );
+        let actual_session = result.output["session_id"].as_str().unwrap().to_owned();
+        assert!(actual_session.starts_with("wc_sess_"));
+        if let Some(expected) = &session_id {
+            assert_eq!(expected, &actual_session);
+        }
+        session_id = Some(actual_session.clone());
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| kind.as_str() == "mcp_gateway")
+                .count(),
+            2
+        );
+        let public = crate::mcp::mcp_runtime_tool_result("work_on_project", false, result);
+        let serialized = serde_json::to_vec(&public).unwrap();
+        let public: Value = serde_json::from_slice(&serialized).unwrap();
+        let structured = &public["structuredContent"]["output"]["shared_memory"];
+        assert_eq!(structured["status"], "available", "{public}");
+        assert_eq!(structured["boundary"], "server-tool-result");
+        assert_eq!(structured["host_request_verified"], false);
+        assert_eq!(
+            structured["packet"]["caller_context"]["session_id"],
+            actual_session
+        );
+        assert_eq!(
+            structured["packet"]["scope"]["cwd"],
+            root.path().to_str().unwrap()
+        );
+        assert_eq!(
+            structured["packet"]["packet_revision"],
+            format!("{generation:064x}")
+        );
+        assert!(structured["packet"]["text"]
+            .as_str()
+            .unwrap()
+            .contains(state));
+        let text = public["content"][0]["text"].as_str().unwrap();
+        if let Ok(text_result) = serde_json::from_str::<Value>(text) {
+            // Explicit JSON compatibility mode may expose a second copy.
+            assert_eq!(&text_result["output"]["shared_memory"], structured);
+        } else {
+            assert_eq!(text, "WebCodex tool completed successfully.");
+            assert!(!text.contains("Airport route"));
+        }
+        let direct = serde_json::to_string(structured).unwrap();
+        let fallback = serde_json::to_string(&direct).unwrap();
+        assert!(direct.len() + fallback.len() <= 8000);
+    }
+}
+
+async fn register_shared_background_fixture(runtime: &ToolRuntime, client: &str) {
+    use crate::runner_protocol::{RunnerPolicySummary, RunnerRegisterRequest};
+    runtime
+        .runner_registry
+        .register(RunnerRegisterRequest {
+            client_id: client.into(),
+            runner_instance_id: "inst".into(),
+            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
+            process_started_at: None,
+            build: None,
+            job_concurrency_limit: None,
+            job_inventory: None,
+            coding_agent_providers: None,
+            coding_agent_inventory: None,
+            display_name: None,
+            owner: None,
+            hostname: None,
+            host_context: None,
+            capabilities: crate::test_support::current_runner_capabilities(RunnerCapabilities {
+                shell: true,
+                explicit_shell_selection: true,
+                bash_login_shell: true,
+                git: true,
+                file_read: true,
+                file_write: true,
+                internal_posix_script: true,
+                ..Default::default()
+            }),
+            policy: Some(RunnerPolicySummary {
+                mcp_gateway_providers: Some(vec![McpGatewayProvider {
+                    provider_id: "shared-memory".into(),
+                    provider_instance_id: "fixture-provider".into(),
+                    name: "Shared memory fixture".into(),
+                }]),
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn shared_memory_overlapping_scopes_keep_exact_public_sessions() {
+    let roots = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let runtime = ToolRuntime::new_for_tests();
+    let client = "shared-memory-configured";
+    register_shared_background_fixture(&runtime, client).await;
+    let mut inventory = Vec::new();
+    for (index, name) in ["alpha", "bravo"].iter().enumerate() {
+        fs::write(roots[index].path().join("README.md"), name).unwrap();
+        fs::write(
+            roots[index].path().join("shared-background-fixture.json"),
+            serde_json::to_vec(&json!({"generation": index + 1, "project_id": name,
+                "text": format!("Only {name} scoped knowledge.")}))
+            .unwrap(),
+        )
+        .unwrap();
+        inventory.push(named_registered_project(
+            client,
+            name,
+            name,
+            roots[index].path().to_str().unwrap(),
+            1,
+        ));
+    }
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        client,
+        "inst",
+        inventory,
+    )
+    .await;
+    let auth = bootstrap_auth_context();
+    let mut tasks = Vec::new();
+    for name in ["alpha", "bravo"] {
+        let runtime = runtime.clone();
+        let auth = auth.clone();
+        tasks.push(tokio::spawn(async move {
+            let window = crate::client_window::ClientWindow::for_test(name);
+            runtime
+                .dispatch_with_auth_transport_options_and_metadata_with_window(
+                    work_on_project_call(
+                        &crate::tool_runtime::runner_project_runtime_id(client, name),
+                        "Read-only scoped fixture",
+                        None,
+                    ),
+                    Some(&auth),
+                    crate::tool_runtime::sessions::SessionTransport::Mcp,
+                    Default::default(),
+                    Some(&window),
+                )
+                .await
+        }));
+    }
+    let deadline = std::time::Instant::now() + CODING_WORKFLOW_FIXTURE_TIMEOUT;
+    let mut pending = Vec::new();
+    let mut overlap_observed = false;
+    while tasks.iter().any(|task| !task.is_finished()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "overlapping shared-memory calls timed out"
+        );
+        let Some(request) = probe_patch_agent_request(&runtime, client).await else {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            continue;
+        };
+        if matches!(
+            request.mcp_gateway,
+            Some(McpGatewayRequest::ToolsCall { .. })
+        ) {
+            pending.push(request);
+            if pending.len() == 2 {
+                overlap_observed = true;
+                while let Some(request) = pending.pop() {
+                    complete_shared_background_fixture(&runtime, client, request).await;
+                }
+            }
+        } else if request.kind == "mcp_gateway" {
+            complete_shared_background_fixture(&runtime, client, request).await;
+        } else if request.kind == AGENT_LSP_REQUEST_KIND {
+            complete_patch_agent_request(
+                &runtime,
+                client,
+                &request.request_id,
+                0,
+                &RunnerLspResultEnvelope::err(
+                    "lsp_status_unavailable",
+                    "Fixture has no language server",
+                )
+                .to_stdout_json(),
+                "",
+            )
+            .await;
+        } else {
+            complete_agent_request_by_running_locally(&runtime, client, request).await;
+        }
+    }
+    assert!(overlap_observed);
+    let mut sessions = Vec::new();
+    for (index, task) in tasks.into_iter().enumerate() {
+        let result = task.await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        let session = result.output["session_id"].as_str().unwrap().to_owned();
+        let public = crate::mcp::mcp_runtime_tool_result("work_on_project", false, result);
+        let packet = &public["structuredContent"]["output"]["shared_memory"]["packet"];
+        let name = ["alpha", "bravo"][index];
+        assert_eq!(packet["caller_context"]["session_id"], session);
+        assert_eq!(
+            packet["scope"]["cwd"],
+            roots[index].path().to_str().unwrap()
+        );
+        assert_eq!(packet["scope"]["project_id"], name);
+        assert_eq!(packet["text"], format!("Only {name} scoped knowledge."));
+        sessions.push(session);
+    }
+    assert_ne!(sessions[0], sessions[1]);
+}
+
+async fn complete_shared_background_fixture(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    request: crate::runner_protocol::RunnerRequest,
+) {
+    assert_eq!(client_id, "shared-memory-configured");
+    let payload = match request.mcp_gateway.as_ref().unwrap() {
+        McpGatewayRequest::ToolsList {
+            provider_id,
+            provider_instance_id,
+        } => {
+            assert_eq!(provider_id, "shared-memory");
+            assert_eq!(provider_instance_id, "fixture-provider");
+            McpGatewayResponsePayload::Tools {
+                tools: vec![McpGatewayTool {
+                    name: "context".into(),
+                    title: None,
+                    description: None,
+                    input_schema: json!({"type":"object","properties":{"context":{"type":"object"},"max_bytes":{"type":"integer"}},"required":["context"],"additionalProperties":false}),
+                    output_schema: None,
+                    annotations: Some(json!({"readOnlyHint":true})),
+                    meta: None,
+                }],
+            }
+        }
+        McpGatewayRequest::ToolsCall {
+            name, arguments, ..
+        } => {
+            assert_eq!(name, "context");
+            let caller = &arguments["context"];
+            assert_eq!(caller["harness"], "webcodex");
+            let session_id = caller["session_id"].as_str().unwrap();
+            assert!(runtime.sessions.summary(session_id, Some(0)).is_some());
+            assert_eq!(arguments["max_bytes"], 3400);
+            let cwd = caller["cwd"].as_str().unwrap();
+            let fixture: Value = serde_json::from_slice(
+                &fs::read(Path::new(cwd).join("shared-background-fixture.json")).unwrap(),
+            )
+            .unwrap();
+            let project_id = fixture["project_id"].as_str().unwrap_or("demo");
+            let packet = json!({"status":"ok","packet_version":1,
+                "packet_revision":format!("{:064x}",fixture["generation"].as_u64().unwrap()),
+                "caller_context":{"cwd":cwd,"harness":"webcodex","session_id":session_id,"actor":"webcodex","project_id":project_id},
+                "scope":{"cwd":cwd,"project_id":project_id}, "text":fixture["text"],
+                "budget":{"limit_bytes":3400,"token_accounting":"unavailable"}});
+            McpGatewayResponsePayload::ToolResult {
+                result: McpGatewayToolResult {
+                    content: vec![McpGatewayContent::Text {
+                        text: serde_json::to_string(&packet).unwrap(),
+                    }],
+                    structured_content: Some(packet),
+                    is_error: false,
+                },
+            }
+        }
+        other => panic!("unexpected automatic operation: {other:?}"),
+    };
+    runtime
+        .runner_registry
+        .complete(RunnerResultPayload {
+            result: RunnerResultRequest {
+                client_id: client_id.into(),
+                runner_instance_id: "inst".into(),
+                request_id: request.request_id,
+                exit_code: None,
+                stdout: None,
+                stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
+                duration_ms: None,
+                error: None,
+            },
+            command_execution_state: None,
+            mcp_gateway: Some(McpGatewayResponse::success(payload)),
+            plugin_gateway: None,
+            coding_agent: None,
+        })
+        .await
+        .unwrap();
+}
 
 fn record_window_activity_fixture(
     db: &std::sync::Arc<crate::Database>,
@@ -682,6 +1049,10 @@ async fn record_startup_requests_with_runner_instruction_response(
             continue;
         };
         request_kinds.push(request.kind.clone());
+        if request.kind == "mcp_gateway" && client_id == "shared-memory-configured" {
+            complete_shared_background_fixture(runtime, client_id, request).await;
+            continue;
+        }
         if request.kind == RUNNER_INSTRUCTION_REQUEST_KIND {
             let stdout = runner_instruction_stdout
                 .expect("instruction-runtime fixture requires a configured Runner response");

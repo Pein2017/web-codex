@@ -89,6 +89,7 @@ pub(crate) use window_activity::{
 mod session_shell;
 mod session_tools;
 pub(crate) mod sessions;
+mod shared_memory;
 mod shell;
 mod shell_tools;
 pub(crate) mod skills;

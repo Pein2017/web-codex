@@ -523,6 +523,16 @@ async fn execute_exact(
     request: McpGatewayRequest,
     auth: Option<&AuthContext>,
 ) -> Result<McpGatewayResponse, GatewayError> {
+    execute_exact_with_timeout(runtime, provider, request, auth, GATEWAY_WAIT_TIMEOUT).await
+}
+
+async fn execute_exact_with_timeout(
+    runtime: &ToolRuntime,
+    provider: &ResolvedProvider,
+    request: McpGatewayRequest,
+    auth: Option<&AuthContext>,
+    wait_timeout: Duration,
+) -> Result<McpGatewayResponse, GatewayError> {
     let access = crate::runner_http::runner_access_from_auth(auth);
     let (request_id, receiver) = runtime
         .runner_registry
@@ -553,7 +563,7 @@ async fn execute_exact(
             )
         })?;
 
-    match tokio::time::timeout(GATEWAY_WAIT_TIMEOUT, receiver).await {
+    match tokio::time::timeout(wait_timeout, receiver).await {
         Ok(Ok(response)) => Ok(response),
         Ok(Err(_)) | Err(_) => {
             let dispatched = runtime
@@ -662,6 +672,168 @@ fn required_tool(value: Option<&str>) -> Result<&str, GatewayError> {
     validate_tool_name(value)
         .map_err(|_| GatewayError::local("invalid_arguments", "tool name is invalid"))?;
     Ok(value)
+}
+
+/// Read only the operator-registered shared-memory provider on the Project's
+/// exact Runner. This is a Server tool-result contract, not a Host model hook.
+pub(crate) async fn shared_memory_background(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    cwd: &str,
+    session_id: &str,
+    auth: Option<&AuthContext>,
+) -> Value {
+    fn unavailable(reason: &str) -> Value {
+        json!({"status": "unavailable", "reason_code": reason,
+               "boundary": "server-tool-result", "host_request_verified": false})
+    }
+    if !authorized(auth) {
+        return unavailable("shared_memory_scope_unavailable");
+    }
+    let candidates = visible_provider_candidates(runtime, auth).await;
+    let matching: Vec<_> = candidates
+        .get("shared-memory")
+        .into_iter()
+        .flatten()
+        .filter(|candidate| candidate.client_id == client_id)
+        .collect();
+    if matching.len() != 1 {
+        return unavailable(if matching.is_empty() {
+            "shared_memory_not_configured"
+        } else {
+            "shared_memory_binding_ambiguous"
+        });
+    }
+    let provider = matching[0];
+    let response = execute_exact_with_timeout(
+        runtime,
+        provider,
+        McpGatewayRequest::ToolsList {
+            provider_id: provider.provider_id.clone(),
+            provider_instance_id: provider.provider_instance_id.clone(),
+        },
+        auth,
+        Duration::from_secs(3),
+    )
+    .await;
+    let tools = match response.and_then(response_tools) {
+        Ok(tools) => tools,
+        Err(_) => return unavailable("shared_memory_catalog_unavailable"),
+    };
+    let Some(tool) = tools.into_iter().find(|tool| tool.name == "context") else {
+        return unavailable("shared_memory_context_missing");
+    };
+    if tool
+        .annotations
+        .as_ref()
+        .and_then(|value| value.get("readOnlyHint"))
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return unavailable("shared_memory_read_contract_unverified");
+    }
+    // Reserve room for the public sidecar and the Host's structured/text fallback.
+    // The actual final projection is checked again; this is not a token estimate.
+    let arguments = json!({"context": {"cwd": cwd, "harness": "webcodex",
+        "session_id": session_id, "actor": "webcodex"}, "max_bytes": 3400});
+    let response = execute_exact_with_timeout(
+        runtime,
+        provider,
+        McpGatewayRequest::ToolsCall {
+            provider_id: provider.provider_id.clone(),
+            provider_instance_id: provider.provider_instance_id.clone(),
+            name: "context".to_string(),
+            arguments,
+            expected_schema: tool.schema_observation(),
+        },
+        auth,
+        Duration::from_secs(3),
+    )
+    .await;
+    let result = match response {
+        Ok(McpGatewayResponse {
+            error: None,
+            payload: Some(McpGatewayResponsePayload::ToolResult { result }),
+            ..
+        }) if !result.is_error => result,
+        _ => return unavailable("shared_memory_context_unavailable"),
+    };
+    match shared_memory_packet_projection(result, cwd, session_id) {
+        Ok(packet) => packet,
+        Err(reason) => unavailable(reason),
+    }
+}
+
+fn shared_memory_packet_projection(
+    result: McpGatewayToolResult,
+    cwd: &str,
+    session_id: &str,
+) -> Result<Value, &'static str> {
+    if result.is_error {
+        return Err("shared_memory_context_unavailable");
+    }
+    let text_values: Vec<Value> = result
+        .content
+        .iter()
+        .filter_map(|item| match item {
+            McpGatewayContent::Text { text } => serde_json::from_str(text).ok(),
+            _ => None,
+        })
+        .collect();
+    let packet = match (result.structured_content, text_values.as_slice()) {
+        (Some(value), []) => value,
+        (Some(value), [text]) if value == *text => value,
+        (None, [value]) => value.clone(),
+        _ => return Err("shared_memory_projection_ambiguous"),
+    };
+    if packet.get("status").and_then(Value::as_str) == Some("budget-limited") {
+        return Ok(
+            json!({"status": "budget-limited", "boundary": "server-tool-result",
+                         "host_request_verified": false, "reason_code": "shared_memory_budget_limited"}),
+        );
+    }
+    if packet.get("packet_version").and_then(Value::as_u64) != Some(1)
+        || packet.get("status").and_then(Value::as_str) != Some("ok")
+        || packet
+            .pointer("/caller_context/cwd")
+            .and_then(Value::as_str)
+            != Some(cwd)
+        || packet
+            .pointer("/caller_context/harness")
+            .and_then(Value::as_str)
+            != Some("webcodex")
+        || packet
+            .pointer("/caller_context/session_id")
+            .and_then(Value::as_str)
+            != Some(session_id)
+        || packet.pointer("/scope/cwd").and_then(Value::as_str) != Some(cwd)
+        || !packet
+            .pointer("/scope/project_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.trim().is_empty())
+        || packet.pointer("/caller_context/project_id") != packet.pointer("/scope/project_id")
+        || !packet.get("text").is_some_and(Value::is_string)
+        || !packet
+            .get("packet_revision")
+            .and_then(Value::as_str)
+            .is_some_and(|revision| {
+                revision.len() == 64 && revision.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+    {
+        return Err("shared_memory_identity_or_contract_mismatch");
+    }
+    let projection = json!({"status": "available", "boundary": "server-tool-result",
+        "host_request_verified": false, "packet": packet,
+        "budget": {"combined_exposure_limit_bytes": 8000,
+                   "provider_limit_bytes": 3400, "counted_representations": 2}});
+    let serialized =
+        serde_json::to_string(&projection).map_err(|_| "shared_memory_serialization_failed")?;
+    let fallback =
+        serde_json::to_string(&serialized).map_err(|_| "shared_memory_serialization_failed")?;
+    if serialized.len() + fallback.len() > 8000 {
+        return Err("shared_memory_serialized_budget_exceeded");
+    }
+    Ok(projection)
 }
 
 fn render_gateway_result(result: Result<GatewaySuccess, GatewayError>) -> Value {
@@ -829,6 +1001,86 @@ mod tests {
             let rendered = render_gateway_result(Ok(GatewaySuccess::UpstreamToolResult(result)));
             assert_eq!(rendered, expected);
         }
+    }
+
+    fn fixture_shared_packet() -> Value {
+        json!({"status":"ok","packet_version":1,"packet_revision":"a".repeat(64),
+            "scope":{"cwd":"/fixture/project","project_id":"demo"},
+            "caller_context":{"cwd":"/fixture/project","project_id":"demo","harness":"webcodex","session_id":"wc_sess_actual","actor":"webcodex"},
+            "text":"Dated finite-fit result; preservation was not established."})
+    }
+
+    fn fixture_shared_result(packet: Value) -> McpGatewayToolResult {
+        McpGatewayToolResult {
+            content: vec![McpGatewayContent::Text {
+                text: serde_json::to_string(&packet).unwrap(),
+            }],
+            structured_content: Some(packet),
+            is_error: false,
+        }
+    }
+
+    #[test]
+    fn shared_memory_packet_rejects_foreign_missing_and_oversized_scope() {
+        for (path, value) in [
+            ("/caller_context/session_id", json!("wc_sess_foreign")),
+            ("/scope/cwd", json!("/another/project")),
+            ("/caller_context/harness", json!("codex")),
+            ("/scope/project_id", Value::Null),
+            ("/packet_revision", json!("unverified")),
+            ("/text", json!("中文\"\\path".repeat(2000))),
+        ] {
+            let mut packet = fixture_shared_packet();
+            *packet.pointer_mut(path).unwrap() = value;
+            assert!(shared_memory_packet_projection(
+                fixture_shared_result(packet),
+                "/fixture/project",
+                "wc_sess_actual"
+            )
+            .is_err());
+        }
+        let mut packet = fixture_shared_packet();
+        packet["scope"]
+            .as_object_mut()
+            .unwrap()
+            .remove("project_id");
+        packet["caller_context"]
+            .as_object_mut()
+            .unwrap()
+            .remove("project_id");
+        assert!(shared_memory_packet_projection(
+            fixture_shared_result(packet),
+            "/fixture/project",
+            "wc_sess_actual"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn shared_memory_duplicate_forms_are_equal_or_rejected_and_byte_bounded() {
+        let packet = fixture_shared_packet();
+        let projection = shared_memory_packet_projection(
+            fixture_shared_result(packet.clone()),
+            "/fixture/project",
+            "wc_sess_actual",
+        )
+        .unwrap();
+        let encoded = serde_json::to_string(&projection).unwrap();
+        assert!(encoded.len() + serde_json::to_string(&encoded).unwrap().len() <= 8000);
+        let mut contradictory = fixture_shared_result(packet);
+        contradictory.structured_content.as_mut().unwrap()["text"] =
+            json!("Contradictory unreviewed content");
+        assert!(shared_memory_packet_projection(
+            contradictory,
+            "/fixture/project",
+            "wc_sess_actual"
+        )
+        .is_err());
+        let mut failed = fixture_shared_result(fixture_shared_packet());
+        failed.is_error = true;
+        assert!(
+            shared_memory_packet_projection(failed, "/fixture/project", "wc_sess_actual").is_err()
+        );
     }
 
     #[test]
