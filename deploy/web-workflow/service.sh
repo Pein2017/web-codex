@@ -43,6 +43,7 @@ case "$service" in
     export WEBCODEX_TUNNEL_CLIENT_BIN="$root/runtime/bin/tunnel-client"
     command=("$root/app/bin/webcodex-cli" server tunnel --provider openai
       --env-file "$root/config/server.env" --json --stop-on-stdin-eof)
+    command=(python3 "$root/bin/tunnel_watchdog.py" "${command[@]}")
     ;;
 esac
 child=

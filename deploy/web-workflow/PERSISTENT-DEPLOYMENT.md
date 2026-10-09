@@ -110,6 +110,17 @@ Server/Runner can communicate locally without it; Tunnel reconnects when network
 access returns. Neither a surviving tmux process nor local MCP health proves that
 the externally hosted ChatGPT conversation can reach the Tunnel.
 
+The Tunnel window supervises the CLI with `bin/tunnel_watchdog.py`. Every five
+seconds it attempts certificate-verified HTTPS through `127.0.0.1:9090`; merely
+listening on that port does not count as online. It leaves the native Tunnel
+running during an outage. After observing recovery for 30 seconds, it requests
+one graceful Tunnel restart; the existing service loop waits 15 seconds before
+launching its replacement. Server, Runner and Jobs stay running. Startup waits
+for a working proxy. Manual `control.sh stop` also stops the watchdog.
+This detects sampled proxy outages, not every Host-side failure; a disconnect
+that occurs entirely between probes can be missed. Private `logs/tunnel.log`
+records `watchdog_*` transition events without credentials.
+
 ## Restore after container recreation
 
 ```bash

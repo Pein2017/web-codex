@@ -16,6 +16,7 @@ case "$action" in
     for path in "$root/config/server.env" "$root/config/runner.toml" "$root/config/tunnel.env"; do
       test -r "$path" || { echo "Missing private config: $path" >&2; exit 1; }
     done
+    test -r "$root/bin/tunnel_watchdog.py" || { echo "Missing Tunnel watchdog" >&2; exit 1; }
     for path in AGENTS.md plugins/web-workflow/plugin.mjs \
       plugins/web-workflow/pytest_report.py plugins/web-workflow/package.json; do
       test -r "$root/app/$path" || { echo "Missing installed application file: $path" >&2; exit 1; }

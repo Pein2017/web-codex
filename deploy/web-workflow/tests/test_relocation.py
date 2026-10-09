@@ -7,6 +7,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -64,6 +65,7 @@ if action == 'list-panes':
             self.touch(self.release / name)
         for name in ("server.env", "runner.toml", "tunnel.env"):
             self.touch(self.root / "config" / name)
+        self.touch(self.root / "bin/tunnel_watchdog.py")
         for path in (self.root / "bin" / "service.sh",):
             self.executable(path, """#!/usr/bin/env python3
 import json, os, sys
@@ -154,6 +156,7 @@ with open(os.environ['FAKE_SERVICE_CALLS'], 'a') as out:
                   "plugins/web-workflow/pytest_report.py", "plugins/web-workflow/package.json")]
         paths += [self.root / "runtime/bin/rg", self.node_dir / "node",
                   self.root / "bin/service.sh"]
+        paths += [self.root / "bin/tunnel_watchdog.py"]
         for path in paths:
             with self.subTest(path=path):
                 saved = path.read_bytes()
@@ -250,6 +253,49 @@ print(json.dumps({'script': sys.argv[0], 'args': sys.argv[1:], 'xdg': {key: os.e
         for key, suffix in (("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"),
                             ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state")):
             self.assertEqual(row["xdg"][key], str(self.root / "state/xdg" / suffix))
+
+    def test_tunnel_service_stops_watchdog_and_child(self):
+        # Keep the real service/monitor/process tree; substitute only networking.
+        watchdog = str(SCRIPTS / "tunnel_watchdog.py")
+        self.executable(self.root / "bin/tunnel_watchdog.py", f"""import importlib.util, signal, sys, threading
+spec = importlib.util.spec_from_file_location('monitor', {watchdog!r})
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.proxy_online = lambda: True
+stopped = threading.Event()
+for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(sig, lambda *_: stopped.set())
+sys.exit(m.supervise(sys.argv[1:], stopped))
+""")
+        self.executable(self.release / "bin/webcodex-cli", """#!/usr/bin/env python3
+import json, os, signal, threading
+stopped = threading.Event()
+signal.signal(signal.SIGTERM, lambda *_: stopped.set())
+with open(os.environ['FAKE_SERVICE_CALLS'], 'w') as out:
+    json.dump({'pid': os.getpid(), 'watchdog_pid': os.getppid()}, out)
+stopped.wait()
+with open(os.environ['FAKE_SERVICE_CALLS'] + '.stopped', 'w') as out:
+    out.write('graceful')
+""")
+        process = subprocess.Popen(["bash", str(SCRIPTS / "service.sh"), "tunnel"],
+                                   env=self.env, stdin=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 5
+            while not self.executions.exists() and time.monotonic() < deadline:
+                time.sleep(.02)
+            self.assertTrue(self.executions.exists(), "Tunnel did not start")
+            row = json.loads(self.executions.read_text())
+            self.assertNotEqual(row["watchdog_pid"], process.pid)
+            process.terminate()
+            self.assertEqual(process.wait(timeout=8), 0)
+            self.assertEqual(Path(str(self.executions) + '.stopped').read_text(), "graceful")
+            for pid in row.values():
+                self.assertFalse(Path(f"/proc/{pid}").exists())
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=8)
+            process.stdin.close()
 
 
 if __name__ == "__main__":
