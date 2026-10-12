@@ -3,8 +3,8 @@
 ## Session 与上下文
 
 - 一个 Session 对应一个 Project。多步骤工作用 work_on_project 进入既有 checkout，保留返回的 session_id / session_ref；切换仓库就新建一次 work_on_project，不要创建替代 clone/worktree。已注册项目含 coordexp、coordexp-infras、research-probes、web-codex、shared-memory-mcp，以 list_projects 为准。
-- 需要记入该 Session 的调用显式传 `_wc.record`（即旧的 recording_session_id；Stateless MCP 拒绝平铺的旧参数）。它只记录本次调用，Job 归属仍靠业务 session_id。
-- 规则正文和工作流按需用 `_wc.context=["project.instructions","webcodex.workflow"]` 读取，材料在该次调用返回后才生效。丢失上下文时读同一 Session 的 read_session_handoff，不因恢复上下文重跑已执行的操作。
+- 需要记入该 Session 的调用显式传业务参数 session_id；当前 ChatGPT 协商的协议面（2025-06-18）没有 `_wc` 信封，也不接受 recording_session_id / context_request，传了会被整次拒绝。
+- 本规则正文随时可用 load_skill(project, name="web-harness") 重读（任一已注册 Project 都可，如 agent:coordexp-web-runner:web-codex）。丢失上下文时读同一 Session 的 read_session_handoff，不因恢复上下文重跑已执行的操作。
 - 使用当前连接宣告的工具和参数；0.4 版的旧工具名已全部失效且不会自动映射，不猜别名，精确契约用 read_tool_manifest。启动结果中的能力状态是观察，不是权限。
 
 ## 读与改
