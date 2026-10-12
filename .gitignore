@@ -66,3 +66,7 @@ __pycache__/
 /artifacts/mcp-workspaces/
 /artifacts/runtime-call-stream/
 /scripts/ui-smoke/node_modules/
+
+# CoordExp local deployment tree and runtime dependencies (never commit)
+/deployment/
+/dependencies/
