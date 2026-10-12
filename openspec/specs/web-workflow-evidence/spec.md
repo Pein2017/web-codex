@@ -2,30 +2,8 @@
 
 ## Purpose
 Make the existing Web workflow report bounded, honest workspace and validation evidence so a model can use the real shared environment with less protocol guesswork.
+
 ## Requirements
-### Requirement: Workspace baseline observations
-
-Fresh project Workflow Sessions SHALL retain a bounded startup Git path/status observation and SHALL preserve that baseline across resume and restart. Finish SHALL distinguish pre-existing dirty paths from later newly dirty, cleared and overlapping paths without claiming exclusive Session authorship or unchanged content for overlapping paths. Existing canonical local v2 Session rows containing this optional baseline SHALL remain restorable when adopting upstream continuity changes; Session identity, events, messages and baseline MUST NOT be silently discarded because retired context metadata is removed.
-
-#### Scenario: Shell changes a previously clean path
-
-- **WHEN** a Session starts with dirty `existing.txt` and later a shell changes clean `new.txt`
-- **THEN** finish identifies `existing.txt` as pre-existing and `new.txt` as newly dirty since the observation
-- **AND** tool classification counts are not presented as proof that no filesystem write occurred
-
-#### Scenario: Existing dirty path remains dirty
-
-- **WHEN** a baseline path is dirty both before and after work
-- **THEN** finish reports overlap without asserting that its contents or author are unchanged
-
-#### Scenario: Baseline cannot prove completeness
-
-- **WHEN** startup or finish inspection fails, is truncated, changes HEAD/target, or the restored Session lacks a baseline
-- **THEN** the result explicitly reports the evidence limitation and does not infer absent paths as clean or cleared
-
-#### Scenario: Restore an existing local v2 row
-- **WHEN** a frozen pre-upgrade canonical Session row contains a workspace baseline and retired context revision metadata
-- **THEN** restoration retains its identity, events, messages and baseline, and subsequent serialization follows upstream behavior by omitting retired context revision metadata
 
 ### Requirement: Validation truth and recovery
 
@@ -110,66 +88,6 @@ Structured execution SHALL produce mutually consistent admission, start and term
 - **WHEN** terminal status and command execution state contradict one another or required evidence is missing
 - **THEN** the consumer rejects the inconsistent evidence and retains uncertainty
 - **AND** it does not retry, relabel the Job as completed or accept a weaker lifecycle contract
-
-### Requirement: Bounded durable Job evidence recovery
-
-Within operator-declared retention and disk bounds, terminal receipts and exact retained decoded stdout/stderr SHALL be recoverable through existing authorized Job readers for the original execution after live-tail or terminal-inventory eviction, ordinary receipt expiry or Server/Runner restart. Archived evidence SHALL retain an authenticated exact-Job lookup distinct from live lifecycle restoration; temporary Runner-instance replacement SHALL NOT orphan committed history. Output retention SHALL remain separate from execution survival and task acceptance. Readers SHALL enforce current Project visibility and pinned root incarnation for archive metadata/output, exact Job/executor identity, private storage, bounded response size and explicit completeness. When a fresh Server lacks current Project authority and the Runner is offline, only the explicit minimal-terminal-fact exception below MAY disclose historical facts under normal current request authentication and immutable admission ownership. Archive failure, truncation, expiration or unsupported historical evidence SHALL NOT be represented as empty complete output or authorize re-execution. Quota-bound retention SHALL NOT promise minimum availability or silently sanitize the retained evidence.
-
-The total archive bound SHALL account for actual output, active and temporary files, locator/index storage and its auxiliary files, and concurrent reservations across all namespaces of the named deployment. Retained row counts or serialized-payload limits alone SHALL NOT constitute a physical storage bound. Reaching an evidence-storage bound SHALL stop or reject additional retention without blocking child output draining, changing the actual process outcome or consuming unrelated Session/ordinary-receipt storage as an overflow path.
-
-#### Scenario: Read output older than the live tail
-
-- **WHEN** a Job produces more output than its live snapshot can hold and the retained archive contains earlier output
-- **THEN** the caller can read that earlier output in bounded pages for the same Job
-- **AND** the result retains stream position, continuation and completeness without repeating the command
-
-#### Scenario: Recover a terminal receipt after restart
-
-- **WHEN** the Server or Runner restarts after a Job terminal receipt has been durably committed
-- **THEN** an authorized reader recovers the original Job identity, actual exit outcome and retained evidence
-- **AND** a historical receipt does not become permission to launch, stop or reattach a process
-
-#### Scenario: Output retention does not detach a running process
-
-- **WHEN** an ordinary non-detached Job loses its owning Runner before terminal completion
-- **THEN** recovery reports the reconciled lost or unknown execution state
-- **AND** the presence of archived output is not presented as proof of continued execution or completion
-
-#### Scenario: Archive outlives ordinary inventory retention
-
-- **WHEN** a retained terminal archive remains within its configured bounds but the Job has left the live terminal inventory or ordinary receipt lifetime
-- **THEN** an authorized exact-id read recovers the original committed terminal evidence and available archived bytes without registering the entire archive as live inventory
-- **AND** an unavailable Runner is reported as output unavailable rather than an empty complete stream
-
-#### Scenario: Evidence unavailable or capped
-
-- **WHEN** a retention limit, quota, write failure or old non-archived Job makes some output unavailable
-- **THEN** the reader explicitly reports the retained range and missing evidence
-- **AND** actual execution outcome remains distinct from evidence-storage failure
-
-#### Scenario: Physical archive bound includes storage overhead
-
-- **WHEN** repeated archive commits, concurrent reservations or a long-lived reader retain storage page versions or temporary data
-- **THEN** the total physical archive usage remains within the declared deployment-wide bound, including index and auxiliary bytes
-- **AND** an insertion that cannot stay within that bound fails as evidence retention, not as a fabricated process failure or an unbounded spill into another store
-
-#### Scenario: Locator capacity does not alter other durable state
-
-- **WHEN** the archive locator reaches its physical capacity or an allowed old terminal archive is evicted
-- **THEN** current Session identities/events and ordinary receipt behavior remain intact
-- **AND** active Jobs, unrelated traces/configuration and sealed qualification/research receipts are not removed to make space
-
-#### Scenario: Fresh Server and offline Runner expose only authenticated terminal facts
-
-- **WHEN** an exact archived Job remains within retention, a fresh Server cannot establish current Project authority, and the owning Runner is offline
-- **THEN** normal current request authentication and immutable admission partition/owner checks permit only a dedicated `job_id`, canonical terminal `status` and recorded `exit_code` projection
-- **AND** no Project/root/path, Session, command, error, archive descriptor, sizes, timestamps or output are returned and no archive read is dispatched
-- **AND** a different or revoked principal is rejected without confirming the Job, the deadline is not renewed, and online evidence of Project revocation or retargeting cannot use this exception
-
-#### Scenario: Archive cannot broaden access
-
-- **WHEN** a caller cannot currently access the Job's exact Project, or a storage reference attempts path traversal, symlink escape or identity substitution
-- **THEN** the read fails closed without disclosing archived payloads
 
 ### Requirement: Work Result uses authorized canonical resolution
 

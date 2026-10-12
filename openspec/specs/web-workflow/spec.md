@@ -2,13 +2,8 @@
 
 ## Purpose
 Make ChatGPT Web project work concise and reproducible while preserving canonical checkout authority and shared-context provenance.
-## Requirements
-### Requirement: Explicit Web guidance
-The server SHALL expose configured bounded Web-specific instructions at MCP initialization and identify the effective guidance in project startup without copying full repository instructions by default.
 
-#### Scenario: Shared guidance across worktrees
-- **WHEN** two registered worktrees are opened with repository instructions disabled
-- **THEN** their startup identifies the same configured guidance revision while retaining distinct canonical project identities.
+## Requirements
 
 ### Requirement: Truthful compact startup
 The existing work_on_project tool SHALL report available extension context using current authority and distinguish unprobed or unavailable capabilities from verified failures without introducing a second project entry tool.
@@ -76,22 +71,6 @@ The named Linux deployment SHALL use a committed build with recorded identity, r
 - **THEN** disposable candidate-write/previous-read and pruning checks prove existing Session/receipt behavior and evidence preservation before live activation
 - **AND** incompatible downgrade keeps activation on HOLD unless the user explicitly changes the recovery boundary
 
-### Requirement: Native upstream feature ownership
-
-The integrated fork SHALL include the pinned upstream release and use native upstream tool names, schemas and behavior when they satisfy existing CoordExp requirements. A local implementation SHALL remain only for an operator-specific integration or a demonstrated requirement gap with a consumer-facing check. Retired context ACK/revision behavior MUST NOT be reinstated to preserve old code or fixtures.
-
-#### Scenario: Native behavior replaces a local patch
-- **WHEN** upstream supplies equivalent discovery, recovery or validation behavior
-- **THEN** the fork uses that native implementation and removes the redundant local implementation, guidance and dedicated compatibility tests
-
-#### Scenario: A requirement gap remains
-- **WHEN** native behavior fails an existing boundedness, identity or durability scenario
-- **THEN** the smallest local correction preserves that scenario while retaining unrelated upstream behavior and its tests
-
-#### Scenario: Source integration completes
-- **WHEN** the candidate is accepted
-- **THEN** its history includes the pinned release and original fork base, the remaining local differences have explicit owners and checks, and production activation remains a separate action
-
 ### Requirement: Direct Runner operation does not depend on Codex CLI
 
 The named deployment's Web workflow SHALL complete authorized file, Git, validation, process and Job recovery operations through the existing WebCodex Server → Runner path. Its guidance, startup, packaged assets and acceptance workflow SHALL NOT require or invoke Codex CLI, a Codex sandbox probe or a local Codex agent to perform those operations. It SHALL NOT configure or implicitly delegate to a local coding-agent provider as a replacement for direct tools. Removing that dependency SHALL preserve ordinary authentication, Project/root authority, permissions, source guards and execution uncertainty. Process completion SHALL remain distinct from task acceptance.
@@ -147,24 +126,6 @@ The named local deployment SHALL retain configuration, credentials, database, la
 - **WHEN** deployment switches versions or restores the preceding accepted build
 - **THEN** exact prior artifacts and consistent state backups remain available, secrets retain private permissions, and research/proxy processes are not implicitly stopped.
 
-### Requirement: Consistent Plugin acknowledgement metadata
-The Plugin gateway SHALL process supported invocation acknowledgement metadata through the authorized Workflow Session contract without forwarding it as provider business arguments or silently discarding an accepted message ACK.
-
-#### Scenario: Explicit guidance acknowledgement
-- **WHEN** an authorized caller supplies a valid message ACK for its explicit recording Session on a Plugin invocation
-- **THEN** the invocation accepts the wrapper, records the existing first-ACK observation semantics, and does not resolve the guidance or infer a Session.
-
-#### Scenario: Invalid or unauthorized acknowledgement
-- **WHEN** a caller supplies malformed or wrong-Session metadata or lacks Session authority
-- **THEN** existing validation and authority boundaries remain enforced and another Session's guidance is not acknowledged.
-
-### Requirement: Executable Skill continuation
-An incomplete Skill read SHALL return one parser-ready continuation with the same authorized project, opaque Skill identity, resource path, effective page limit, next line, and observed definition revision guard. A completed read SHALL NOT advertise another page.
-
-#### Scenario: Continue and detect changes
-- **WHEN** a caller executes the suggested continuation
-- **THEN** it reads the next bounded page without skipping content, or fails closed if the guarded definition changed.
-
 ### Requirement: Actionable Skill diagnostics
 Invalid Skill discovery entries SHALL provide bounded safe logical identity and source scope where available, without exposing native paths or inventing a usable Skill identity.
 
@@ -185,3 +146,21 @@ Existing exploration discovery and Web guidance SHALL describe symbol relationsh
 #### Scenario: Unavailable semantic backend
 - **WHEN** LSP is unavailable or a graph is stale
 - **THEN** guidance recommends an appropriate available narrow relationship query or bounded literal search, does not claim equivalent completeness, and does not automatically reindex or retry.
+
+### Requirement: Pulled Runner-global Web guidance
+The Runner SHALL project the operator-reviewed Web instruction file through upstream `[instructions].files`; the model receives it by requesting `project.instructions` on `work_on_project`. The Server MUST NOT carry a fork-only push of instructions at MCP initialization.
+
+#### Scenario: Guidance is pulled, not pushed
+- **WHEN** a fresh model context calls `work_on_project` with `_wc.context=["project.instructions"]`
+- **THEN** the projection contains the configured Runner-global file ahead of project-local instructions within the shared sidecar budget.
+
+### Requirement: Zero-fork upstream overlay
+The maintained branch SHALL be unmodified upstream source plus additive CoordExp directories (`deploy/`, `plugins/web-workflow/`, `openspec/`, maintenance docs, root-anchored ignores). CoordExp behavior SHALL be expressed only through configuration, plugins, instruction files and deployment scripts. A source patch requires a demonstrated requirement gap recorded in OpenSpec before it is applied.
+
+#### Scenario: Upstream update
+- **WHEN** a reviewed upstream revision is adopted
+- **THEN** the overlay rebases without source conflicts, the instruction file follows any tool renames, and the ChatGPT connector rescans tools when the surface changed.
+
+#### Scenario: Native behavior replaces a local capability
+- **WHEN** upstream supplies an equivalent to a retired fork capability
+- **THEN** the overlay configures or documents the native path instead of reinstating the fork implementation.
