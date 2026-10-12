@@ -12,7 +12,11 @@
   `plugins/web-workflow/`, `openspec/`, this file, and the two root-anchored
   Git ignores `/deployment/` and `/dependencies/`. Nothing else is modified.
 - The former fork (upstream v0.4.3 plus 59 local commits, tip `8b8321fc`) is
-  retained unchanged on branch `history/fork-0.4.3-main`. Its
+  retained unchanged on branch `history/fork-0.4.3-main`, pushed to `origin`
+  before `main` was replaced. On 2026-10-12 the user explicitly authorized
+  replacing published `origin/main` (then `094d5c06`) with this overlay history
+  via a lease-checked push; that one-time operation is not a precedent for
+  routine force-pushes. Its
   `workspace_baseline` startup observations, durable Job output archive, pushed
   MCP initialization instructions and artifact-tool consolidation were retired
   with the overlay; see
