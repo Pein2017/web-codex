@@ -20,7 +20,7 @@ Shared skills come from absolute operator-controlled roots:
 roots = ["/data/CoordExp/codex-tools/web-codex/deployment/app/skills", "/data/CoordExp/.codex/skills", "/data/CoordExp/codex-tools/shared-memory-mcp/skills"]
 ```
 
-`load_skill` is direct; `list_skills` and `read_skill_file` are gateway tools (`call_runtime_tool`). Skills written for Codex CLI are not executable in this host. A project whose `.agents/skills` is a symlink (currently `/data/CoordExp`) makes upstream report `skill_catalog_unavailable` for that project; replace the symlink with a real directory or accept no skills there.
+`load_skill` is direct; `list_skills` and `read_skill_file` are gateway tools (`call_runtime_tool`). Skills written for Codex CLI are not executable in this host. A project whose `.agents/skills` is a symlink makes upstream report `skill_catalog_unavailable` for that project (`/data/CoordExp` had such a leftover from the retired Pi harness; it was removed on 2026-10-12 and skills stay maintained under `/data/CoordExp/.codex/skills`, served through the Runner root).
 
 Shared memory is a Runner-owned stdio MCP provider (`[[mcp.providers]] id = "shared-memory"`) reached through `mcp_tool` list/describe/call.
 
