@@ -18,10 +18,13 @@ history is retained on branch `history/fork-0.4.3-main`.
 
 The model sees upstream's own v0.5 tool surface. Model guidance is not pushed
 at MCP `initialize`; the Runner projects `app/AGENTS.md` through
-`[instructions].files` in `config/runner.toml`, and the model receives it when
-it requests `_wc.context=["project.instructions", ...]` on `work_on_project`.
-The ChatGPT connector description should therefore tell the model to request
-`project.instructions` before dependent work.
+`[instructions].files` in `config/runner.toml`. Its body is only reachable
+through `_wc.context=["project.instructions", ...]` on the Stateless MCP 2026
+surface; ChatGPT negotiates the `2025-06-18` surface (no context channel), so
+the same text is installed as the Runner skill `web-harness` under
+`app/skills/` (root listed first in `[skills] roots`) and the ChatGPT connector
+description tells the model to `load_skill` it before dependent work. Regenerate
+`skills/web-harness/SKILL.md` from `AGENTS.md` whenever the latter changes.
 
 Updating upstream is explicit operator work: fetch `upstream`, fast-forward
 `main` onto the reviewed upstream revision, re-apply nothing (the overlay

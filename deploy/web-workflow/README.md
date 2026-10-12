@@ -11,16 +11,16 @@ Runner-global guidance uses upstream's Runner-level configured instructions (see
 files = ["/data/CoordExp/codex-tools/web-codex/deployment/app/AGENTS.md"]
 ```
 
-The path must be absolute, Runner-local, at most 1 MiB and not a symlink (configure the resolved physical path). Its body reaches the model only when `work_on_project` is called with `_wc.context=["project.instructions", ...]`, and it shares one 20 KiB envelope with the project's own `AGENTS.md` / `.codex/AGENTS.md`; global text is shortened first when over budget, so keep it at 8 KB or less with the most important rules first. Restart the Runner after changing it.
+The path must be absolute, Runner-local, at most 1 MiB and not a symlink (configure the resolved physical path). `work_on_project` always reports the file's identity (`instructions.sources[].source_scope = "runner"`), but its body is only projected through the `_wc.context=["project.instructions", ...]` channel of the Stateless MCP 2026 surface (protocol `2026-07-28`). ChatGPT currently negotiates `2025-06-18` (verified in Server traces on 2026-10-12), which has no context channel, so the same guidance is also packaged as the Runner skill `web-harness` (`deploy/web-workflow/skills/web-harness/SKILL.md`, generated from `AGENTS.md`) and installed under `deployment/app/skills`. On that surface the model reads it with the direct `load_skill(project, name="web-harness")` call; put "开工前先 load_skill web-harness" in the ChatGPT connector description. Keep the file at 8 KB or less with the most important rules first.
 
 Shared skills come from absolute operator-controlled roots:
 
 ```toml
 [skills]
-roots = ["/data/CoordExp/.codex/skills", "/data/CoordExp/codex-tools/shared-memory-mcp/skills"]
+roots = ["/data/CoordExp/codex-tools/web-codex/deployment/app/skills", "/data/CoordExp/.codex/skills", "/data/CoordExp/codex-tools/shared-memory-mcp/skills"]
 ```
 
-Use `list_skills`, `load_skill` and `read_skill_file`; skills written for Codex CLI are not executable in this host.
+`load_skill` is direct; `list_skills` and `read_skill_file` are gateway tools (`call_runtime_tool`). Skills written for Codex CLI are not executable in this host. A project whose `.agents/skills` is a symlink (currently `/data/CoordExp`) makes upstream report `skill_catalog_unavailable` for that project; replace the symlink with a real directory or accept no skills there.
 
 Shared memory is a Runner-owned stdio MCP provider (`[[mcp.providers]] id = "shared-memory"`) reached through `mcp_tool` list/describe/call.
 
@@ -36,8 +36,8 @@ The merged upstream Git review path requires Git with `check-attr --source` supp
 
 ## Fork maintenance and delivery
 
-- `upstream` is the original WebCodex repository; `origin` is the operator's fork. See [docs/fork-maintenance.md](../../docs/fork-maintenance.md).
-- Use scoped development branches and repository-local OpenSpec changes. Merge upstream before accepting an update, preserving original history and only demonstrated local requirement gaps.
+- `upstream` is the original WebCodex repository; `origin` is the operator's repository. Since 2026-10-12 `main` is a zero-fork overlay (unmodified upstream plus this directory, `deploy/codegraph/`, `plugins/web-workflow/` and `openspec/`); see [docs/fork-maintenance.md](../../docs/fork-maintenance.md).
+- Update by rebasing the overlay onto the reviewed upstream revision; a source patch needs a recorded requirement gap first.
 - Fork deployment tags use `coordexp-YYYY.MM.DD.N`: self-hosted Linux prereleases, not upstream npm/desktop/container releases. The inherited container-release workflow skips `coordexp-*` tags.
 - Before deployment: focused changed-contract tests, plugin tests, strict OpenSpec validation and a disposable real Server/Runner smoke. Build matching Server/Runner binaries from the same clean commit with the `dogfood` profile; record checksums and build identities. Local deployment alone does not create a tag or GitHub Release.
 - Retain old binaries, operator config and a consistent Server-state backup; check active jobs before restarting the Server/Runner. See [PERSISTENT-DEPLOYMENT.md](PERSISTENT-DEPLOYMENT.md) and the acceptance notes in this directory.

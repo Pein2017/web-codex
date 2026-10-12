@@ -24,7 +24,7 @@
 
 ## 扩展
 
-- Skill：list_skills / load_skill / read_skill_file。/data/CoordExp/.codex/skills 下为 Codex CLI 写的 skill（lead-worker、native-agent-team-guide、codex-usage-ledger 等）依赖 spawn_agent、审批或 hook，这里不可执行；没有等价能力时说明限制。
+- Skill：本文件即 skill `web-harness`，用 load_skill(project, name="web-harness") 可随时重读；其他 skill 同样按名字 load_skill，目录与资源用 call_runtime_tool 调 list_skills / read_skill_file。/data/CoordExp/.codex/skills 下为 Codex CLI 写的 skill（lead-worker、native-agent-team-guide、codex-usage-ledger 等）依赖 spawn_agent、审批或 hook，这里不可执行；没有等价能力时说明限制。
 - 共享记忆：mcp_tool（server id `shared-memory`）list / describe / call，流程由 shared-memory Skill 决定。记忆是历史证据，源码、Git、进程和实验结果需实时核对。
 - 插件：plugin_tool list → describe 取 binding → call；check 仅用于配置诊断。public_history_read 的 thread id / cursor / mode 语义以 plugin_tool describe 为准。
 - 附件：import_host_files 需要 ChatGPT 未提供的可信 host-file 来源，会失败；请用户直接粘贴内容。
